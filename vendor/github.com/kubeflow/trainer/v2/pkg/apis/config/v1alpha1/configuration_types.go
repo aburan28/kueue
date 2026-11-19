@@ -51,7 +51,8 @@ type Configuration struct {
 	// +optional
 	Controller *ControllerConfigurationSpec `json:"controller,omitempty"`
 
-	// certManagement is configuration for certificate management used by the webhook server.
+	// certManagement is configuration for TLS certificate management.
+	// The certificate is used by webhooks, metrics server, and status server.
 	// +optional
 	CertManagement *CertManagement `json:"certManagement,omitempty"`
 
@@ -68,6 +69,10 @@ type Configuration struct {
 	// default enablement status of a feature.
 	// +optional
 	FeatureGates map[string]bool `json:"featureGates,omitempty"`
+
+	// tls contains TLS configuration for the controller manager servers.
+	// +optional
+	TLS *TLSOptions `json:"tls,omitempty"`
 }
 
 // ControllerWebhook defines the webhook server for the controller.
@@ -106,6 +111,21 @@ type ControllerMetrics struct {
 	// +optional
 	// +kubebuilder:default=true
 	SecureServing *bool `json:"secureServing,omitempty"`
+
+	// auth configures RBAC-based authentication and authorization for the metrics endpoint.
+	// +optional
+	Auth *MetricsAuthConfig `json:"auth,omitempty"`
+}
+
+// MetricsAuthConfig holds authentication and authorization settings for the metrics endpoint.
+type MetricsAuthConfig struct {
+	// enabled enables Kubernetes RBAC-based authentication and authorization
+	// for the metrics endpoint. When enabled, only principals with permission to access
+	// the /metrics path are allowed to scrape metrics. Requires secureServing to be true.
+	// Defaults to false.
+	// +optional
+	// +kubebuilder:default=false
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 // ControllerHealth defines the health configs.
@@ -157,7 +177,8 @@ type ControllerConfigurationSpec struct {
 	GroupKindConcurrency map[string]int32 `json:"groupKindConcurrency,omitempty"`
 }
 
-// CertManagement holds configuration related to webhook server certificate generation.
+// CertManagement holds configuration related to TLS certificate generation for the controller manager.
+// The certificate is used by multiple components: admission webhooks, metrics server, and status server.
 type CertManagement struct {
 	// enable controls whether the cert management is enabled.
 	// If disabled, certificates must be provided externally.
@@ -166,22 +187,22 @@ type CertManagement struct {
 	// +kubebuilder:default=true
 	Enable *bool `json:"enable,omitempty"`
 
-	// webhookServiceName is the name of the Service used as part of the DNSName
-	// when generating the webhook server certificate.
+	// serviceName is the name of the Service used as part of the DNSName
+	// when generating the TLS certificate.
 	// Defaults to "kubeflow-trainer-controller-manager".
 	// +optional
 	// +kubebuilder:default="kubeflow-trainer-controller-manager"
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
-	WebhookServiceName string `json:"webhookServiceName,omitempty"`
+	ServiceName string `json:"serviceName,omitempty"`
 
-	// webhookSecretName is the name of the Secret used to store the CA and server certificates.
+	// secretName is the name of the Secret used to store the CA and server certificates.
 	// Defaults to "kubeflow-trainer-webhook-cert".
 	// +optional
 	// +kubebuilder:default="kubeflow-trainer-webhook-cert"
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
-	WebhookSecretName string `json:"webhookSecretName,omitempty"`
+	SecretName string `json:"secretName,omitempty"`
 }
 
 // ClientConnection provides additional configuration options for Kubernetes
@@ -221,4 +242,57 @@ type StatusServer struct {
 	// +optional
 	// +kubebuilder:default=10
 	Burst *int32 `json:"burst,omitempty"`
+}
+
+const (
+	// TLSVersion10 is the TLS 1.0 version string.
+	TLSVersion10 = "1.0"
+	// TLSVersion11 is the TLS 1.1 version string.
+	TLSVersion11 = "1.1"
+	// TLSVersion12 is the TLS 1.2 version string.
+	TLSVersion12 = "1.2"
+	// TLSVersion13 is the TLS 1.3 version string.
+	TLSVersion13 = "1.3"
+)
+
+// TLSOptions contains TLS configuration for the controller manager.
+type TLSOptions struct {
+	// minVersion is the minimum TLS version supported.
+	// +optional
+	// +kubebuilder:validation:Enum=1.0;1.1;1.2;1.3
+	MinVersion string `json:"minVersion,omitempty"`
+
+	// cipherSuites is the list of allowed cipher suites.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:MaxLength=100
+	CipherSuites []string `json:"cipherSuites,omitempty"`
+
+	// curvePreferences is the set of allowed TLS key exchange mechanisms,
+	// specified as numeric IANA TLS Supported Group IDs (see
+	// https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml#tls-parameters-8).
+	// Common values: 23 (secp256r1), 24 (secp384r1), 25 (secp521r1),
+	// 29 (x25519), 4587 (SecP256r1MLKEM768), 4588 (X25519MLKEM768),
+	// 4589 (SecP384r1MLKEM1024). Post-quantum hybrids are only negotiated over
+	// TLS 1.3, so include a classical curve if minVersion allows TLS 1.2.
+	// The set of supported values depends on the Go version used to build the
+	// controller. Go selects from this list using its internal preference
+	// order; list order is ignored. If empty, Go defaults apply.
+	// Unsupported IDs fail controller startup.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:Minimum=1
+	// +kubebuilder:validation:items:Maximum=65535
+	CurvePreferences []int32 `json:"curvePreferences,omitempty"`
+
+	// nextProtos is the list of application-level protocols negotiated during
+	// the TLS handshake. Set to ["h2", "http/1.1"] to enable HTTP/2, or omit
+	// to disable it (mitigates CVE-2023-44487 and CVE-2023-39325).
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=10
+	// +kubebuilder:validation:items:MaxLength=32
+	NextProtos []string `json:"nextProtos,omitempty"`
 }

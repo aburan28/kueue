@@ -24,7 +24,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
@@ -32,18 +31,20 @@ import (
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	testingtrainjob "sigs.k8s.io/kueue/pkg/util/testingjobs/trainjob"
-	"sigs.k8s.io/kueue/test/util"
+	utiltrainjob "sigs.k8s.io/kueue/pkg/util/trainjob"
+	"sigs.k8s.io/kueue/test/util/behavioral"
+	"sigs.k8s.io/kueue/test/util/behavioral/e2e"
 )
 
 var _ = ginkgo.Describe("TrainJob", ginkgo.Label("area:singlecluster", "feature:trainjob"), func() {
 	var ns *corev1.Namespace
 
 	ginkgo.BeforeEach(func() {
-		ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "e2e-")
+		ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "e2e-")
 	})
 	ginkgo.AfterEach(func() {
-		gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
-		util.ExpectAllPodsInNamespaceDeleted(ctx, k8sClient, ns)
+		gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
+		behavioral.ExpectAllPodsInNamespaceDeleted(ctx, k8sClient, ns)
 	})
 	ginkgo.When("Creating a TrainJob", func() {
 		var (
@@ -53,24 +54,24 @@ var _ = ginkgo.Describe("TrainJob", ginkgo.Label("area:singlecluster", "feature:
 		)
 		ginkgo.BeforeEach(func() {
 			defaultRf = utiltestingapi.MakeResourceFlavor("default-" + ns.Name).Obj()
-			util.MustCreate(ctx, k8sClient, defaultRf)
+			behavioral.MustCreate(ctx, k8sClient, defaultRf)
 			clusterQueue = utiltestingapi.MakeClusterQueue("cluster-queue-" + ns.Name).
 				ResourceGroup(
 					*utiltestingapi.MakeFlavorQuotas(defaultRf.Name).
 						Resource(corev1.ResourceCPU, "2").
 						Resource(corev1.ResourceMemory, "2G").Obj()).Obj()
-			util.CreateClusterQueuesAndWaitForActive(ctx, k8sClient, clusterQueue)
+			behavioral.CreateClusterQueuesAndWaitForActive(ctx, k8sClient, clusterQueue)
 			localQueue = utiltestingapi.MakeLocalQueue("main", ns.Name).ClusterQueue(clusterQueue.Name).Obj()
-			util.CreateLocalQueuesAndWaitForActive(ctx, k8sClient, localQueue)
+			behavioral.CreateLocalQueuesAndWaitForActive(ctx, k8sClient, localQueue)
 		})
 		ginkgo.AfterEach(func() {
-			gomega.Expect(util.DeleteAllTrainJobsInNamespace(ctx, k8sClient, ns)).Should(gomega.Succeed())
+			gomega.Expect(behavioral.DeleteAllTrainJobsInNamespace(ctx, k8sClient, ns)).Should(gomega.Succeed())
 			// Force remove workloads to be sure that cluster queue can be removed.
-			gomega.Expect(util.DeleteWorkloadsInNamespace(ctx, k8sClient, ns)).Should(gomega.Succeed())
-			gomega.Expect(util.DeleteObject(ctx, k8sClient, localQueue)).Should(gomega.Succeed())
-			util.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
-			util.ExpectObjectToBeDeleted(ctx, k8sClient, defaultRf, true)
-			util.ExpectAllPodsInNamespaceDeleted(ctx, k8sClient, ns)
+			gomega.Expect(behavioral.DeleteWorkloadsInNamespace(ctx, k8sClient, ns)).Should(gomega.Succeed())
+			gomega.Expect(behavioral.DeleteObject(ctx, k8sClient, localQueue)).Should(gomega.Succeed())
+			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
+			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, defaultRf, true)
+			behavioral.ExpectAllPodsInNamespaceDeleted(ctx, k8sClient, ns)
 		})
 
 		ginkgo.It("Should run a TrainJob if admitted", func() {
@@ -78,13 +79,13 @@ var _ = ginkgo.Describe("TrainJob", ginkgo.Label("area:singlecluster", "feature:
 				RuntimeRefName("torch-distributed").
 				Queue("main").
 				// Even if we override the image coming from the TrainingRuntime, we still need to set the command and args
-				TrainerImage(util.GetAgnHostImage(), []string{"/agnhost"}, util.BehaviorExitFast).
+				TrainerImage(e2e.GetAgnHostImage(), []string{"/agnhost"}, e2e.BehaviorExitFast).
 				TrainerRequest(corev1.ResourceCPU, "500m").
 				TrainerRequest(corev1.ResourceMemory, "200Mi").
 				Obj()
 
 			ginkgo.By("Creating the trainjob", func() {
-				util.MustCreate(ctx, k8sClient, trainjob)
+				behavioral.MustCreate(ctx, k8sClient, trainjob)
 			})
 
 			createdWorkload := &kueue.Workload{}
@@ -93,23 +94,23 @@ var _ = ginkgo.Describe("TrainJob", ginkgo.Label("area:singlecluster", "feature:
 				gomega.Eventually(func(g gomega.Gomega) {
 					g.Expect(k8sClient.Get(ctx, wlLookupKey, createdWorkload)).To(gomega.Succeed())
 					g.Expect(createdWorkload.Status.Conditions).To(utiltesting.HaveConditionStatus(kueue.WorkloadAdmitted, metav1.ConditionTrue))
-				}, util.MediumTimeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.MediumTimeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Waiting for the trainjob to be unsuspended", func() {
 				gomega.Eventually(func(g gomega.Gomega) {
 					g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(trainjob), trainjob)).To(gomega.Succeed())
 					g.Expect(trainjob.Spec.Suspend).Should(gomega.BeEquivalentTo(new(false)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Waiting for the trainjob to finish", func() {
 				gomega.Eventually(func(g gomega.Gomega) {
 					g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(trainjob), trainjob)).To(gomega.Succeed())
 					g.Expect(trainjob.Status.Conditions).To(utiltesting.HaveConditionStatusTrue(kftrainerapi.TrainJobComplete), "trainjob is complete")
-				}, util.LongTimeout, util.Interval).Should(gomega.Succeed(), util.AssertMsg[runtime.Object]("TrainJob or Workload did not finish", trainjob))
+				}, behavioral.LongTimeout, behavioral.Interval).Should(gomega.Succeed(), behavioral.AssertMsg[runtime.Object]("TrainJob or Workload did not finish", trainjob))
 
-				util.ExpectWorkloadToFinishWithTimeout(ctx, k8sClient, wlLookupKey, util.LongTimeout)
+				behavioral.ExpectWorkloadToFinishWithTimeout(ctx, k8sClient, wlLookupKey, behavioral.LongTimeout)
 			})
 		})
 	})
@@ -124,10 +125,10 @@ var _ = ginkgo.Describe("TrainJob", ginkgo.Label("area:singlecluster", "feature:
 		ginkgo.BeforeEach(func() {
 			onDemandRF = utiltestingapi.MakeResourceFlavor("on-demand-"+ns.Name).
 				NodeLabel("instance-type", "on-demand").Obj()
-			util.MustCreate(ctx, k8sClient, onDemandRF)
+			behavioral.MustCreate(ctx, k8sClient, onDemandRF)
 			spotRF = utiltestingapi.MakeResourceFlavor("spot-"+ns.Name).
 				NodeLabel("instance-type", "spot").Obj()
-			util.MustCreate(ctx, k8sClient, spotRF)
+			behavioral.MustCreate(ctx, k8sClient, spotRF)
 			clusterQueue = utiltestingapi.MakeClusterQueue("cluster-queue-"+ns.Name).
 				ResourceGroup(
 					*utiltestingapi.MakeFlavorQuotas(onDemandRF.Name).
@@ -143,19 +144,19 @@ var _ = ginkgo.Describe("TrainJob", ginkgo.Label("area:singlecluster", "feature:
 					WithinClusterQueue: kueue.PreemptionPolicyLowerPriority,
 				}).
 				Obj()
-			util.CreateClusterQueuesAndWaitForActive(ctx, k8sClient, clusterQueue)
+			behavioral.CreateClusterQueuesAndWaitForActive(ctx, k8sClient, clusterQueue)
 			localQueue = utiltestingapi.MakeLocalQueue("main", ns.Name).ClusterQueue(clusterQueue.Name).Obj()
-			util.CreateLocalQueuesAndWaitForActive(ctx, k8sClient, localQueue)
+			behavioral.CreateLocalQueuesAndWaitForActive(ctx, k8sClient, localQueue)
 		})
 		ginkgo.AfterEach(func() {
-			gomega.Expect(util.DeleteAllTrainJobsInNamespace(ctx, k8sClient, ns)).Should(gomega.Succeed())
+			gomega.Expect(behavioral.DeleteAllTrainJobsInNamespace(ctx, k8sClient, ns)).Should(gomega.Succeed())
 			// Force remove workloads to be sure that cluster queue can be removed.
-			gomega.Expect(util.DeleteWorkloadsInNamespace(ctx, k8sClient, ns)).Should(gomega.Succeed())
-			gomega.Expect(util.DeleteObject(ctx, k8sClient, localQueue)).Should(gomega.Succeed())
-			util.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
-			util.ExpectObjectToBeDeleted(ctx, k8sClient, onDemandRF, true)
-			util.ExpectObjectToBeDeleted(ctx, k8sClient, spotRF, true)
-			util.ExpectAllPodsInNamespaceDeleted(ctx, k8sClient, ns)
+			gomega.Expect(behavioral.DeleteWorkloadsInNamespace(ctx, k8sClient, ns)).Should(gomega.Succeed())
+			gomega.Expect(behavioral.DeleteObject(ctx, k8sClient, localQueue)).Should(gomega.Succeed())
+			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
+			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, onDemandRF, true)
+			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, spotRF, true)
+			behavioral.ExpectAllPodsInNamespaceDeleted(ctx, k8sClient, ns)
 		})
 
 		ginkgo.It("Should allow to suspend a TrainJob when injected nodeSelector", func() {
@@ -163,13 +164,13 @@ var _ = ginkgo.Describe("TrainJob", ginkgo.Label("area:singlecluster", "feature:
 				RuntimeRefName("torch-distributed").
 				Queue("main").
 				// Even if we override the image coming from the TrainingRuntime, we still need to set the command and args
-				TrainerImage(util.GetAgnHostImage(), []string{"/agnhost"}, util.BehaviorWaitForDeletion).
+				TrainerImage(e2e.GetAgnHostImage(), []string{"/agnhost"}, e2e.BehaviorWaitForDeletion).
 				TrainerRequest(corev1.ResourceCPU, "500m").
 				TrainerRequest(corev1.ResourceMemory, "200Mi").
 				Obj()
 
 			ginkgo.By("Creating the trainjob", func() {
-				util.MustCreate(ctx, k8sClient, trainjob)
+				behavioral.MustCreate(ctx, k8sClient, trainjob)
 			})
 
 			createdWorkload := &kueue.Workload{}
@@ -178,22 +179,22 @@ var _ = ginkgo.Describe("TrainJob", ginkgo.Label("area:singlecluster", "feature:
 				gomega.Eventually(func(g gomega.Gomega) {
 					g.Expect(k8sClient.Get(ctx, wlLookupKey, createdWorkload)).To(gomega.Succeed())
 					g.Expect(createdWorkload.Status.Conditions).To(utiltesting.HaveConditionStatus(kueue.WorkloadAdmitted, metav1.ConditionTrue))
-				}, util.MediumTimeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.MediumTimeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Waiting for the trainjob to be unsuspended", func() {
 				gomega.Eventually(func(g gomega.Gomega) {
 					g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(trainjob), trainjob)).To(gomega.Succeed())
 					g.Expect(trainjob.Spec.Suspend).Should(gomega.BeEquivalentTo(new(false)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Verify that the trainjob has a runtime patch from kueue", func() {
-				gomega.Expect(testingtrainjob.KueueRuntimePatch(trainjob)).ToNot(gomega.BeNil())
+				gomega.Expect(utiltrainjob.KueueRuntimePatch(trainjob)).ToNot(gomega.BeNil())
 			})
 
 			ginkgo.By("Verify the trainjob has nodeSelector set", func() {
-				rJobs := testingtrainjob.KueueRuntimePatch(trainjob).TrainingRuntimeSpec.Template.Spec.ReplicatedJobs
+				rJobs := utiltrainjob.KueueRuntimePatch(trainjob).TrainingRuntimeSpec.Template.Spec.ReplicatedJobs
 				gomega.Expect(rJobs).To(gomega.HaveLen(1))
 				gomega.Expect(rJobs[0].Template.Spec.Template.Spec.NodeSelector).To(gomega.Equal(
 					map[string]string{
@@ -203,17 +204,13 @@ var _ = ginkgo.Describe("TrainJob", ginkgo.Label("area:singlecluster", "feature:
 			})
 
 			ginkgo.By("Stopping the ClusterQueue to make the TrainJob be stopped and suspended")
-			gomega.Eventually(func(g gomega.Gomega) {
-				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(clusterQueue), clusterQueue)).To(gomega.Succeed())
-				clusterQueue.Spec.StopPolicy = ptr.To(kueue.HoldAndDrain)
-				g.Expect(k8sClient.Update(ctx, clusterQueue)).Should(gomega.Succeed())
-			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			behavioral.SetClusterQueueStopPolicy(ctx, k8sClient, clusterQueue, kueue.HoldAndDrain)
 
 			ginkgo.By("Waiting for the TrainJob to be suspended", func() {
 				gomega.Eventually(func(g gomega.Gomega) {
 					g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(trainjob), trainjob)).To(gomega.Succeed())
 					g.Expect(trainjob.Spec.Suspend).Should(gomega.BeEquivalentTo(new(true)))
-				}, util.MediumTimeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.MediumTimeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 	})

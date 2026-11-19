@@ -27,12 +27,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
-	inventoryv1alpha1 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha1"
+	autoscaling "k8s.io/autoscaler/cluster-autoscaler/apis/provisioningrequest/autoscaling.x-k8s.io/v1"
+	inventoryv1alpha2 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/controller/constants"
+	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 	"sigs.k8s.io/kueue/pkg/util/csv"
 	utilslices "sigs.k8s.io/kueue/pkg/util/slices"
 	"sigs.k8s.io/kueue/pkg/util/tas"
@@ -66,7 +68,7 @@ type WorkloadWrapper struct{ kueue.Workload }
 // with a single container.
 func MakeWorkload(name, ns string) *WorkloadWrapper {
 	return &WorkloadWrapper{kueue.Workload{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Name: name, Namespace: ns,
 		Spec: kueue.WorkloadSpec{
 			PodSets: []kueue.PodSet{
 				*MakePodSet(kueue.DefaultPodSetName, 1).Obj(),
@@ -318,6 +320,11 @@ func (w *WorkloadWrapper) Annotation(k, v string) *WorkloadWrapper {
 	return w
 }
 
+// Group marks the Workload as created by the pod-group framework.
+func (w *WorkloadWrapper) Group() *WorkloadWrapper {
+	return w.Annotation(podconstants.IsGroupWorkloadAnnotationKey, podconstants.IsGroupWorkloadAnnotationValue)
+}
+
 func (w *WorkloadWrapper) AdmissionChecks(checks ...kueue.AdmissionCheckState) *WorkloadWrapper {
 	w.Status.AdmissionChecks = checks
 	return w
@@ -345,6 +352,12 @@ func (w *WorkloadWrapper) OwnerReference(gvk schema.GroupVersionKind, name, uid 
 
 func (w *WorkloadWrapper) Annotations(annotations map[string]string) *WorkloadWrapper {
 	w.ObjectMeta.Annotations = annotations
+	return w
+}
+
+// WaitForPodsReady sets the Spec.WaitForPodsReady configuration.
+func (w *WorkloadWrapper) WaitForPodsReady(cfg *kueue.WaitForPodsReady) *WorkloadWrapper {
+	w.Spec.WaitForPodsReady = cfg
 	return w
 }
 
@@ -792,10 +805,8 @@ type LocalQueueWrapper struct{ kueue.LocalQueue }
 // MakeLocalQueue creates a wrapper for a LocalQueue.
 func MakeLocalQueue(name, ns string) *LocalQueueWrapper {
 	return &LocalQueueWrapper{kueue.LocalQueue{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: ns,
-		},
+		Name:      name,
+		Namespace: ns,
 	}}
 }
 
@@ -908,14 +919,17 @@ type CohortWrapper struct {
 
 func MakeCohort(name kueue.CohortReference) *CohortWrapper {
 	return &CohortWrapper{kueue.Cohort{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: string(name),
-		},
+		Name: string(name),
 	}}
 }
 
 func (c *CohortWrapper) Obj() *kueue.Cohort {
 	return &c.Cohort
+}
+
+func (c *CohortWrapper) UID(uid types.UID) *CohortWrapper {
+	c.Cohort.UID = uid
+	return c
 }
 
 func (c *CohortWrapper) Parent(parentName kueue.CohortReference) *CohortWrapper {
@@ -926,6 +940,21 @@ func (c *CohortWrapper) Parent(parentName kueue.CohortReference) *CohortWrapper 
 // ResourceGroup adds a ResourceGroup with flavors.
 func (c *CohortWrapper) ResourceGroup(flavors ...kueue.FlavorQuotas) *CohortWrapper {
 	c.Spec.ResourceGroups = append(c.Spec.ResourceGroups, ResourceGroup(flavors...))
+	return c
+}
+
+// EffectiveQuotas adds a ResourceGroup with flavors to status.effectiveQuotas.
+func (c *CohortWrapper) EffectiveQuotas(flavors ...kueue.FlavorQuotas) *CohortWrapper {
+	if c.Status.EffectiveQuotas == nil {
+		c.Status.EffectiveQuotas = &kueue.EffectiveQuotaStatus{}
+	}
+	c.Status.EffectiveQuotas.ResourceGroups = append(c.Status.EffectiveQuotas.ResourceGroups, ResourceGroup(flavors...))
+	return c
+}
+
+// EffectiveQuotaStatus sets status.effectiveQuotas.
+func (c *CohortWrapper) EffectiveQuotaStatus(eq *kueue.EffectiveQuotaStatus) *CohortWrapper {
+	c.Status.EffectiveQuotas = eq
 	return c
 }
 
@@ -966,9 +995,7 @@ type ClusterQueueWrapper struct{ kueue.ClusterQueue }
 // select-all NamespaceSelector.
 func MakeClusterQueue(name string) *ClusterQueueWrapper {
 	return &ClusterQueueWrapper{kueue.ClusterQueue{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		},
+		Name: name,
 		Spec: kueue.ClusterQueueSpec{
 			NamespaceSelector: &metav1.LabelSelector{},
 			QueueingStrategy:  kueue.BestEffortFIFO,
@@ -989,6 +1016,11 @@ func (c *ClusterQueueWrapper) Obj() *kueue.ClusterQueue {
 	return &c.ClusterQueue
 }
 
+func (c *ClusterQueueWrapper) UID(uid types.UID) *ClusterQueueWrapper {
+	c.ClusterQueue.UID = uid
+	return c
+}
+
 // Cohort sets the borrowing cohort.
 func (c *ClusterQueueWrapper) Cohort(cohort kueue.CohortReference) *ClusterQueueWrapper {
 	c.Spec.CohortName = cohort
@@ -998,7 +1030,7 @@ func (c *ClusterQueueWrapper) Cohort(cohort kueue.CohortReference) *ClusterQueue
 func (c *ClusterQueueWrapper) ConcurrentAdmissionPolicy(mode kueue.ConcurrentAdmissionMigrationMode) *ClusterQueueWrapper {
 	c.Spec.ConcurrentAdmissionPolicy = &kueue.ConcurrentAdmissionPolicy{
 		Migration: kueue.ConcurrentAdmissionMigration{
-			Mode: mode,
+			Mode: &mode,
 		},
 	}
 	return c
@@ -1078,6 +1110,21 @@ func ResourceGroup(flavors ...kueue.FlavorQuotas) kueue.ResourceGroup {
 // ResourceGroup adds a ResourceGroup with flavors.
 func (c *ClusterQueueWrapper) ResourceGroup(flavors ...kueue.FlavorQuotas) *ClusterQueueWrapper {
 	c.Spec.ResourceGroups = append(c.Spec.ResourceGroups, ResourceGroup(flavors...))
+	return c
+}
+
+// EffectiveQuotas adds a ResourceGroup with flavors to status.effectiveQuotas.
+func (c *ClusterQueueWrapper) EffectiveQuotas(flavors ...kueue.FlavorQuotas) *ClusterQueueWrapper {
+	if c.Status.EffectiveQuotas == nil {
+		c.Status.EffectiveQuotas = &kueue.EffectiveQuotaStatus{}
+	}
+	c.Status.EffectiveQuotas.ResourceGroups = append(c.Status.EffectiveQuotas.ResourceGroups, ResourceGroup(flavors...))
+	return c
+}
+
+// EffectiveQuotaStatus sets status.effectiveQuotas.
+func (c *ClusterQueueWrapper) EffectiveQuotaStatus(eq *kueue.EffectiveQuotaStatus) *ClusterQueueWrapper {
+	c.Status.EffectiveQuotas = eq
 	return c
 }
 
@@ -1192,6 +1239,52 @@ func (c *ClusterQueueWrapper) AdmittedWorkloads(n int32) *ClusterQueueWrapper {
 	return c
 }
 
+// EffectiveQuotaStatusWrapper wraps an EffectiveQuotaStatus.
+type EffectiveQuotaStatusWrapper struct{ kueue.EffectiveQuotaStatus }
+
+// MakeEffectiveQuotaStatus creates a wrapper for an EffectiveQuotaStatus with default orchestratorRef.
+func MakeEffectiveQuotaStatus() *EffectiveQuotaStatusWrapper {
+	return &EffectiveQuotaStatusWrapper{
+		EffectiveQuotaStatus: kueue.EffectiveQuotaStatus{
+			OrchestratorRef: kueue.EffectiveQuotaStatusOrchestratorRef{
+				APIGroup: "kueue.x-k8s.io",
+				Kind:     "DynamicQuotaOrchestrator",
+				Name:     "dqo",
+			},
+			ResourceGroups: make([]kueue.ResourceGroup, 0),
+		},
+	}
+}
+
+// Obj returns the inner EffectiveQuotaStatus.
+func (e *EffectiveQuotaStatusWrapper) Obj() *kueue.EffectiveQuotaStatus {
+	return &e.EffectiveQuotaStatus
+}
+
+// APIGroup sets the APIGroup of orchestratorRef.
+func (e *EffectiveQuotaStatusWrapper) APIGroup(apiGroup string) *EffectiveQuotaStatusWrapper {
+	e.OrchestratorRef.APIGroup = apiGroup
+	return e
+}
+
+// Kind sets the Kind of orchestratorRef.
+func (e *EffectiveQuotaStatusWrapper) Kind(kind string) *EffectiveQuotaStatusWrapper {
+	e.OrchestratorRef.Kind = kind
+	return e
+}
+
+// Name sets the Name of orchestratorRef.
+func (e *EffectiveQuotaStatusWrapper) Name(name string) *EffectiveQuotaStatusWrapper {
+	e.OrchestratorRef.Name = name
+	return e
+}
+
+// ResourceGroups sets the resourceGroups.
+func (e *EffectiveQuotaStatusWrapper) ResourceGroups(rgs ...kueue.ResourceGroup) *EffectiveQuotaStatusWrapper {
+	e.EffectiveQuotaStatus.ResourceGroups = rgs
+	return e
+}
+
 // FlavorQuotasWrapper wraps a FlavorQuotas object.
 type FlavorQuotasWrapper struct{ kueue.FlavorQuotas }
 
@@ -1266,9 +1359,7 @@ type ResourceFlavorWrapper struct{ kueue.ResourceFlavor }
 // MakeResourceFlavor creates a wrapper for a ResourceFlavor.
 func MakeResourceFlavor(name string) *ResourceFlavorWrapper {
 	return &ResourceFlavorWrapper{kueue.ResourceFlavor{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		},
+		Name: name,
 		Spec: kueue.ResourceFlavorSpec{
 			NodeLabels: make(map[string]string),
 		},
@@ -1343,9 +1434,7 @@ type TopologyWrapper struct{ kueue.Topology }
 // MakeTopology creates a wrapper for a Topology.
 func MakeTopology(name string) *TopologyWrapper {
 	return &TopologyWrapper{kueue.Topology{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		},
+		Name: name,
 	}}
 }
 
@@ -1379,10 +1468,8 @@ type TopologyDomainAssignmentWrapper struct {
 
 func MakeTopologyDomainAssignment(values []string, count int32) *TopologyDomainAssignmentWrapper {
 	return &TopologyDomainAssignmentWrapper{
-		TopologyDomainAssignment: tas.TopologyDomainAssignment{
-			Values: values,
-			Count:  count,
-		},
+		Values: values,
+		Count:  count,
 	}
 }
 
@@ -1431,7 +1518,7 @@ func MakePodSetAssignment(name kueue.PodSetReference) *PodSetAssignmentWrapper {
 			Name:          name,
 			Flavors:       make(map[corev1.ResourceName]kueue.ResourceFlavorReference),
 			ResourceUsage: make(corev1.ResourceList),
-			Count:         ptr.To[int32](1),
+			Count:         new(int32(1)),
 		},
 	}
 }
@@ -1479,11 +1566,7 @@ type AdmissionCheckWrapper struct{ kueue.AdmissionCheck }
 
 func MakeAdmissionCheck(name string) *AdmissionCheckWrapper {
 	return &AdmissionCheckWrapper{
-		AdmissionCheck: kueue.AdmissionCheck{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: name,
-			},
-		},
+		Name: name,
 	}
 }
 
@@ -1539,6 +1622,18 @@ func (ac *AdmissionCheckWrapper) Generation(num int64) *AdmissionCheckWrapper {
 	return ac
 }
 
+// Finalizers sets the finalizers on the AdmissionCheck.
+func (ac *AdmissionCheckWrapper) Finalizers(fin ...string) *AdmissionCheckWrapper {
+	ac.ObjectMeta.Finalizers = fin
+	return ac
+}
+
+// DeletionTimestamp sets a deletion timestamp for the AdmissionCheck.
+func (ac *AdmissionCheckWrapper) DeletionTimestamp(t time.Time) *AdmissionCheckWrapper {
+	ac.AdmissionCheck.DeletionTimestamp = &metav1.Time{Time: t}
+	return ac
+}
+
 func (ac *AdmissionCheckWrapper) ControllerName(c string) *AdmissionCheckWrapper {
 	ac.Spec.ControllerName = c
 	return ac
@@ -1565,9 +1660,7 @@ type WorkloadPriorityClassWrapper struct {
 // MakeWorkloadPriorityClass creates a wrapper for a WorkloadPriorityClass.
 func MakeWorkloadPriorityClass(name string) *WorkloadPriorityClassWrapper {
 	return &WorkloadPriorityClassWrapper{kueue.WorkloadPriorityClass{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		}},
+		Name: name},
 	}
 }
 
@@ -1594,11 +1687,7 @@ type MultiKueueConfigWrapper struct {
 
 func MakeMultiKueueConfig(name string) *MultiKueueConfigWrapper {
 	return &MultiKueueConfigWrapper{
-		MultiKueueConfig: kueue.MultiKueueConfig{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: name,
-			},
-		},
+		Name: name,
 	}
 }
 
@@ -1618,7 +1707,7 @@ func (mkc *MultiKueueConfigWrapper) Clusters(clusters ...string) *MultiKueueConf
 }
 
 func (mkc *MultiKueueConfigWrapper) QuotaManagement(mode kueue.MultiKueueConfigQuotaManagementMode) *MultiKueueConfigWrapper {
-	mkc.Spec.QuotaManagement = &mode
+	mkc.Spec.QuotaManagement = &mode //nolint:staticcheck // SA1019: kept to test that deprecated field is ignored
 	return mkc
 }
 
@@ -1628,11 +1717,7 @@ type MultiKueueClusterWrapper struct {
 
 func MakeMultiKueueCluster(name string) *MultiKueueClusterWrapper {
 	return &MultiKueueClusterWrapper{
-		MultiKueueCluster: kueue.MultiKueueCluster{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: name,
-			},
-		},
+		Name: name,
 	}
 }
 
@@ -1687,9 +1772,7 @@ type ProvisioningRequestConfigWrapper struct {
 // MakeProvisioningRequestConfig creates a wrapper for a ProvisioningRequestConfig.
 func MakeProvisioningRequestConfig(name string) *ProvisioningRequestConfigWrapper {
 	return &ProvisioningRequestConfigWrapper{kueue.ProvisioningRequestConfig{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		}},
+		Name: name},
 	}
 }
 
@@ -1777,23 +1860,79 @@ func (prc *ProvisioningRequestConfigWrapper) Obj() *kueue.ProvisioningRequestCon
 	return &prc.ProvisioningRequestConfig
 }
 
+// ProvisioningRequestWrapper wraps a ProvisioningRequest.
+type ProvisioningRequestWrapper struct {
+	autoscaling.ProvisioningRequest
+}
+
+// MakeProvisioningRequest creates a wrapper for a ProvisioningRequest.
+func MakeProvisioningRequest(name, ns string) *ProvisioningRequestWrapper {
+	return &ProvisioningRequestWrapper{autoscaling.ProvisioningRequest{
+		Name:      name,
+		Namespace: ns,
+	}}
+}
+
+func (pr *ProvisioningRequestWrapper) Obj() *autoscaling.ProvisioningRequest {
+	return &pr.ProvisioningRequest
+}
+
+func (pr *ProvisioningRequestWrapper) UID(uid types.UID) *ProvisioningRequestWrapper {
+	pr.ProvisioningRequest.UID = uid
+	return pr
+}
+
+func (pr *ProvisioningRequestWrapper) Label(k, v string) *ProvisioningRequestWrapper {
+	if pr.Labels == nil {
+		pr.Labels = make(map[string]string)
+	}
+	pr.Labels[k] = v
+	return pr
+}
+
+func (pr *ProvisioningRequestWrapper) OwnerReference(gvk schema.GroupVersionKind, name, uid string) *ProvisioningRequestWrapper {
+	AppendOwnerReference(&pr.ProvisioningRequest, gvk, name, uid, nil, nil)
+	return pr
+}
+
+func (pr *ProvisioningRequestWrapper) PodSet(templateName string, count int32) *ProvisioningRequestWrapper {
+	pr.Spec.PodSets = append(pr.Spec.PodSets, autoscaling.PodSet{
+		PodTemplateRef: autoscaling.Reference{Name: templateName},
+		Count:          count,
+	})
+	return pr
+}
+
+func (pr *ProvisioningRequestWrapper) ProvisioningClass(pc string) *ProvisioningRequestWrapper {
+	pr.Spec.ProvisioningClassName = pc
+	return pr
+}
+
+func (pr *ProvisioningRequestWrapper) WithParameter(key string, value autoscaling.Parameter) *ProvisioningRequestWrapper {
+	if pr.Spec.Parameters == nil {
+		pr.Spec.Parameters = make(map[string]autoscaling.Parameter, 1)
+	}
+	pr.Spec.Parameters[key] = value
+	return pr
+}
+
 type ClusterProfileWrapper struct {
-	inventoryv1alpha1.ClusterProfile
+	inventoryv1alpha2.ClusterProfile
 }
 
 func MakeClusterProfile(name, ns string) *ClusterProfileWrapper {
 	return &ClusterProfileWrapper{
-		ClusterProfile: inventoryv1alpha1.ClusterProfile{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: ns,
+		Name:      name,
+		Namespace: ns,
+		Spec: inventoryv1alpha2.ClusterProfileSpec{
+			ClusterManager: inventoryv1alpha2.ClusterManager{
+				Name: "test-cluster-manager",
 			},
-			Spec: inventoryv1alpha1.ClusterProfileSpec{},
 		},
 	}
 }
 
-func (cpw *ClusterProfileWrapper) Obj() *inventoryv1alpha1.ClusterProfile {
+func (cpw *ClusterProfileWrapper) Obj() *inventoryv1alpha2.ClusterProfile {
 	return &cpw.ClusterProfile
 }
 
@@ -1803,8 +1942,91 @@ func (cpw *ClusterProfileWrapper) DisplayName(displayName string) *ClusterProfil
 }
 
 func (cpw *ClusterProfileWrapper) ClusterManager(clusterManagerName string) *ClusterProfileWrapper {
-	cpw.Spec.ClusterManager = inventoryv1alpha1.ClusterManager{
+	cpw.Spec.ClusterManager = inventoryv1alpha2.ClusterManager{
 		Name: clusterManagerName,
 	}
 	return cpw
+}
+
+// CustomLabelWrapper wraps a ControllerMetricsCustomLabel.
+type CustomLabelWrapper struct {
+	label configapi.ControllerMetricsCustomLabel
+}
+
+func MakeCustomLabel(name string) *CustomLabelWrapper {
+	return &CustomLabelWrapper{label: configapi.ControllerMetricsCustomLabel{Name: name}}
+}
+
+func (w *CustomLabelWrapper) SourceLabelKey(key string) *CustomLabelWrapper {
+	w.label.SourceLabelKey = key
+	return w
+}
+
+func (w *CustomLabelWrapper) SourceAnnotationKey(key string) *CustomLabelWrapper {
+	w.label.SourceAnnotationKey = key
+	return w
+}
+
+func (w *CustomLabelWrapper) SourceKind(kind configapi.SourceKind) *CustomLabelWrapper {
+	w.label.SourceKind = new(kind)
+	return w
+}
+
+func (w *CustomLabelWrapper) TrackedValues(values ...string) *CustomLabelWrapper {
+	w.label.TrackedValues = values
+	return w
+}
+
+// Obj returns the built ControllerMetricsCustomLabel.
+func (w *CustomLabelWrapper) Obj() configapi.ControllerMetricsCustomLabel {
+	return w.label
+}
+
+// ManagedJobsNamespaceSelectorWrapper wraps the LabelSelector configured as
+// managedJobsNamespaceSelector.
+type ManagedJobsNamespaceSelectorWrapper struct {
+	selector metav1.LabelSelector
+}
+
+func MakeManagedJobsNamespaceSelector() *ManagedJobsNamespaceSelectorWrapper {
+	return &ManagedJobsNamespaceSelectorWrapper{}
+}
+
+func (w *ManagedJobsNamespaceSelectorWrapper) MatchExpressions(matchExpressions ...metav1.LabelSelectorRequirement) *ManagedJobsNamespaceSelectorWrapper {
+	w.selector.MatchExpressions = append(w.selector.MatchExpressions, matchExpressions...)
+	return w
+}
+
+// Obj returns the built LabelSelector.
+func (w *ManagedJobsNamespaceSelectorWrapper) Obj() *metav1.LabelSelector {
+	return &w.selector
+}
+
+// MatchExpressionWrapper wraps a LabelSelectorRequirement.
+type MatchExpressionWrapper struct {
+	metav1.LabelSelectorRequirement
+}
+
+func MakeMatchExpression() *MatchExpressionWrapper {
+	return &MatchExpressionWrapper{}
+}
+
+func (w *MatchExpressionWrapper) Key(key string) *MatchExpressionWrapper {
+	w.LabelSelectorRequirement.Key = key
+	return w
+}
+
+func (w *MatchExpressionWrapper) Operator(operator metav1.LabelSelectorOperator) *MatchExpressionWrapper {
+	w.LabelSelectorRequirement.Operator = operator
+	return w
+}
+
+func (w *MatchExpressionWrapper) Values(values ...string) *MatchExpressionWrapper {
+	w.LabelSelectorRequirement.Values = values
+	return w
+}
+
+// Obj returns the built LabelSelectorRequirement.
+func (w *MatchExpressionWrapper) Obj() metav1.LabelSelectorRequirement {
+	return w.LabelSelectorRequirement
 }

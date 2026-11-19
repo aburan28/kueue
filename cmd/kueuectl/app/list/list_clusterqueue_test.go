@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
@@ -39,6 +40,7 @@ func TestClusterQueueRun(t *testing.T) {
 	testCases := map[string]struct {
 		ns         string
 		objs       []runtime.Object
+		listPages  []runtime.Object
 		args       []string
 		wantOut    string
 		wantOutErr string
@@ -139,12 +141,47 @@ cq1    cohort1   1                   2                    true     60m
 		"should print not found error": {
 			wantOutErr: "No resources found\n",
 		},
+		"should print a single yaml document across pages": {
+			args: []string{"-o", "yaml"},
+			listPages: []runtime.Object{
+				&kueue.ClusterQueueList{
+					Continue: "page2",
+					Items:    []kueue.ClusterQueue{{Name: "a"}},
+				},
+				&kueue.ClusterQueueList{
+					Items: []kueue.ClusterQueue{{Name: "b"}},
+				},
+			},
+			wantOut: `apiVersion: kueue.x-k8s.io/v1beta2
+items:
+- metadata:
+    name: a
+  spec: {}
+  status:
+    admittedWorkloads: 0
+    pendingWorkloads: 0
+    reservingWorkloads: 0
+- metadata:
+    name: b
+  spec: {}
+  status:
+    admittedWorkloads: 0
+    pendingWorkloads: 0
+    reservingWorkloads: 0
+kind: ClusterQueueList
+metadata: {}
+`,
+		},
 	}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			streams, _, out, outErr := genericiooptions.NewTestIOStreams()
 
-			tcg := cmdtesting.NewTestClientGetter().WithKueueClientset(fake.NewSimpleClientset(tc.objs...))
+			clientset := fake.NewSimpleClientset(tc.objs...)
+			if len(tc.listPages) > 0 {
+				prependPagedListReactor(clientset, "clusterqueues", tc.listPages)
+			}
+			tcg := cmdtesting.NewTestClientGetter().WithKueueClientset(clientset)
 
 			cmd := NewClusterQueueCmd(tcg, streams, testingclock.NewFakeClock(testStartTime))
 			cmd.SetArgs(tc.args)
@@ -162,6 +199,58 @@ cq1    cohort1   1                   2                    true     60m
 			gotOutErr := outErr.String()
 			if diff := cmp.Diff(tc.wantOutErr, gotOutErr); diff != "" {
 				t.Errorf("Unexpected output (-want/+got)\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestClusterQueueOptionsComplete(t *testing.T) {
+	testCases := map[string]struct {
+		envValue  string
+		wantLimit int64
+		wantErr   string
+	}{
+		"should use the default limit": {
+			wantLimit: defaultListRequestLimit,
+		},
+		"should use the limit from the env var": {
+			envValue:  "5",
+			wantLimit: 5,
+		},
+		"should return an error for an invalid limit env var": {
+			envValue: "invalid",
+			wantErr:  `invalid list request limit: KUEUECTL_LIST_REQUEST_LIMIT="invalid" must be a non-negative integer`,
+		},
+		"should allow zero limit env var to disable pagination": {
+			envValue:  "0",
+			wantLimit: 0,
+		},
+		"should return an error for a negative limit env var": {
+			envValue: "-1",
+			wantErr:  `invalid list request limit: KUEUECTL_LIST_REQUEST_LIMIT="-1" must be a non-negative integer`,
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			if tc.envValue != "" {
+				t.Setenv(KueuectlListRequestLimitEnvName, tc.envValue)
+			}
+
+			streams, _, _, _ := genericiooptions.NewTestIOStreams()
+			tcg := cmdtesting.NewTestClientGetter().WithKueueClientset(fake.NewSimpleClientset())
+			o := NewClusterQueueOptions(streams, testingclock.NewFakeClock(time.Now()))
+
+			gotErr := o.Complete(tcg, &cobra.Command{}, nil)
+			var gotErrStr string
+			if gotErr != nil {
+				gotErrStr = gotErr.Error()
+			}
+			if diff := cmp.Diff(tc.wantErr, gotErrStr); diff != "" {
+				t.Errorf("Unexpected error (-want/+got)\n%s", diff)
+			}
+
+			if tc.wantErr == "" && o.Limit != tc.wantLimit {
+				t.Errorf("Unexpected limit: got %d, want %d", o.Limit, tc.wantLimit)
 			}
 		})
 	}

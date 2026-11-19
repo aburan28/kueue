@@ -19,6 +19,7 @@ package limitrange
 import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	resourcehelpers "k8s.io/component-helpers/resource"
 
 	"sigs.k8s.io/kueue/pkg/resources"
 	"sigs.k8s.io/kueue/pkg/util/resource"
@@ -67,10 +68,10 @@ func (s Summary) validatePodSpecContainers(containers []corev1.Container, path *
 		res := &containers[i].Resources
 		cMin := resource.MergeResourceListKeepMin(res.Requests, res.Limits)
 		cMax := resource.MergeResourceListKeepMax(res.Requests, res.Limits)
-		if resNames := resources.NewRequests(cMax).GreaterKeysRL(containerRange.Max); len(resNames) > 0 {
+		if resNames := resources.NewRequestsFromResourceList(cMax).GreaterKeysRL(containerRange.Max); len(resNames) > 0 {
 			allErrs = append(allErrs, field.Invalid(containerPath, resNames, RequestsMustNotBeAboveLimitRangeMaxMessage))
 		}
-		if resNames := resources.NewRequests(containerRange.Min).GreaterKeys(resources.NewRequests(cMin)); len(resNames) > 0 {
+		if resNames := resources.NewRequestsFromResourceList(containerRange.Min).GreaterKeys(resources.NewRequestsFromResourceList(cMin)); len(resNames) > 0 {
 			allErrs = append(allErrs, field.Invalid(containerPath, resNames, RequestsMustNotBeBelowLimitRangeMinMessage))
 		}
 	}
@@ -84,10 +85,14 @@ func (s Summary) ValidatePodSpec(ps *corev1.PodSpec, path *field.Path) field.Err
 	allErrs = append(allErrs, s.validatePodSpecContainers(ps.Containers, path.Child("containers"))...)
 	if podRange, found := s[corev1.LimitTypePod]; found {
 		total := resources.NewRequestsFromPodSpec(ps)
-		if resNames := total.GreaterKeysRL(podRange.Max); len(resNames) > 0 {
+		// Like the LimitRanger admission plugin, hold the pod limits to Max as well,
+		// otherwise the Workload is admitted but its Pods are rejected at creation.
+		podLimits := resourcehelpers.PodLimits(&corev1.Pod{Spec: *ps}, resourcehelpers.PodResourcesOptions{ExcludeOverhead: true})
+		pMax := resources.NewRequestsFromResourceList(resource.MergeResourceListKeepMax(resources.PodRequests(ps), podLimits))
+		if resNames := pMax.GreaterKeysRL(podRange.Max); len(resNames) > 0 {
 			allErrs = append(allErrs, field.Invalid(path, resNames, RequestsMustNotBeAboveLimitRangeMaxMessage))
 		}
-		if resNames := resources.NewRequests(podRange.Min).GreaterKeys(total); len(resNames) > 0 {
+		if resNames := resources.NewRequestsFromResourceList(podRange.Min).GreaterKeys(total); len(resNames) > 0 {
 			allErrs = append(allErrs, field.Invalid(path, resNames, RequestsMustNotBeBelowLimitRangeMinMessage))
 		}
 	}

@@ -24,7 +24,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/component-base/featuregate"
-	"k8s.io/utils/ptr"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/features"
@@ -273,6 +272,53 @@ func TestRestorePodSetsInfo(t *testing.T) {
 	}
 }
 
+func TestRunWithPodSetsInfo(t *testing.T) {
+	testCases := map[string]struct {
+		job         *kftraining.PyTorchJob
+		podSetsInfo []podset.PodSetInfo
+		wantJob     *kftraining.PyTorchJob
+	}{
+		"pod-index-offset 0 is set on Pod templates in a PodSet group": {
+			job: testingpytorchjob.MakePyTorchJob("pytorchjob", "ns").
+				PyTorchReplicaSpecsDefault().
+				PodAnnotation(kftraining.PyTorchJobReplicaTypeMaster, kueue.PodSetGroupName, "group").
+				PodAnnotation(kftraining.PyTorchJobReplicaTypeWorker, kueue.PodSetGroupName, "group").
+				Obj(),
+			podSetsInfo: []podset.PodSetInfo{{}, {}},
+			wantJob: testingpytorchjob.MakePyTorchJob("pytorchjob", "ns").
+				PyTorchReplicaSpecsDefault().
+				PodAnnotation(kftraining.PyTorchJobReplicaTypeMaster, kueue.PodSetGroupName, "group").
+				PodAnnotation(kftraining.PyTorchJobReplicaTypeMaster, kueue.PodIndexOffsetAnnotation, "0").
+				PodAnnotation(kftraining.PyTorchJobReplicaTypeWorker, kueue.PodSetGroupName, "group").
+				PodAnnotation(kftraining.PyTorchJobReplicaTypeWorker, kueue.PodIndexOffsetAnnotation, "0").
+				Suspend(false).
+				Obj(),
+		},
+		"pod-index-offset is not set on Pod templates outside a PodSet group": {
+			job: testingpytorchjob.MakePyTorchJob("pytorchjob", "ns").
+				PyTorchReplicaSpecsDefault().
+				Obj(),
+			podSetsInfo: []podset.PodSetInfo{{}, {}},
+			wantJob: testingpytorchjob.MakePyTorchJob("pytorchjob", "ns").
+				PyTorchReplicaSpecsDefault().
+				Suspend(false).
+				Obj(),
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctx, _ := utiltesting.ContextWithLog(t)
+			if err := fromObject(tc.job).RunWithPodSetsInfo(ctx, nil, tc.podSetsInfo); err != nil {
+				t.Fatalf("RunWithPodSetsInfo() failed: %v", err)
+			}
+			if diff := cmp.Diff(tc.wantJob, tc.job); diff != "" {
+				t.Errorf("Unexpected job after RunWithPodSetsInfo (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestPodSets(t *testing.T) {
 	testCases := map[string]struct {
 		job          *kftraining.PyTorchJob
@@ -329,17 +375,16 @@ func TestPodSets(t *testing.T) {
 						PodSpec(job.Spec.PyTorchReplicaSpecs[kftraining.PyTorchJobReplicaTypeMaster].Template.Spec).
 						Annotations(map[string]string{kueue.PodSetRequiredTopologyAnnotation: "cloud.com/rack"}).
 						RequiredTopologyRequest("cloud.com/rack").
-						PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+						PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 						Obj(),
 					*utiltestingapi.MakePodSet(kueue.NewPodSetReference(string(kftraining.PyTorchJobReplicaTypeWorker)), 1).
 						PodSpec(job.Spec.PyTorchReplicaSpecs[kftraining.PyTorchJobReplicaTypeWorker].Template.Spec).
 						Annotations(map[string]string{kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block"}).
 						PreferredTopologyRequest("cloud.com/block").
-						PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+						PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 						Obj(),
 				}
 			},
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
 		},
 		"without required and preferred topology annotation if TAS is disabled": {
 			job: testingpytorchjob.MakePyTorchJob("pytorchjob", "ns").
@@ -430,7 +475,6 @@ func TestValidate(t *testing.T) {
 					},
 				).
 				Obj(),
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
 		},
 		"invalid TAS request": {
 			job: testingpytorchjob.MakePyTorchJob("pytorchjob", "ns").
@@ -469,7 +513,29 @@ func TestValidate(t *testing.T) {
 					`must not contain more than one topology annotation: ["kueue.x-k8s.io/podset-required-topology", `+
 						`"kueue.x-k8s.io/podset-preferred-topology", "kueue.x-k8s.io/podset-unconstrained-topology"]`),
 			},
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
+		},
+		"invalid TAS request is accepted if TAS is disabled": {
+			job: testingpytorchjob.MakePyTorchJob("pytorchjob", "ns").
+				PyTorchReplicaSpecs(
+					testingpytorchjob.PyTorchReplicaSpecRequirement{
+						ReplicaType:  kftraining.PyTorchJobReplicaTypeMaster,
+						ReplicaCount: 1,
+						Annotations: map[string]string{
+							kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/rack",
+							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
+						},
+					},
+					testingpytorchjob.PyTorchReplicaSpecRequirement{
+						ReplicaType:  kftraining.PyTorchJobReplicaTypeWorker,
+						ReplicaCount: 3,
+						Annotations: map[string]string{
+							kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/rack",
+							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
+						},
+					},
+				).
+				Obj(),
+			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: false},
 		},
 		"invalid slice topology request - slice size larger than number of podsets": {
 			job: testingpytorchjob.MakePyTorchJob("pytorchjob", "ns").
@@ -510,7 +576,6 @@ func TestValidate(t *testing.T) {
 					"20", "must not be greater than pod set count 10",
 				),
 			},
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
 		},
 	}
 	for name, tc := range testCases {

@@ -1,8 +1,39 @@
+{{/* Determine which documentation version the current page belongs to, from its
+     path (e.g. /v0.18/docs/... or /zh-cn/v0.18/docs/...); defaults to "main". */}}
+{{ $current := "main" }}
+{{ range .Site.Params.versions }}
+	{{ if and (ne .version "main") (in $.RelPermalink (printf "/%s/" .version)) }}
+		{{ $current = .version }}
+	{{ end }}
+{{ end }}
+{{/* Preserve the current language when switching versions.
+     .Site.LanguagePrefix is empty for the default language, "/zh-cn" etc. for others. */}}
+{{ $langPrefix := .Site.LanguagePrefix }}
+
+{{/* Extract the documentation subpath (starting from /docs/) to preserve page context */}}
+{{ $docSubpath := "" }}
+{{ $docMatches := findRE "/docs/.*" $.RelPermalink }}
+{{ if gt (len $docMatches) 0 }}
+	{{ $docSubpath = index $docMatches 0 }}
+{{ end }}
+
 <a class="nav-link dropdown-toggle" href="#" id="navbarDropdown" role="button" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
-	{{ .Site.Params.version_menu }}
+	{{ .Site.Params.version_menu }}: {{ $current }}
 </a>
 <div class="dropdown-menu dropdown-menu-md-right dropdown-menu-lg-left" aria-labelledby="navbarDropdownMenuLink">
 	{{ range .Site.Params.versions }}
-	<a class="dropdown-item" href="{{ .url }}">{{ .version }}</a>
+		{{ $targetUrl := printf "%s%s" $langPrefix .url }}
+		{{ if $docSubpath }}
+			{{ $targetPath := "" }}
+			{{ if eq .version "main" }}
+				{{ $targetPath = $docSubpath }}
+			{{ else }}
+				{{ $targetPath = printf "/%s%s" .version $docSubpath }}
+			{{ end }}
+			{{ with site.GetPage $targetPath }}
+				{{ $targetUrl = .RelPermalink }}
+			{{ end }}
+		{{ end }}
+		<a class="dropdown-item{{ if eq .version $current }} active{{ end }}" href="{{ $targetUrl }}">{{ .version }}</a>
 	{{ end }}
 </div>

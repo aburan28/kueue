@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/util/slices"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	testingtrainjob "sigs.k8s.io/kueue/pkg/util/testingjobs/trainjob"
+	utiltrainjob "sigs.k8s.io/kueue/pkg/util/trainjob"
 )
 
 const (
@@ -87,7 +88,7 @@ func TestMultiKueueAdapter(t *testing.T) {
 			managersTrainJobs: []kftrainerapi.TrainJob{
 				*baseTrainJobManagedByKueueBuilder.Clone().
 					RuntimePatches([]kftrainerapi.RuntimePatch{
-						testingtrainjob.MakeRuntimePatch(runtimePatchManagerName).Obj(),
+						testingtrainjob.MakeRuntimePatch(utiltrainjob.KueueRuntimePatchManager).Obj(),
 					}).
 					Obj(),
 			},
@@ -99,7 +100,7 @@ func TestMultiKueueAdapter(t *testing.T) {
 			wantManagersTrainJobs: []kftrainerapi.TrainJob{
 				*baseTrainJobManagedByKueueBuilder.Clone().
 					RuntimePatches([]kftrainerapi.RuntimePatch{
-						testingtrainjob.MakeRuntimePatch(runtimePatchManagerName).Obj(),
+						testingtrainjob.MakeRuntimePatch(utiltrainjob.KueueRuntimePatchManager).Obj(),
 					}).
 					Obj(),
 			},
@@ -314,12 +315,16 @@ func TestMultiKueueAdapter(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			features.SetFeatureGatesDuringTest(t, tc.featureGates)
-			managerBuilder := utiltesting.NewClientBuilder(kftrainerapi.AddToScheme).WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge})
+			managerBuilder := utiltesting.NewClientBuilder(kftrainerapi.AddToScheme).WithInterceptorFuncs(interceptor.Funcs{
+				SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration,
+			})
 			managerBuilder = managerBuilder.WithLists(&kftrainerapi.TrainJobList{Items: tc.managersTrainJobs})
 			managerBuilder = managerBuilder.WithStatusSubresource(slices.Map(tc.managersTrainJobs, func(w *kftrainerapi.TrainJob) client.Object { return w })...)
 			managerClient := managerBuilder.Build()
 
-			workerBuilder := utiltesting.NewClientBuilder(kftrainerapi.AddToScheme).WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge})
+			workerBuilder := utiltesting.NewClientBuilder(kftrainerapi.AddToScheme).WithInterceptorFuncs(interceptor.Funcs{
+				SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration,
+			})
 			workerBuilder = workerBuilder.WithLists(&kftrainerapi.TrainJobList{Items: tc.workerTrainJobs})
 			workerClient := workerBuilder.Build()
 

@@ -35,6 +35,7 @@ import (
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
+	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/util/expectations"
 	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
 )
@@ -48,17 +49,17 @@ func reconcileRequestForPod(p *corev1.Pod) reconcile.Request {
 
 	if groupName == "" {
 		return reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Namespace: p.Namespace,
-				Name:      p.Name,
-			},
+			Namespace: p.Namespace,
+			Name:      p.Name,
 		}
 	}
+	return reconcileRequestForPodGroup(p.Namespace, groupName)
+}
+
+func reconcileRequestForPodGroup(namespace, groupName string) reconcile.Request {
 	return reconcile.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      groupName,
-			Namespace: fmt.Sprintf("group/%s", p.Namespace),
-		},
+		Name:      groupName,
+		Namespace: fmt.Sprintf("group/%s", namespace),
 	}
 }
 
@@ -82,15 +83,16 @@ func (h *podEventHandler) Delete(ctx context.Context, e event.DeleteEvent, q wor
 		return
 	}
 
-	log := ctrl.LoggerFrom(ctx).WithValues("pod", klog.KObj(p))
-
+	log := ctrl.LoggerFrom(ctx)
 	if groupName := utilpod.GetPodGroupName(p); groupName != "" {
 		// If the watch was temporarily unavailable, it is possible that the object reported in the event still
 		// has a finalizer, but we can consider this Pod cleaned up, as it is being deleted.
-		h.cleanedUpPodsExpectations.ObservedUID(log, types.NamespacedName{Namespace: p.Namespace, Name: groupName}, p.UID)
+		h.cleanedUpPodsExpectations.ObservedUID(log.WithValues("pod", klog.KObj(p)), types.NamespacedName{Namespace: p.Namespace, Name: groupName}, p.UID)
 	}
 
-	log.V(5).Info("Queueing reconcile for pod")
+	if logV := log.V(5); logV.Enabled() {
+		logV.Info("Queueing reconcile for pod", "pod", klog.KObj(p))
+	}
 
 	q.Add(reconcileRequestForPod(p))
 }
@@ -104,15 +106,16 @@ func (h *podEventHandler) queueReconcileForPod(ctx context.Context, object clien
 		return
 	}
 
-	log := ctrl.LoggerFrom(ctx).WithValues("pod", klog.KObj(p))
-
+	log := ctrl.LoggerFrom(ctx)
 	if groupName := utilpod.GetPodGroupName(p); groupName != "" {
 		if !slices.Contains(p.Finalizers, podconstants.PodFinalizer) {
-			h.cleanedUpPodsExpectations.ObservedUID(log, types.NamespacedName{Namespace: p.Namespace, Name: groupName}, p.UID)
+			h.cleanedUpPodsExpectations.ObservedUID(log.WithValues("pod", klog.KObj(p)), types.NamespacedName{Namespace: p.Namespace, Name: groupName}, p.UID)
 		}
 	}
 
-	log.V(5).Info("Queueing reconcile for pod")
+	if logV := log.V(5); logV.Enabled() {
+		logV.Info("Queueing reconcile for pod", "pod", klog.KObj(p))
+	}
 
 	q.Add(reconcileRequestForPod(p))
 }
@@ -128,10 +131,30 @@ func (h *workloadHandler) Update(ctx context.Context, e event.UpdateEvent, q wor
 }
 
 func (h *workloadHandler) Delete(ctx context.Context, e event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	h.queueReconcileForBlockedPodGroup(ctx, e.Object, q)
 	h.queueReconcileForChildPod(ctx, e.Object, q)
 }
 
 func (h *workloadHandler) Generic(_ context.Context, _ event.GenericEvent, _ workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+// queueReconcileForBlockedPodGroup requeues the pod group named after a deleted Workload
+// which was not created by the pod group framework. Such a Workload makes the pod group
+// refuse adoption with errNotPodGroupWorkload, which is unretryable, so without this
+// enqueue the group would stay blocked until an unrelated pod event or a resync.
+func (h *workloadHandler) queueReconcileForBlockedPodGroup(ctx context.Context, object client.Object, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	if !features.Enabled(features.PodIntegrationValidateGroupOwner) {
+		return
+	}
+	w, ok := object.(*kueue.Workload)
+	if !ok || w.Annotations[podconstants.IsGroupWorkloadAnnotationKey] == podconstants.IsGroupWorkloadAnnotationValue {
+		return
+	}
+	if logV := ctrl.LoggerFrom(ctx).V(5); logV.Enabled() {
+		logV.Info("Queueing reconcile for the pod group unblocked by the deleted workload",
+			"workload", klog.KObj(w))
+	}
+	q.Add(reconcileRequestForPodGroup(w.Namespace, w.Name))
 }
 
 func (h *workloadHandler) queueReconcileForChildPod(ctx context.Context, object client.Object, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
@@ -139,43 +162,43 @@ func (h *workloadHandler) queueReconcileForChildPod(ctx context.Context, object 
 	if !ok {
 		return
 	}
-	log := ctrl.LoggerFrom(ctx).WithValues("workload", klog.KObj(w))
-
 	if len(w.OwnerReferences) == 0 {
 		return
 	}
-	log.V(5).Info("Queueing reconcile for parent pods")
+
+	log := ctrl.LoggerFrom(ctx)
+	if logV := log.V(5); logV.Enabled() {
+		logV.Info("Queueing reconcile for parent pods", "workload", klog.KObj(w))
+	}
 
 	// Compose request for a pod group if workload has an "is-group-workload" annotation
 	if w.Annotations[podconstants.IsGroupWorkloadAnnotationKey] == podconstants.IsGroupWorkloadAnnotationValue {
-		log.V(5).Info("Queueing reconcile for the pod group", "groupName", w.Name, "namespace", w.Namespace)
-		q.Add(reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      w.Name,
-				Namespace: fmt.Sprintf("group/%s", w.Namespace),
-			},
-		})
+		if logV := log.V(5); logV.Enabled() {
+			logV.Info("Queueing reconcile for the pod group", "workload", klog.KObj(w), "groupName", w.Name, "namespace", w.Namespace)
+		}
+		q.Add(reconcileRequestForPodGroup(w.Namespace, w.Name))
 		return
 	}
 
 	// Get controller reference to a single pod object
 	if ref := metav1.GetControllerOf(object); ref != nil {
-		log.V(5).Info("Queueing reconcile for the single pod", "ControllerReference", ref)
+		if logV := log.V(5); logV.Enabled() {
+			logV.Info("Queueing reconcile for the single pod", "workload", klog.KObj(w), "controllerReference", ref)
+		}
 
 		// Parse the Group out of the OwnerReference to compare it to what was parsed out of the requested OwnerType
 		refGV, err := schema.ParseGroupVersion(ref.APIVersion)
 		if err != nil {
-			log.Error(errFailedRefAPIVersionParse, "failed to enqueue single pod request", "APIVersion", ref.APIVersion)
+			log.Error(errFailedRefAPIVersionParse, "Failed to enqueue single pod request", "workload", klog.KObj(w), "apiVersion", ref.APIVersion)
 			return
 		}
 
 		// Check if the OwnerReference is pointing to a Pod object.
 		if ref.Kind == "Pod" && refGV.Group == "" {
 			// Match found - add a Request for the object referred to in the OwnerReference
-			q.Add(reconcile.Request{NamespacedName: types.NamespacedName{
+			q.Add(reconcile.Request{
 				Name:      ref.Name,
-				Namespace: object.GetNamespace(),
-			}})
+				Namespace: object.GetNamespace()})
 			return
 		}
 	}

@@ -21,10 +21,12 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -42,6 +44,7 @@ import (
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/core"
+	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
 	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 )
@@ -65,7 +68,7 @@ var _ predicate.TypedPredicate[*kueue.ResourceFlavor] = (*rfReconciler)(nil)
 
 func newRfReconciler(c client.Client, queues *qcache.Manager, cache *schdcache.Cache, recorder events.EventRecorder, roleTracker *roletracker.RoleTracker) *rfReconciler {
 	return &rfReconciler{
-		logName:      TASResourceFlavorController,
+		logName:      "tas-resourceflavor-reconciler",
 		client:       c,
 		queues:       queues,
 		cache:        cache,
@@ -80,20 +83,30 @@ func (r *rfReconciler) logger() logr.Logger {
 }
 
 func (r *rfReconciler) setupWithManager(mgr ctrl.Manager, cache *schdcache.Cache, cfg *configapi.Configuration) (string, error) {
-	return TASResourceFlavorController, builder.TypedControllerManagedBy[reconcile.Request](mgr).
+	bld := builder.TypedControllerManagedBy[reconcile.Request](mgr).
 		Named("tas_resource_flavor_controller").
-		WatchesRawSource(source.TypedKind(
+		WatchesRawSource(cache.TrackInitialSync(source.TypedKind(
 			mgr.GetCache(),
 			&kueue.ResourceFlavor{},
 			&handler.TypedEnqueueRequestForObject[*kueue.ResourceFlavor]{},
 			r,
-		)).
-		WatchesRawSource(source.Channel(r.nodeUpdateCh, &nodeHandler{cache: cache})).
+		))).
+		WatchesRawSource(source.Channel(r.nodeUpdateCh, &nodeHandler{cache: cache}))
+	if features.Enabled(features.KueueDRADeviceFeasibility) {
+		h := &draDeviceHandler{cache: cache}
+		bld = bld.Watches(&resourcev1.ResourceSlice{}, h).
+			Watches(&resourcev1.DeviceClass{}, h).
+			Watches(&resourcev1.ResourceClaim{}, h)
+		if features.Enabled(features.KueueDRAIntegrationDeviceTaints) && cache.DeviceTaintRulesServed() {
+			bld = bld.Watches(&resourcev1.DeviceTaintRule{}, h)
+		}
+	}
+	return TASResourceFlavorController, bld.
 		WithOptions(controller.Options{
 			NeedLeaderElection:      new(false),
 			MaxConcurrentReconciles: mgr.GetControllerOptions().GroupKindConcurrency[kueue.SchemeGroupVersion.WithKind("ResourceFlavor").GroupKind().String()],
 		}).
-		WithLogConstructor(roletracker.NewLogConstructor(r.roleTracker, TASResourceFlavorController)).
+		WithLogConstructor(roletracker.NewLogConstructor(r.roleTracker, "tas-resourceflavor-reconciler")).
 		Complete(core.WithLeadingManager(mgr, r, &kueue.ResourceFlavor{}, cfg))
 }
 
@@ -101,7 +114,9 @@ var _ NodeUpdateWatcher = (*rfReconciler)(nil)
 
 func (r *rfReconciler) NotifyNodeUpdate(oldNode *corev1.Node, newNode *corev1.Node) {
 	if oldNode != nil && newNode != nil && checkNodeSchedulingPropertiesChanged(newNode, oldNode) == nodeUnchanged {
-		r.logger().V(5).Info("Skipping node update as scheduling properties are unchanged", "node", newNode.Name)
+		if logV := r.logger().V(5); logV.Enabled() {
+			logV.Info("Skipping node update as scheduling properties are unchanged", "node", klog.KObj(newNode))
+		}
 		return
 	}
 	if oldNode != nil {
@@ -136,16 +151,72 @@ func (h *nodeHandler) Generic(_ context.Context, e event.GenericEvent, q workque
 	// trigger reconcile for TAS flavors affected by the node being created or updated
 	for name, cache := range h.cache.CloneTASCache() {
 		if utiltas.NodeMatchesFlavor(node.Labels, cache.NodeLabels(), cache.TopologyLevels()) {
-			q.AddAfter(reconcile.Request{NamespacedName: types.NamespacedName{
-				Name: string(name),
-			}}, constants.UpdatesBatchPeriod)
+			q.AddAfter(reconcile.Request{
+				Name: string(name)}, constants.UpdatesBatchPeriod)
 		}
+	}
+}
+
+var _ handler.EventHandler = (*draDeviceHandler)(nil)
+
+// draDeviceHandler requeues TAS flavors on the DRA events that can make devices available.
+type draDeviceHandler struct {
+	cache *schdcache.Cache
+}
+
+func (h *draDeviceHandler) Create(_ context.Context, e event.CreateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	if makesDevicesAvailable(nil, e.Object, false) {
+		h.requeue(q)
+	}
+}
+
+func (h *draDeviceHandler) Update(_ context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	if makesDevicesAvailable(e.ObjectOld, e.ObjectNew, false) {
+		h.requeue(q)
+	}
+}
+
+func (h *draDeviceHandler) Delete(_ context.Context, e event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	if makesDevicesAvailable(e.Object, nil, e.DeleteStateUnknown) {
+		h.requeue(q)
+	}
+}
+
+func (h *draDeviceHandler) Generic(context.Context, event.GenericEvent, workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+// makesDevicesAvailable reports whether a DRA object going from oldObj to newObj can make
+// devices available. A nil oldObj is a creation and a nil newObj a deletion.
+func makesDevicesAvailable(oldObj, newObj client.Object, finalStateUnknown bool) bool {
+	oldClaim, oldIsClaim := oldObj.(*resourcev1.ResourceClaim)
+	newClaim, newIsClaim := newObj.(*resourcev1.ResourceClaim)
+	if !oldIsClaim && !newIsClaim {
+		// ResourceSlices, DeviceClasses and DeviceTaintRules change rarely, and even a delete
+		// can help: deleting the newer of two DeviceClasses for one extended resource makes
+		// the other one resolve.
+		return true
+	}
+	// Claims change with every Pod, so only a claim that frees its devices counts, as in
+	// kube-scheduler. With the final state unknown, the deallocation may have been missed.
+	switch {
+	case newClaim == nil:
+		return finalStateUnknown || oldClaim.Status.Allocation != nil
+	case oldClaim == nil:
+		return false
+	default:
+		return oldClaim.Status.Allocation != nil && newClaim.Status.Allocation == nil
+	}
+}
+
+func (h *draDeviceHandler) requeue(q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	for name := range h.cache.CloneTASCache() {
+		q.AddAfter(reconcile.Request{Name: string(name)}, constants.UpdatesBatchPeriod)
 	}
 }
 
 func (r *rfReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
-	log.V(2).Info("Reconcile TAS Resource Flavor")
+	log.V(3).Info("Reconcile TAS Resource Flavor")
 
 	flv := &kueue.ResourceFlavor{}
 	if err := r.client.Get(ctx, req.NamespacedName, flv); err != nil {
@@ -154,11 +225,11 @@ func (r *rfReconciler) Reconcile(ctx context.Context, req reconcile.Request) (re
 		}
 	}
 	if flv.Spec.TopologyName != nil {
-		// requeue inadmissible workloads as a change to the resource flavor
-		// or the set of nodes can allow admitting a workload which was
-		// previously inadmissible.
-		if cqNames := r.cache.ActiveClusterQueues(); len(cqNames) > 0 {
-			qcache.NotifyRetryInadmissible(r.queues, cqNames)
+		// requeue inadmissible workloads as a change to the resource flavor,
+		// the set of nodes or their devices can allow admitting a workload
+		// which was previously inadmissible.
+		if cqNames := r.cache.ClusterQueuesUsingFlavor(kueue.ResourceFlavorReference(req.Name)); len(cqNames) > 0 {
+			qcache.NotifyRetryInadmissible(r.queues, sets.New(cqNames...))
 		}
 	}
 	return reconcile.Result{}, nil
@@ -166,8 +237,8 @@ func (r *rfReconciler) Reconcile(ctx context.Context, req reconcile.Request) (re
 
 func (r *rfReconciler) Create(event event.TypedCreateEvent[*kueue.ResourceFlavor]) bool {
 	if event.Object.Spec.TopologyName != nil {
-		log := r.logger().WithValues("flavor", event.Object.Name)
-		log.V(2).Info("Topology TAS ResourceFlavor event")
+		log := r.logger().WithValues("resourceFlavor", klog.KObj(event.Object))
+		log.V(3).Info("Topology TAS ResourceFlavor create event")
 
 		r.cache.AddOrUpdateResourceFlavor(log, event.Object)
 		return true
@@ -182,6 +253,15 @@ func (r *rfReconciler) Delete(event event.TypedDeleteEvent[*kueue.ResourceFlavor
 func (r *rfReconciler) Update(event event.TypedUpdateEvent[*kueue.ResourceFlavor]) bool {
 	switch {
 	case ptr.Equal(event.ObjectOld.Spec.TopologyName, event.ObjectNew.Spec.TopologyName):
+		if event.ObjectNew.Spec.TopologyName != nil &&
+			(!equality.Semantic.DeepEqual(event.ObjectOld.Spec.Tolerations, event.ObjectNew.Spec.Tolerations) ||
+				!equality.Semantic.DeepEqual(event.ObjectOld.Spec.NodeTaints, event.ObjectNew.Spec.NodeTaints) ||
+				!equality.Semantic.DeepEqual(event.ObjectOld.Spec.NodeLabels, event.ObjectNew.Spec.NodeLabels)) {
+			log := r.logger().WithValues("resourceFlavor", klog.KObj(event.ObjectNew))
+			log.V(3).Info("TAS ResourceFlavor tolerations, nodeTaints or nodeLabels updated")
+			r.cache.AddOrUpdateResourceFlavor(log, event.ObjectNew)
+			return true
+		}
 		return false
 	case event.ObjectOld.Spec.TopologyName == nil:
 		return true

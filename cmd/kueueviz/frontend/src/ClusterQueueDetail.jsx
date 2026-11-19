@@ -59,8 +59,10 @@ const ClusterQueueDetail = () => {
           <Typography variant="body1"><strong>Name:</strong> {clusterQueue.metadata?.name}</Typography>
           <Typography variant="body1"><strong>UID:</strong> {clusterQueue.metadata?.uid}</Typography>
           <Typography variant="body1"><strong>Creation Timestamp:</strong> {new Date(clusterQueue.metadata?.creationTimestamp).toLocaleString()}</Typography>
-          <Typography variant="body1"><strong>Cohort:</strong>
-            <Link to={`/cohort/${clusterQueue.spec?.cohortName}`}>{clusterQueue.spec?.cohortName}</Link>
+          <Typography variant="body1"><strong>Cohort:</strong>{' '}
+            {clusterQueue.spec?.cohortName ? (
+              <Link to={`/cohort/${clusterQueue.spec.cohortName}`}>{clusterQueue.spec.cohortName}</Link>
+            ) : '-'}
           </Typography>        </Grid>
         <Grid item xs={12} sm={6}>
           <Typography variant="body1"><strong>Admitted Workloads:</strong> {clusterQueue.status?.admittedWorkloads ?? 'N/A'}</Typography>
@@ -216,7 +218,7 @@ const ClusterQueueDetail = () => {
           <TableBody>
             {clusterQueue.queues && clusterQueue.queues.length > 0 ? (
               clusterQueue.queues.map((queue) => (
-                <React.Fragment key={queue.name}>
+                <React.Fragment key={`${queue.namespace}/${queue.name}`}>
                   {queue.reservation?.map((reservation, resIndex) => (
                     <React.Fragment key={`${queue.name}-reservation-${resIndex}`}>
                       {reservation.resources?.map((resource, resResourceIndex) => (
@@ -224,7 +226,7 @@ const ClusterQueueDetail = () => {
                           {/* Display Queue Name with rowSpan across all flavors and resources */}
                           {resIndex === 0 && resResourceIndex === 0 && (
                             <TableCell rowSpan={queue.reservation.reduce((acc, flavor) => acc + (flavor.resources?.length || 0), 0)}>
-                              <Link to={`/local-queue/${queue.namespace}/${queue.name}`}>{queue.name}</Link>
+                              <Link to={`/local-queue/${queue.namespace}/${queue.name}`}>{`${queue.namespace}/${queue.name}`}</Link>
                             </TableCell>
                           )}
 

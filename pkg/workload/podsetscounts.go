@@ -19,16 +19,16 @@ package workload
 import (
 	"maps"
 
+	"k8s.io/utils/ptr"
+
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/features"
 	utilslices "sigs.k8s.io/kueue/pkg/util/slices"
 )
 
-// PodSetsCounts represents a mapping between PodSet references and their desired replica counts.
-//
-// Each key in the map corresponds to a unique kueue.PodSetReference, and the associated value
-// is the number of replicas (int32) requested for that PodSet. This type is used to facilitate
-// comparisons, updates, and compatibility checks between different sets of PodSet definitions
-// within jobs and workloads.
+// PodSetsCounts holds one replica count per PodSet, such as the requested, granted or
+// reclaimable count. Keying by PodSet name lets callers combine counts taken from lists
+// that are not in the same order, such as the spec and the admission.
 type PodSetsCounts map[kueue.PodSetReference]int32
 
 // HasSamePodSetKeys returns true if both PodSetsCounts have exactly the same PodSet keys,
@@ -64,6 +64,37 @@ func ExtractPodSetCounts(podSets []kueue.PodSet) PodSetsCounts {
 	})
 }
 
+// ExtractGrantedPodSetCounts builds a PodSetsCounts map from a list of PodSetAssignments.
+// Each entry maps PodSet name to its replica count.
+func ExtractGrantedPodSetCounts(wl *kueue.Workload) PodSetsCounts {
+	if wl.Status.Admission == nil {
+		return nil
+	}
+	counts := ExtractPodSetCounts(wl.Spec.PodSets)
+	granted := make(PodSetsCounts, len(wl.Status.Admission.PodSetAssignments))
+	for _, psa := range wl.Status.Admission.PodSetAssignments {
+		count := counts[psa.Name]
+		granted[psa.Name] = min(ptr.Deref(psa.Count, count), count)
+	}
+	return granted
+}
+
+// ExtractGrantedPodSetCountsAfterReclaim is ExtractGrantedPodSetCounts with
+// each granted count additionally capped at the PodSet's count after
+// reclaimable pods are subtracted, i.e. the number of pods the Workload still
+// effectively runs. It returns nil when the Workload has no admission.
+func ExtractGrantedPodSetCountsAfterReclaim(wl *kueue.Workload) PodSetsCounts {
+	granted := ExtractGrantedPodSetCounts(wl)
+	if granted == nil {
+		return nil
+	}
+	current := podSetsCountsAfterReclaim(wl)
+	for name, count := range granted {
+		granted[name] = min(count, current[name])
+	}
+	return granted
+}
+
 // ExtractPodSetCountsFromWorkload returns a PodSetsCounts map derived from the provided Workload.
 //
 // Important: This function assumes the Workload is not nil. It does not perform a nil check,
@@ -72,7 +103,15 @@ func ExtractPodSetCountsFromWorkload(wl *kueue.Workload) PodSetsCounts {
 	return ExtractPodSetCounts(wl.Spec.PodSets)
 }
 
-// ApplyPodSetCounts updates the count values of a Workload's PodSets based on the provided counts.
+// CanReduceMinCountOnScaleDown reports whether an admitted elastic Workload
+// can lower its PodSet minimums when partial scale-up is enabled.
+func CanReduceMinCountOnScaleDown(wl *kueue.Workload) bool {
+	return features.Enabled(features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp) &&
+		IsElasticWorkload(wl) && IsAdmitted(wl)
+}
+
+// ApplyPodSetCounts updates a Workload's PodSet counts. For admitted elastic
+// Workloads with partial scale-up enabled, it caps minimums on scale-down.
 //
 // This function only updates existing PodSets within the Workload. It ignores:
 //   - PodSet names present in the counts map but not found in the Workload.
@@ -81,9 +120,14 @@ func ExtractPodSetCountsFromWorkload(wl *kueue.Workload) PodSetsCounts {
 // Important: This function assumes the Workload is not nil. It does not perform a nil check,
 // and calling it with a nil Workload will result in a panic.
 func ApplyPodSetCounts(wl *kueue.Workload, counts PodSetsCounts) {
+	canReduceMinCount := CanReduceMinCountOnScaleDown(wl)
 	for i := range wl.Spec.PodSets {
-		if count, found := counts[wl.Spec.PodSets[i].Name]; found {
-			wl.Spec.PodSets[i].Count = count
+		ps := &wl.Spec.PodSets[i]
+		if count, found := counts[ps.Name]; found {
+			if canReduceMinCount && count < ps.Count && ps.MinCount != nil && *ps.MinCount > count {
+				ps.MinCount = new(count)
+			}
+			ps.Count = count
 		}
 	}
 }

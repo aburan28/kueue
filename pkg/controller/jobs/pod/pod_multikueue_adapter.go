@@ -23,10 +23,12 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -36,7 +38,9 @@ import (
 	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
 )
 
-type multiKueueAdapter struct{}
+type multiKueueAdapter struct {
+	clock clock.Clock
+}
 
 var _ jobframework.MultiKueueAdapter = (*multiKueueAdapter)(nil)
 
@@ -81,6 +85,38 @@ func (b *multiKueueAdapter) DeleteRemoteObject(ctx context.Context, localClient 
 	}
 
 	return nil
+}
+
+var _ jobframework.MultiKueueLocalStatusResetter = (*multiKueueAdapter)(nil)
+
+// ResetLocalStatus resets the status copied from the remote Pod back to the
+// status of a gated Pod. Pods that are ungated, terminated, terminating, or
+// were never synced with a remote Pod are left unchanged.
+func (b *multiKueueAdapter) ResetLocalStatus(ctx context.Context, localClient client.Client, key types.NamespacedName) error {
+	localPod := corev1.Pod{}
+	if err := localClient.Get(ctx, key, &localPod); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+
+	// Pod groups are not supported: a gated Pod group with a copied Running
+	// phase is still active, so its evicted workload keeps the quota reservation
+	// and this reset is never reached for it.
+	if utilpod.GetPodGroupName(&localPod) != "" {
+		return nil
+	}
+
+	if !isGated(&localPod) || utilpod.IsTerminated(&localPod) || !localPod.DeletionTimestamp.IsZero() || !hasRemoteStatus(&localPod) {
+		return nil
+	}
+
+	return clientutil.PatchStatus(ctx, localClient, &localPod, func() (bool, error) {
+		localPod.Status = corev1.PodStatus{
+			Phase:      corev1.PodPending,
+			Conditions: []corev1.PodCondition{b.schedulingGatedCondition(&localPod)},
+			QOSClass:   localPod.Status.QOSClass,
+		}
+		return true, nil
+	})
 }
 
 func (b *multiKueueAdapter) IsJobManagedByKueue(ctx context.Context, c client.Client, key types.NamespacedName) (bool, string, error) {
@@ -157,7 +193,7 @@ func syncLocalPodWithRemote(
 	if err == nil {
 		// Skip syncing if the local pod is terminating
 		if !localPod.DeletionTimestamp.IsZero() {
-			log.V(2).Info("Skipping sync since the local pod is terminating", "podName", localPod.Name)
+			log.V(3).Info("Skipping sync since the local pod is terminating", "pod", klog.KObj(localPod))
 			return nil
 		}
 
@@ -170,8 +206,10 @@ func syncLocalPodWithRemote(
 			// PodScheduled=False/Unschedulable condition verbatim would make the
 			// management cluster's autoscaler treat the gated Pod as a regular
 			// unschedulable Pod and trigger a spurious scale-up. Preserve the local
-			// condition while gated; everything else (phase, container statuses, IPs)
-			// is still synced for visibility.
+			// condition while the worker Pod is not yet scheduled; once the worker Pod
+			// reports PodScheduled=True the remote condition is synced through so the
+			// manager Pod stops showing SchedulingGated while its phase is Running.
+			// Everything else (phase, container statuses, IPs) is always synced.
 			//
 			// The cluster-autoscaler classifies a Pod as Unschedulable (a scale-up
 			// candidate) purely from PodScheduled=False/reason=Unschedulable, and
@@ -180,8 +218,13 @@ func syncLocalPodWithRemote(
 			// ArrangePodsBySchedulability / isSchedulingGated in cluster-autoscaler:
 			// https://github.com/kubernetes/autoscaler/blob/94dcda068/cluster-autoscaler/utils/kubernetes/listers.go#L180-L236
 			localScheduled := findPodCondition(localPod.Status.Conditions, corev1.PodScheduled)
+			remoteScheduled := findPodCondition(remotePod.Status.Conditions, corev1.PodScheduled)
 			localPod.Status = remotePod.Status
-			if isGated(localPod) && localScheduled != nil {
+			// Keep the local SchedulingGated condition only while the worker Pod has
+			// not been scheduled yet (PodScheduled != True). Once it is scheduled, the
+			// remote PodScheduled=True condition (already copied above) is left in place.
+			remoteIsScheduled := remoteScheduled != nil && remoteScheduled.Status == corev1.ConditionTrue
+			if isGated(localPod) && localScheduled != nil && !remoteIsScheduled {
 				setPodCondition(&localPod.Status, *localScheduled)
 			}
 			return true, nil
@@ -193,16 +236,50 @@ func syncLocalPodWithRemote(
 		ObjectMeta: api.CloneObjectMetaForCreation(&localPod.ObjectMeta),
 		Spec:       *localPod.Spec.DeepCopy(),
 	}
+	// The API server forbids ephemeralContainers on create; they are added only via the subresource.
+	remotePod.Spec.EphemeralContainers = nil
 
 	// Add prebuilt workload name and multikueue origin
 	jobframework.SetMultiKueueMeta(&remotePod, workloadName, origin)
 
 	if err = remoteClient.Create(ctx, &remotePod); err != nil {
-		log.Error(err, "Failed to create remote pod", "podName", remotePod.Name)
-		return err
+		log.Error(err, "Failed to create remote pod", "pod", klog.KObj(&remotePod))
+		return fmt.Errorf("creating remote pod %s: %w", klog.KObj(&remotePod), err)
 	}
 
 	return nil
+}
+
+// hasRemoteStatus reports whether the Pod status carries anything that only a
+// running remote Pod can report. The API server initializes a gated Pod with
+// phase Pending and a SchedulingGated PodScheduled condition only.
+func hasRemoteStatus(pod *corev1.Pod) bool {
+	return pod.Status.Phase != corev1.PodPending ||
+		!isSchedulingGatedCondition(findPodCondition(pod.Status.Conditions, corev1.PodScheduled)) ||
+		pod.Status.PodIP != "" ||
+		pod.Status.HostIP != "" ||
+		pod.Status.StartTime != nil ||
+		len(pod.Status.ContainerStatuses) > 0 ||
+		len(pod.Status.InitContainerStatuses) > 0
+}
+
+// schedulingGatedCondition returns the PodScheduled condition of a gated Pod,
+// keeping the existing one so its LastTransitionTime is preserved.
+func (b *multiKueueAdapter) schedulingGatedCondition(pod *corev1.Pod) corev1.PodCondition {
+	if c := findPodCondition(pod.Status.Conditions, corev1.PodScheduled); isSchedulingGatedCondition(c) {
+		return *c
+	}
+	return corev1.PodCondition{
+		Type:               corev1.PodScheduled,
+		Status:             corev1.ConditionFalse,
+		Reason:             corev1.PodReasonSchedulingGated,
+		Message:            "Scheduling is blocked due to non-empty scheduling gates",
+		LastTransitionTime: metav1.NewTime(b.clock.Now()),
+	}
+}
+
+func isSchedulingGatedCondition(c *corev1.PodCondition) bool {
+	return c != nil && c.Status == corev1.ConditionFalse && c.Reason == corev1.PodReasonSchedulingGated
 }
 
 // findPodCondition returns a pointer to the condition of the given type, or nil

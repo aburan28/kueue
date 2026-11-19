@@ -56,6 +56,18 @@ description: >
 
 参见[运行 RayJob](/docs/tasks/run/rayjobs)
 
+## RayCluster
+
+参见[运行 RayCluster](/zh-cn/docs/tasks/run/rayclusters)
+
+## RayService
+
+参见[运行 RayService](/zh-cn/docs/tasks/run/rayservices)
+
+## SparkApplication
+
+参见[运行 SparkApplication](/zh-cn/docs/tasks/run/kubeflow/sparkapplications)
+
 ## 特性门控
 
 通过工作负载切片实现的弹性工作负载由以下特性门控控制：
@@ -63,6 +75,8 @@ description: >
 ```yaml
 ElasticJobsViaWorkloadSlices: true
 ```
+
+SparkApplication 还需要启用 `ElasticJobsViaWorkloadSlicesForSparkApplication` 特性门控。
 
 此外，必须通过注解为每个 Job 显式启用弹性 Job 行为：
 
@@ -78,6 +92,8 @@ metadata:
     * `batch/v1.Job`
     * `ray.io/v1.RayJob`
     * `ray.io/v1.RayCluster`
+    * `ray.io/v1.RayService`
+    * `sparkoperator.k8s.io/v1beta2.SparkApplication`
 * 对于启用了部分准入的 Job，不支持弹性工作负载。
 
     * 尝试扩缩启用了部分准入的 Job 将导致准入验证错误，类似于以下内容：
@@ -87,5 +103,5 @@ metadata:
       error when patching "job.yaml": admission webhook "vjob.kb.io" denied the request: spec.parallelism: Forbidden: cannot change when partial admission is enabled and the job is not suspended
       ```
 * 扩大之前已接受的 Job 时，新工作负载必须重用最初分配的规格，即使有其他符合条件且有可用容量的规格。
-* 不支持多队列。
+* 弹性工作负载的 MultiKueue 支持目前仅适用于 `batch/v1.Job` 和 `ray.io/v1.RayCluster`（不支持 `ray.io/v1.RayJob` 或 `ray.io/v1.RayService`）。
 * 不支持拓扑感知调度（TAS）。

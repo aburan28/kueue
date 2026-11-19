@@ -18,21 +18,48 @@ filters:
   "go\\.(mod|sum)$":
     approvers:
       - dependency-approvers
+    emeritus_approvers:
+      - dependency-emeritus-approvers
 
   # Any directory depth: package.json or package-lock.json
   "package(-lock)?\\.json$":
     approvers:
       - dependency-approvers
+      - release-team
+    emeritus_approvers:
+      - dependency-emeritus-approvers
 
-  # Any directory depth: Makefile-deps.mk
-  "Makefile-deps\\.mk$":
+  "^Makefile$":
+    approvers:
+      - release-team
+    reviewers:
+      - infra-reviewers
+
+  # Any directory depth: README.md or README.md.gotmpl
+  "README\\.md(\\.gotmpl)?$":
+    approvers:
+      - release-team
+
+  # Any directory depth: INSTALL.md
+  "INSTALL\\.md(\\.gotmpl)?$":
+    approvers:
+      - release-team
+
+  # Any directory depth: Chart.yaml
+  "Chart\\.yaml$":
+    approvers:
+      - release-team
+
+  "^SECURITY-INSIGHTS\\.yaml$":
+    approvers:
+      - release-team
+
+  # Dependency makefile
+  "^hack/make/deps\\.mk$":
     approvers:
       - dependency-approvers
-
-  "^site/hugo\\.toml$":
-    approvers:
-      - hugo-approvers
-      - infra-approvers
+    emeritus_approvers:
+      - dependency-emeritus-approvers
 
   "^netlify\\.toml$":
     approvers:
@@ -42,21 +69,35 @@ filters:
   "^vendor/.*$":
     approvers:
       - dependency-approvers
+    emeritus_approvers:
+      - dependency-emeritus-approvers
 
   # Any directory depth: *_test.go
   "_test\\.go$":
     approvers:
       - test-approvers
+    reviewers:
+      - test-reviewers
+    emeritus_approvers:
+      - test-emeritus-approvers
 
-  # Any directory depth: Makefile-test.mk
-  "Makefile-(verify|test)\\.mk$":
+  # Test and verification makefiles
+  "^hack/make/(verify|test)\\.mk$":
     approvers:
       - test-approvers
+    reviewers:
+      - test-reviewers
+    emeritus_approvers:
+      - test-emeritus-approvers
 
   # Linter configs
   "^\\.golangci.*\\.ya?ml$":
     approvers:
       - test-approvers
+    reviewers:
+      - test-reviewers
+    emeritus_approvers:
+      - test-emeritus-approvers
 
   # Agent instructions and experimental agent
   "^AGENTS\\.md$":
@@ -64,19 +105,29 @@ filters:
       - agent-approvers
     reviewers:
       - agent-reviewers
+    emeritus_approvers:
+      - agent-emeritus-approvers
 
   "Dockerfile$|\\.dockerignore$":
     approvers:
       - infra-approvers
+    reviewers:
+      - infra-reviewers
 
   "^\\.github/dependabot\\.ya?ml$":
     approvers:
       - infra-approvers
+    reviewers:
+      - infra-reviewers
 
-  "^\\.cloudbuild.yaml$":
+  "^cloudbuild(-periodic)?\\.yaml$":
     approvers:
       - infra-approvers
+    reviewers:
+      - infra-reviewers
 
   "^\\.krew.yaml$":
     approvers:
       - infra-approvers
+    reviewers:
+      - infra-reviewers

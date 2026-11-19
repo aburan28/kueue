@@ -81,6 +81,11 @@ if ! command -v gh > /dev/null; then
   exit 1
 fi
 
+if ! command -v python3 > /dev/null; then
+  echo "Can't find 'python3' tool in PATH, please install Python 3"
+  exit 1
+fi
+
 if [[ "$#" -ne 1 ]]; then
   echo "${0} <version>"
   echo
@@ -188,14 +193,15 @@ function prepare_local_branch() {
   git checkout -b "$2" "${KUBERNETES_TEST_INFRA_UPSTREAM_REMOTE}/$1"
   clean_branches+=("$2")
 
-  local release_config_pattern="*release-*-*.yaml"
-
-  find . -type f -name "$release_config_pattern" -maxdepth 1 | while read -r file; do
-    # Extract version (adjust for full path)
+  local -r release_config_regex='^kueue-(periodics|periodics-s390x-ppc64le|presubmits)-release-([0-9]+)[.-]([0-9]+)\.yaml$'
+  local file base major_f minor_f
+  for file in ./*release-*.yaml; do
     base="${file##*/}"  # Get basename to ignore path
-    version=$(echo "$base" | grep -oE '[0-9]+-[0-9]+')
-
-    IFS='-' read -r major_f minor_f <<< "${version#v}"
+    if [[ ! "$base" =~ $release_config_regex ]]; then
+      continue
+    fi
+    major_f="${BASH_REMATCH[2]}"
+    minor_f="${BASH_REMATCH[3]}"
     if [ "$major_f" -lt "$MAJOR" ] || { [ "$major_f" -eq "$MAJOR" ] && [ "$minor_f" -lt "$LAST_SUPPORT_MINOR" ]; }; then
       echo "$file has version $major_f.$minor_f, which is lower than the latest supported $MAJOR.$MINOR."
       rm "$file"
@@ -206,15 +212,20 @@ function prepare_local_branch() {
   local release_suffix="release-$MAJOR-$MINOR"
 
   local periodics_file_name="kueue-periodics-$release_suffix.yaml"
+  local multi_arch_periodics_file_name="kueue-periodics-s390x-ppc64le-$release_branch.yaml"
   local presubmits_file_name="kueue-presubmits-$release_suffix.yaml"
 
   cp kueue-periodics-main.yaml "$periodics_file_name"
+  cp kueue-periodics-s390x-ppc64le-main.yaml "$multi_arch_periodics_file_name"
   cp kueue-presubmits-main.yaml "$presubmits_file_name"
 
   # Update periodics file: base_ref, name, and testgrid-tab-name
-  yq eval "(.periodics[].extra_refs[].base_ref) = \"$release_branch\"" -i "$periodics_file_name"
-  yq eval "(.periodics[].name) |= sub(\"-main\", \"-$release_suffix\")" -i "$periodics_file_name"
-  yq eval "(.periodics[].annotations[\"testgrid-tab-name\"]) |= sub(\"-main\", \"-$release_suffix\")" -i "$periodics_file_name"
+  local periodics_file
+  for periodics_file in "$periodics_file_name" "$multi_arch_periodics_file_name"; do
+    yq eval "(.periodics[].extra_refs[].base_ref) = \"$release_branch\"" -i "$periodics_file"
+    yq eval "(.periodics[].name) |= sub(\"-main\", \"-$release_suffix\")" -i "$periodics_file"
+    yq eval "(.periodics[].annotations[\"testgrid-tab-name\"]) |= sub(\"-main\", \"-$release_suffix\")" -i "$periodics_file"
+  done
 
   # Update presubmits file: branches, name, and testgrid-tab-name
   yq eval "(.presubmits.kubernetes-sigs/kueue.[].branches[]) |= sub(\"\^main\", \"^$release_branch\")" -i "$presubmits_file_name"
@@ -261,6 +272,7 @@ function push_and_create_pr() {
   read -p "+++ Proceed (anything other than 'y' aborts it)? [y/N] " -r
   if ! [[ "${REPLY}" =~ ^[yY]$ ]]; then
     echo "Aborting." >&2
+    exit 1
   else
     git push "${KUBERNETES_TEST_INFRA_FORK_REMOTE}" -f "${3}:${2}"
     make_pr "$1" "$2" "$4"
@@ -286,6 +298,7 @@ push_and_create_pr master "${CI_BRANCH}" "${CI_BRANCH_UNIQUE}" "${CI_PR_NAME}"
 CI_PR_NUMBER=$(gh pr list --repo="${KUBERNETES_TEST_INFRA_MAIN_REPO_ORG}/${KUBERNETES_TEST_INFRA_MAIN_REPO_NAME}" | grep "${CI_PR_NAME}" | awk '{print $1}' || true)
 if [ -n "$CI_PR_NUMBER" ]; then
   NEW_RELEASE_ISSUE_BODY=${RELEASE_ISSUE_BODY//<!-- CI_PULL -->/${KUBERNETES_TEST_INFRA_MAIN_REPO_ORG}/${KUBERNETES_TEST_INFRA_MAIN_REPO_NAME}#${CI_PR_NUMBER}}
+  NEW_RELEASE_ISSUE_BODY=$(printf '%s' "${NEW_RELEASE_ISSUE_BODY}" | python3 "${KUBERNETES_SIGS_KUEUE_PATH}/hack/releasing/mark_step_done.py" ci-pull)
   gh issue edit "${RELEASE_ISSUE_NUMBER}" --body "${NEW_RELEASE_ISSUE_BODY}" --repo="${KUBERNETES_SIGS_KUEUE_MAIN_REPO_ORG}/${KUBERNETES_SIGS_KUEUE_MAIN_REPO_NAME}" || {
     echo "!!! Failed to edit release issue \"${RELEASE_ISSUE_NAME}\": gh issue edit command failed."
   }

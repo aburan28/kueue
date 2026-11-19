@@ -81,6 +81,11 @@ if ! command -v gh > /dev/null; then
   exit 1
 fi
 
+if ! command -v python3 > /dev/null; then
+  echo "Can't find 'python3' tool in PATH, please install Python 3"
+  exit 1
+fi
+
 if [[ "$#" -lt 1 ]]; then
   echo "${0} [--target <all|release|main>] <version>"
   echo
@@ -100,7 +105,7 @@ if [[ "$#" -lt 1 ]]; then
   echo "    $0 --target release v0.13.2         # Create only release branch PR"
   echo "    $0 --target main v0.13.2            # Create only main branch PR"
   echo
-  echo "  Set the DRY_RUN environment var to skip git push and creating PR."
+  echo "  Set the DRY_RUN environment var to skip git push, PR creation and the release issue update."
   echo "  This is useful for creating patches to a release branch without making a PR."
   echo "  When DRY_RUN is set the script will leave you in a branch containing the commits."
   echo
@@ -168,7 +173,7 @@ CHANGELOG_FILE="${REPO_ROOT}/CHANGELOG/CHANGELOG-${MAJOR_MINOR}.md"
 declare -r CHANGELOG_FILE
 
 # shellcheck disable=SC2016
-CHANGELOG=$(echo "${RELEASE_ISSUE_BODY}" | sed -n '/^```markdown$/,/^```$/p' | sed '/^```markdown$/d;/^```$/d')
+CHANGELOG=$(echo "${RELEASE_ISSUE_BODY}" | sed -n '/<!-- release-changelog-start -->/,/<!-- release-changelog-end -->/p' | sed -n '/^```markdown$/,/^```$/p' | sed '/^```markdown$/d;/^```$/d')
 if [ -z "$CHANGELOG" ]; then
   echo "!!! No changelog found. Please update issue and add changelog."
 fi
@@ -211,6 +216,9 @@ function cleanup {
   done
 }
 trap cleanup EXIT
+
+# Read before any branch switch: older release branches may not have this helper.
+MARK_STEP_DONE_PY=$(<"${REPO_ROOT}/hack/releasing/mark_step_done.py")
 
 # $1 - version
 # $2 - branch
@@ -269,6 +277,22 @@ function prepare_local_branch() {
     fi
   fi
 
+  # Freeze the release's docs into a path-based snapshot (site/content/*/v0.X/docs)
+  # and add it to the version dropdown. Runs on the main PR for major, minor, AND
+  # patch releases -- kept independent of the version-string bump above (which is
+  # skipped for older lines via --skip-version-updates) so patch releases still
+  # refresh their docs: a new minor creates the snapshot, and a patch to a still-
+  # retained minor re-freezes it to the new patch version (e.g. v0.17.7 -> v0.17.8).
+  # Skipped only when the line is neither the newest nor an already-retained
+  # snapshot (i.e. an out-of-window/unsupported version). Sourced from the release
+  # branch; committed on main and flows to the live website branch via the usual
+  # main->website merge.
+  if [ "$1" = "main" ]; then
+    if [[ MAJOR -gt LATEST_MAJOR ]] || [[ MAJOR -eq LATEST_MAJOR && MINOR -ge LATEST_MINOR ]] || [[ -d "site/content/en/v${MAJOR_MINOR}" ]]; then
+      hack/releasing/snapshot-docs.py "v${MAJOR_MINOR}" "${UPSTREAM_REMOTE}/${RELEASE_BRANCH}"
+    fi
+  fi
+
   git add .
   git commit -m "$3"
 }
@@ -286,6 +310,7 @@ function make_pr() {
   pr_text=$(cat <<EOF
 #### What type of PR is this?
 /kind cleanup
+/area release
 
 #### What this PR does / why we need it:
 $3.
@@ -310,11 +335,6 @@ EOF
 # $3 - local branch
 # $4 - pr name
 function push_and_create_pr() {
-  if [[ -n "${DRY_RUN}" ]]; then
-    echo "!!! Skipping git push and PR creation because you set DRY_RUN."
-    return
-  fi
-
   echo
   echo "+++ I'm about to do the following to push to GitHub (and I'm assuming ${FORK_REMOTE} is your personal fork):"
   echo
@@ -324,6 +344,7 @@ function push_and_create_pr() {
   read -p "+++ Proceed (anything other than 'y' aborts it)? [y/n] " -r
   if ! [[ "${REPLY}" =~ ^[yY]$ ]]; then
     echo "Aborting." >&2
+    exit 1
   else
     git push "${FORK_REMOTE}" -f "${3}:${2}"
     make_pr "$1" "$2" "$4"
@@ -340,14 +361,20 @@ if [[ "$TARGET" == "all" || "$TARGET" == "release" ]]; then
   declare -r PREPARE_RELEASE_PR_NAME
 
   prepare_local_branch "${RELEASE_BRANCH}" "${PREPARE_RELEASE_BRANCH_UNIQUE}" "${PREPARE_RELEASE_PR_NAME}"
-  push_and_create_pr "${RELEASE_BRANCH}" "${PREPARE_RELEASE_BRANCH}" "${PREPARE_RELEASE_BRANCH_UNIQUE}" "${PREPARE_RELEASE_PR_NAME}"
 
-  PREPARE_RELEASE_PR_NUMBER=$(gh pr list --repo="${MAIN_REPO_ORG}/${MAIN_REPO_NAME}" | grep "${PREPARE_RELEASE_PR_NAME}" | awk '{print $1}' || true)
-  if [ -n "$PREPARE_RELEASE_PR_NUMBER" ]; then
-    RELEASE_ISSUE_BODY=${RELEASE_ISSUE_BODY//<!-- PREPARE_PULL_RELEASE -->/#${PREPARE_RELEASE_PR_NUMBER}}
-    gh issue edit "${RELEASE_ISSUE_NUMBER}" --body "${RELEASE_ISSUE_BODY}" --repo="${MAIN_REPO_ORG}/${MAIN_REPO_NAME}" || {
-      echo "!!! Failed to edit release issue \"${RELEASE_ISSUE_NAME}\": gh issue edit command failed."
-    }
+  # A dry run with --target all must still prepare the main branch below.
+  if [[ -z "${DRY_RUN}" ]]; then
+    push_and_create_pr "${RELEASE_BRANCH}" "${PREPARE_RELEASE_BRANCH}" "${PREPARE_RELEASE_BRANCH_UNIQUE}" "${PREPARE_RELEASE_PR_NAME}"
+    PREPARE_RELEASE_PR_NUMBER=$(gh pr list --repo="${MAIN_REPO_ORG}/${MAIN_REPO_NAME}" | grep "${PREPARE_RELEASE_PR_NAME}" | awk '{print $1}' || true)
+    if [ -n "$PREPARE_RELEASE_PR_NUMBER" ]; then
+      RELEASE_ISSUE_BODY=${RELEASE_ISSUE_BODY//<!-- PREPARE_PULL_RELEASE -->/#${PREPARE_RELEASE_PR_NUMBER}}
+      RELEASE_ISSUE_BODY=$(printf '%s' "${RELEASE_ISSUE_BODY}" | python3 -c "${MARK_STEP_DONE_PY}" prepare-pull-release)
+      gh issue edit "${RELEASE_ISSUE_NUMBER}" --body "${RELEASE_ISSUE_BODY}" --repo="${MAIN_REPO_ORG}/${MAIN_REPO_NAME}" || {
+        echo "!!! Failed to edit release issue \"${RELEASE_ISSUE_NAME}\": gh issue edit command failed."
+      }
+    fi
+  else
+    echo "!!! Skipping git push, PR creation and issue update because you set DRY_RUN."
   fi
 fi
 
@@ -360,11 +387,17 @@ if [[ "$TARGET" == "all" || "$TARGET" == "main" ]]; then
   UPDATE_MAIN_WITH_LATEST_PR_NAME="Update main with the latest ${RELEASE_VERSION}"
 
   prepare_local_branch main "${UPDATE_MAIN_WITH_LATEST_BRANCH_UNIQUE}" "${UPDATE_MAIN_WITH_LATEST_PR_NAME}"
-  push_and_create_pr main "${UPDATE_MAIN_WITH_LATEST_BRANCH}" "${UPDATE_MAIN_WITH_LATEST_BRANCH_UNIQUE}" "${UPDATE_MAIN_WITH_LATEST_PR_NAME}"
 
+  if [[ -n "${DRY_RUN}" ]]; then
+    echo "!!! Skipping git push, PR creation and issue update because you set DRY_RUN."
+    exit 0
+  fi
+
+  push_and_create_pr main "${UPDATE_MAIN_WITH_LATEST_BRANCH}" "${UPDATE_MAIN_WITH_LATEST_BRANCH_UNIQUE}" "${UPDATE_MAIN_WITH_LATEST_PR_NAME}"
   PREPARE_MAIN_PR_NUMBER=$(gh pr list --repo="${MAIN_REPO_ORG}/${MAIN_REPO_NAME}" | grep "${UPDATE_MAIN_WITH_LATEST_PR_NAME}" | awk '{print $1}' || true)
   if [ -n "$PREPARE_MAIN_PR_NUMBER" ]; then
     RELEASE_ISSUE_BODY=${RELEASE_ISSUE_BODY//<!-- PREPARE_PULL_MAIN -->/#${PREPARE_MAIN_PR_NUMBER}}
+    RELEASE_ISSUE_BODY=$(printf '%s' "${RELEASE_ISSUE_BODY}" | python3 -c "${MARK_STEP_DONE_PY}" prepare-pull-main)
     gh issue edit "${RELEASE_ISSUE_NUMBER}" --body "${RELEASE_ISSUE_BODY}" --repo="${MAIN_REPO_ORG}/${MAIN_REPO_NAME}" || {
       echo "!!! Failed to edit release issue \"${RELEASE_ISSUE_NAME}\": gh issue edit command failed."
     }

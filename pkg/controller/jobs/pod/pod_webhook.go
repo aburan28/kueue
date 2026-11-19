@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/constants"
 	ctrlconstants "sigs.k8s.io/kueue/pkg/controller/constants"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	jobframeworktas "sigs.k8s.io/kueue/pkg/controller/jobframework/tas"
 	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 	"sigs.k8s.io/kueue/pkg/features"
 	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
@@ -50,25 +51,30 @@ var (
 	groupNameAnnotationPath        = annotationsPath.Key(podconstants.GroupNameAnnotation)
 	groupTotalCountAnnotationPath  = annotationsPath.Key(podconstants.GroupTotalCountAnnotation)
 	retriableInGroupAnnotationPath = annotationsPath.Key(podconstants.RetriableInGroupAnnotationKey)
+	podIndexLabelAnnotationPath    = annotationsPath.Key(kueue.PodGroupPodIndexLabelAnnotation)
 )
 
 type PodWebhook struct {
+	integrationManager           *jobframework.IntegrationManager
 	client                       client.Client
 	queues                       *qcache.Manager
 	manageJobsWithoutQueueName   bool
 	managedJobsNamespaceSelector labels.Selector
 	namespaceSelector            *metav1.LabelSelector
 	podSelector                  *metav1.LabelSelector
+	maxTimeoutOnWorkload         *metav1.Duration
 }
 
 // SetupWebhook configures the webhook for pods.
 func SetupWebhook(mgr ctrl.Manager, opts ...jobframework.Option) error {
 	options := jobframework.ProcessOptions(opts...)
 	wh := &PodWebhook{
+		integrationManager:           options.IntegrationManager,
 		client:                       mgr.GetClient(),
 		queues:                       options.Queues,
 		manageJobsWithoutQueueName:   options.ManageJobsWithoutQueueName,
 		managedJobsNamespaceSelector: options.ManagedJobsNamespaceSelector,
+		maxTimeoutOnWorkload:         options.MaxTimeoutOnWorkload,
 	}
 	obj := &corev1.Pod{}
 	if options.NoopWebhook {
@@ -143,7 +149,7 @@ func (w *PodWebhook) Default(ctx context.Context, obj *corev1.Pod) error {
 		}
 
 		// Do not suspend a Pod whose owner is already managed by Kueue
-		ancestorJob, err := jobframework.FindAncestorJobManagedByKueue(ctx, w.client, pod.Object(), w.manageJobsWithoutQueueName)
+		ancestorJob, err := w.integrationManager.FindAncestorJobManagedByKueue(ctx, w.client, pod.Object(), w.manageJobsWithoutQueueName)
 		if err != nil || ancestorJob != nil {
 			return err
 		}
@@ -157,7 +163,10 @@ func (w *PodWebhook) Default(ctx context.Context, obj *corev1.Pod) error {
 			pod.pod.Labels[ctrlconstants.QueueLabel] = string(ctrlconstants.DefaultLocalQueueName)
 		}
 
-		jobframework.ApplyDefaultWorkloadPriorityClass(ctx, w.client, pod.Object())
+		// The namespace selector was already enforced above, so it is not re-checked here.
+		if err := w.integrationManager.ApplyDefaultWorkloadPriorityClass(ctx, w.client, pod.Object(), nil); err != nil {
+			return err
+		}
 
 		suspend = jobframework.QueueNameForObject(pod.Object()) != "" || w.manageJobsWithoutQueueName
 		if suspend {
@@ -176,11 +185,16 @@ func (w *PodWebhook) Default(ctx context.Context, obj *corev1.Pod) error {
 		gate(&pod.pod)
 
 		if features.Enabled(features.TopologyAwareScheduling) {
-			if val, ok := pod.pod.Annotations[kueue.PodGroupPodIndexLabelAnnotation]; ok {
-				if pod.pod.Labels == nil {
-					pod.pod.Labels = make(map[string]string, 1)
+			if labelKey, ok := pod.pod.Annotations[kueue.PodGroupPodIndexLabelAnnotation]; ok {
+				// Copy the index only when it survives the read that Workload construction
+				// performs later. A value that fails there arrives as an invalid index
+				// rather than as "no index", and that fails the whole group.
+				index, err := pod.readPodIndex(labelKey)
+				if err != nil {
+					log.V(3).Info("Ignoring unusable Pod index label", "label", labelKey, "error", err)
+				} else {
+					pod.pod.Labels[kueue.PodGroupPodIndexLabel] = index
 				}
-				pod.pod.Labels[kueue.PodGroupPodIndexLabel] = pod.pod.Labels[val]
 			}
 			utilpod.Gate(&pod.pod, kueue.TopologySchedulingGate)
 		}
@@ -205,10 +219,12 @@ func (w *PodWebhook) ValidateCreate(ctx context.Context, obj *corev1.Pod) (admis
 	log := ctrl.LoggerFrom(ctx).WithName("pod-webhook")
 	log.V(5).Info("Validating create")
 
-	allErrs := jobframework.ValidateJobOnCreate(pod)
+	allErrs := jobframework.ValidateJobOnCreate(pod, w.maxTimeoutOnWorkload)
 	allErrs = append(allErrs, validateCommon(pod)...)
+	// Create only: a Pod that predates the gate being turned on must stay updatable.
+	allErrs = append(allErrs, validatePodGroupPodIndexLabel(pod)...)
 
-	if warn := warningForPodManagedLabel(pod); warn != "" {
+	if warn := warningForPodManagedLabel(w.integrationManager, pod); warn != "" {
 		warnings = append(warnings, warn)
 	}
 
@@ -223,7 +239,7 @@ func (w *PodWebhook) ValidateUpdate(ctx context.Context, oldObj, newObj *corev1.
 	log := ctrl.LoggerFrom(ctx).WithName("pod-webhook")
 	log.V(5).Info("Validating update")
 
-	allErrs := jobframework.ValidateJobOnUpdate(oldPod, newPod, w.queues.DefaultLocalQueueExist)
+	allErrs := jobframework.ValidateJobOnUpdate(oldPod, newPod, w.queues.DefaultLocalQueueExist, w.maxTimeoutOnWorkload)
 	allErrs = append(allErrs, validateCommon(newPod)...)
 	allErrs = append(allErrs, validateUpdateForRetriableInGroupAnnotation(oldPod, newPod)...)
 
@@ -233,7 +249,7 @@ func (w *PodWebhook) ValidateUpdate(ctx context.Context, oldObj, newObj *corev1.
 	}
 
 	if _, suspendByParent := newPod.pod.Annotations[podconstants.SuspendedByParentAnnotation]; !suspendByParent {
-		if warn := warningForPodManagedLabel(newPod); warn != "" {
+		if warn := warningForPodManagedLabel(w.integrationManager, newPod); warn != "" {
 			warnings = append(warnings, warn)
 		}
 	}
@@ -264,9 +280,9 @@ func validateManagedLabel(pod *Pod) field.ErrorList {
 }
 
 // warningForPodManagedLabel returns a warning message if the pod has a managed label, and it's parent is managed by kueue
-func warningForPodManagedLabel(p *Pod) string {
+func warningForPodManagedLabel(integrationManager *jobframework.IntegrationManager, p *Pod) string {
 	managedLabel := p.pod.GetLabels()[constants.ManagedByKueueLabelKey]
-	if managedLabel == constants.ManagedByKueueLabelValue && jobframework.IsOwnerManagedByKueueForObject(p.Object()) {
+	if managedLabel == constants.ManagedByKueueLabelValue && integrationManager.IsOwnerManagedByKueueForObject(p.Object()) {
 		return fmt.Sprintf("pod owner is managed by kueue, label '%s=%s' might lead to unexpected behaviour",
 			constants.ManagedByKueueLabelKey, constants.ManagedByKueueLabelValue)
 	}
@@ -304,8 +320,40 @@ func validatePodGroupMetadata(p *Pod) field.ErrorList {
 	return allErrs
 }
 
+// readPodIndex returns the index held by labelKey, and the error Workload construction would report for it.
+func (p *Pod) readPodIndex(labelKey string) (string, error) {
+	index := p.pod.Labels[labelKey]
+	groupTotalCount, err := p.groupTotalCount()
+	if err != nil {
+		// Outside a group there is no count to bound the index against.
+		_, err := utilpod.ReadUIntFromLabel(p.Object(), labelKey)
+		return index, err
+	}
+	_, err = utilpod.ReadUIntFromLabelBelowBound(p.Object(), labelKey, groupTotalCount)
+	return index, err
+}
+
+// validatePodGroupPodIndexLabel checks that the index-label annotation resolves to the Pod's index.
+func validatePodGroupPodIndexLabel(p *Pod) field.ErrorList {
+	// Without TAS the index is never read, so a Pod that cannot resolve one is no
+	// worse off for it. The gate is on by default and so cannot declare TAS as a
+	// dependency: that would fail config validation wherever TAS is turned off.
+	if !features.Enabled(features.TopologyAwareScheduling) ||
+		!features.Enabled(features.TASRejectInvalidPodIndexLabel) {
+		return nil
+	}
+	labelKey, ok := p.pod.Annotations[kueue.PodGroupPodIndexLabelAnnotation]
+	if !ok {
+		return nil
+	}
+	if _, err := p.readPodIndex(labelKey); err != nil {
+		return field.ErrorList{field.Invalid(podIndexLabelAnnotationPath, labelKey, err.Error())}
+	}
+	return nil
+}
+
 func validateTopologyRequest(pod *Pod) field.ErrorList {
-	return jobframework.ValidateTASPodSetRequest(metaPath, &pod.pod.ObjectMeta)
+	return jobframeworktas.ValidateTASPodSetRequest(metaPath, &pod.pod.ObjectMeta)
 }
 
 func validateUpdateForRetriableInGroupAnnotation(oldPod, newPod *Pod) field.ErrorList {

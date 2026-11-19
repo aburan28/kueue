@@ -19,10 +19,8 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 
@@ -40,21 +38,18 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/utils/ptr"
-	inventoryv1alpha1 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha1"
+	inventoryv1alpha2 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	configapiv1beta1 "sigs.k8s.io/kueue/apis/config/v1beta1"
 	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueuealpha "sigs.k8s.io/kueue/apis/kueue/v1alpha1"
-	kueuev1beta1 "sigs.k8s.io/kueue/apis/kueue/v1beta1"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
+	"sigs.k8s.io/kueue/pkg/cache/scheduler/was"
 	"sigs.k8s.io/kueue/pkg/config"
 	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/multikueue"
@@ -66,17 +61,21 @@ import (
 	"sigs.k8s.io/kueue/pkg/controller/elasticjobs"
 	"sigs.k8s.io/kueue/pkg/controller/failurerecovery"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	"sigs.k8s.io/kueue/pkg/controller/jobs"
 	"sigs.k8s.io/kueue/pkg/controller/tas"
 	tasindexer "sigs.k8s.io/kueue/pkg/controller/tas/indexer"
+	"sigs.k8s.io/kueue/pkg/controller/unscheduledpods"
 	"sigs.k8s.io/kueue/pkg/controller/workloaddispatcher"
 	"sigs.k8s.io/kueue/pkg/debugger"
 	"sigs.k8s.io/kueue/pkg/dra"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
+	"sigs.k8s.io/kueue/pkg/resources"
 	"sigs.k8s.io/kueue/pkg/scheduler"
 	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
 	"sigs.k8s.io/kueue/pkg/scheduler/preemption/fairsharing"
 	"sigs.k8s.io/kueue/pkg/util/cert"
+	utildra "sigs.k8s.io/kueue/pkg/util/dra"
 	"sigs.k8s.io/kueue/pkg/util/expectations"
 	"sigs.k8s.io/kueue/pkg/util/kubeversion"
 	utillogging "sigs.k8s.io/kueue/pkg/util/logging"
@@ -91,13 +90,12 @@ import (
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
-	// Ensure linking of the job controllers.
-	_ "sigs.k8s.io/kueue/pkg/controller/jobs"
 )
 
 var (
-	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
+	scheme             = runtime.NewScheme()
+	setupLog           = ctrl.Log.WithName("setup")
+	integrationManager = jobs.NewIntegrationManager()
 )
 
 func init() {
@@ -106,15 +104,13 @@ func init() {
 	utilruntime.Must(resourceapi.AddToScheme(scheme))
 
 	utilruntime.Must(kueue.AddToScheme(scheme))
-	utilruntime.Must(kueuev1beta1.AddToScheme(scheme))
 	utilruntime.Must(kueuealpha.AddToScheme(scheme))
-	utilruntime.Must(configapiv1beta1.AddToScheme(scheme))
 	utilruntime.Must(configapi.AddToScheme(scheme))
 	utilruntime.Must(autoscaling.AddToScheme(scheme))
-	utilruntime.Must(inventoryv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(inventoryv1alpha2.AddToScheme(scheme))
 	// Add any additional framework integration types.
 	utilruntime.Must(
-		jobframework.ForEachIntegration(func(_ string, cb jobframework.IntegrationCallbacks) error {
+		integrationManager.ForEachIntegration(func(_ string, cb jobframework.IntegrationCallbacks) error {
 			if cb.AddToScheme != nil {
 				return cb.AddToScheme(scheme)
 			}
@@ -160,13 +156,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Apply feature-gated defaults after the configured gates have been loaded.
+	scheme.Default(&cfg)
+
 	// Validates the configuration after it has been loaded and feature gates have been set.
-	if err := config.Validate(&cfg, scheme).ToAggregate(); err != nil {
+	if err := config.Validate(&cfg, scheme, integrationManager).ToAggregate(); err != nil {
 		setupLog.Error(err, "Unable to validate the configuration")
 		os.Exit(1)
 	}
 
-	setupLog.Info(
+	setupLog.V(1).Info(
 		"Initializing",
 		"gitVersion",
 		version.GitVersion,
@@ -178,15 +177,15 @@ func main() {
 
 	features.LogFeatureGates(setupLog)
 
+	if labels := jobframework.NonInheritableLabelsIn(cfg.Integrations.LabelKeysToCopy); len(labels) > 0 {
+		setupLog.V(1).Info("integrations.labelKeysToCopy names Kueue's internal labels, which are never copied to a Workload", "labels", labels)
+	}
+
 	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
 	// More info:
 	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.1/pkg/metrics/server
 	// - https://book.kubebuilder.io/reference/metrics.html
-	metricsServerOptions := metricsserver.Options{
-		BindAddress:    cfg.Metrics.BindAddress,
-		SecureServing:  true,
-		FilterProvider: filters.WithAuthenticationAndAuthorization,
-	}
+	metricsServerOptions := config.MetricsServerOptions(setupLog, cfg.Metrics)
 
 	parsedTLSConfig := &tlsconfig.TLS{}
 	if features.Enabled(features.TLSOptions) {
@@ -212,8 +211,8 @@ func main() {
 	var metricsCertWatcher *certwatcher.CertWatcher
 	if cfg.InternalCertManagement == nil || !*cfg.InternalCertManagement.Enable {
 		metricsCertPath := "/etc/kueue/metrics/certs"
-		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
-			"metrics-cert-path", metricsCertPath)
+		setupLog.V(1).Info("Initializing metrics certificate watcher using provided certificates",
+			"metricsCertPath", metricsCertPath)
 
 		var err error
 		metricsCertWatcher, err = certwatcher.New(
@@ -231,13 +230,17 @@ func main() {
 	}
 	options.Metrics = metricsServerOptions
 
-	lqMetrics := metrics.NewLocalQueueMetricsConfig(cfg.Metrics.LocalQueueMetrics)
+	lqMetrics, err := metrics.NewLocalQueueMetricsConfig(cfg.Metrics.LocalQueueMetrics)
+	if err != nil {
+		setupLog.Error(err, "Unable to configure LocalQueue metrics")
+		os.Exit(1)
+	}
 
 	var customLabels *metrics.CustomLabels
 	if features.Enabled(features.CustomMetricLabels) {
 		customLabels = metrics.NewCustomLabels(cfg.Metrics.CustomLabels)
 	} else if len(cfg.Metrics.CustomLabels) > 0 {
-		setupLog.Info("metrics.customLabels is configured but CustomMetricLabels feature gate is disabled; custom labels will have no effect")
+		setupLog.V(1).Info("metrics.customLabels is configured but CustomMetricLabels feature gate is disabled; custom labels will have no effect")
 	}
 	metrics.Register()
 
@@ -256,9 +259,17 @@ func main() {
 			int(*cfg.ClientConnection.Burst),
 		)
 	}
-	setupLog.V(2).Info("K8S Client", "qps", *cfg.ClientConnection.QPS, "burst", *cfg.ClientConnection.Burst)
+	setupLog.V(1).Info("K8S Client", "qps", *cfg.ClientConnection.QPS, "burst", *cfg.ClientConnection.Burst)
+
+	if leaderElectionEnabled(&cfg) {
+		// Keep the leader election lease client off the shared RateLimiter, so that a
+		// burst of controller requests cannot delay lease renewals past renewDeadline.
+		config.SetLeaderElectionConfig(&options, kubeConfig, &cfg)
+	}
 
 	ctx := ctrl.SetupSignalHandler()
+	// Use setupCtx for startup-only calls so setupLog does not leak into long-lived runtime components using ctx.
+	setupCtx := ctrl.LoggerInto(ctx, setupLog)
 	// Bootstrap certificates before creating the main manager
 	// This ensures certs are ready and CA bundles are injected into conversion CRDs
 	if cfg.InternalCertManagement != nil && *cfg.InternalCertManagement.Enable {
@@ -268,10 +279,17 @@ func main() {
 		}
 	}
 
+	var clusterProfileCRDPresent bool
 	if features.Enabled(features.MultiKueueClusterProfile) {
-		if err := config.ConfigureClusterProfileCache(ctx, setupLog, &options, kubeConfig, cfg); err != nil {
-			setupLog.Error(err, "Unable to configure cluster profile")
+		var err error
+		if clusterProfileCRDPresent, err = config.ClusterProfileCRDPresent(setupCtx, kubeConfig); err != nil {
+			setupLog.Error(err, "Unable to check ClusterProfile CRD")
 			os.Exit(1)
+		}
+		if clusterProfileCRDPresent {
+			config.ConfigureClusterProfileCache(&options, cfg)
+		} else {
+			setupLog.V(1).Info("Skipping MultiKueue ClusterProfile setup as the ClusterProfile CRD is not installed")
 		}
 	}
 
@@ -283,22 +301,24 @@ func main() {
 
 	roleTracker := setupRoleTracker(ctx, mgr, &cfg)
 
-	certsReady := make(chan struct{})
-
 	if cfg.InternalCertManagement != nil && *cfg.InternalCertManagement.Enable {
-		if err = cert.ManageCerts(mgr, cfg, certsReady); err != nil {
+		if err = cert.ManageCerts(mgr, cfg); err != nil {
 			setupLog.Error(err, "Unable to set up cert rotation")
 			os.Exit(1)
 		}
-	} else {
-		close(certsReady)
+		if err = cert.ManageVisibilityCerts(mgr, cfg); err != nil {
+			setupLog.Error(err, "Unable to set up visibility cert rotation")
+			os.Exit(1)
+		}
 	}
+	resourceFormatter := resources.NewResourceFormatter()
 	cacheOptions := []schdcache.Option{
 		schdcache.WithPodsReadyTracking(blockForPodsReady(&cfg)),
 		schdcache.WithRoleTracker(roleTracker),
 		schdcache.WithResourceMetrics(cfg.Metrics.EnableClusterQueueResources),
 		schdcache.WithCustomLabels(customLabels),
 		schdcache.WithLocalQueueMetrics(lqMetrics),
+		schdcache.WithResourceFormatter(resourceFormatter),
 	}
 	queueOptions := []qcache.Option{
 		qcache.WithPodsReadyRequeuingTimestamp(podsReadyRequeuingTimestamp(&cfg)),
@@ -306,6 +326,7 @@ func main() {
 		qcache.WithCustomLabels(customLabels),
 		qcache.WithLocalQueueMetrics(lqMetrics),
 		qcache.WithResourceMetrics(cfg.Metrics.EnableClusterQueueResources),
+		qcache.WithResourceFormatter(resourceFormatter),
 	}
 	if cfg.Resources != nil && len(cfg.Resources.ExcludeResourcePrefixes) > 0 {
 		cacheOptions = append(
@@ -328,7 +349,16 @@ func main() {
 				setupLog.Error(err, "Failed to initialize DRA mapper from configuration")
 				os.Exit(1)
 			}
-			setupLog.Info("DRA mapper initialized from configuration")
+			setupLog.V(1).Info("DRA mapper initialized from configuration")
+			for _, resourceName := range draMapper.CounterBasedResourceNames() {
+				resourceFormatter.RegisterBinaryFormattedResource(resourceName)
+			}
+			for _, resourceName := range draMapper.CapacityBasedResourceNames() {
+				resourceFormatter.RegisterBinaryFormattedResource(resourceName)
+			}
+		}
+		if features.Enabled(features.KueueDRAExcludeDeviceClasses) && cfg.Resources != nil {
+			draMapper.SetExcludedDeviceClasses(cfg.Resources.ExcludeDeviceClassNames)
 		}
 	}
 	if cfg.FairSharing != nil {
@@ -337,6 +367,27 @@ func main() {
 	if cfg.AdmissionFairSharing != nil {
 		queueOptions = append(queueOptions, qcache.WithAdmissionFairSharing(cfg.AdmissionFairSharing))
 		cacheOptions = append(cacheOptions, schdcache.WithAdmissionFairSharing(cfg.AdmissionFairSharing))
+	}
+	if features.Enabled(features.SchedulerLibraryIntegration) {
+		simulatorFactory, err := was.NewWASSimulatorFactory(ctx, mgr.GetConfig())
+		if err != nil {
+			setupLog.Error(err, "Failed to initialize scheduling simulator")
+			os.Exit(1)
+		}
+		cacheOptions = append(cacheOptions, schdcache.WithSimulatorFactory(simulatorFactory))
+	}
+	if draBackedResources != nil {
+		cacheOptions = append(cacheOptions, schdcache.WithDRABackedResources(draBackedResources))
+	}
+	if features.Enabled(features.KueueDRAIntegrationDeviceTaints) {
+		// Only a discovery failure errors. Carrying on unregistered would let a scheduling
+		// cycle block on the informer once discovery recovered.
+		served, err := utildra.RegisterDeviceTaintRuleInformer(setupCtx, mgr)
+		if err != nil {
+			setupLog.Error(err, "Unable to watch DeviceTaintRules")
+			os.Exit(1)
+		}
+		cacheOptions = append(cacheOptions, schdcache.WithDeviceTaintRules(served))
 	}
 	cCache := schdcache.New(mgr.GetClient(), cacheOptions...)
 
@@ -354,7 +405,9 @@ func main() {
 	}
 	queues := qcache.NewManager(mgr.GetClient(), cCache, requeuer, queueOptions...)
 
-	if err := setupIndexes(ctx, mgr, &cfg); err != nil {
+	resourceSliceAPIAvailable := utildra.CheckResourceSliceAPIAvailable(mgr)
+
+	if err := setupIndexes(setupCtx, mgr, &cfg, integrationManager, resourceSliceAPIAvailable); err != nil {
 		setupLog.Error(err, "Unable to setup indexes")
 		os.Exit(1)
 	}
@@ -373,7 +426,7 @@ func main() {
 		}
 	}
 
-	if err := setupProbeEndpoints(mgr, certsReady); err != nil {
+	if err := setupProbeEndpoints(mgr); err != nil {
 		setupLog.Error(err, "Unable to setup probe endpoints")
 		os.Exit(1)
 	}
@@ -387,13 +440,16 @@ func main() {
 	}
 
 	controllerOpts := core.SetupControllersOpts{
-		RoleTracker:            roleTracker,
-		PreemptionExpectations: preemptionExpectations,
-		CustomLabels:           customLabels,
-		DRAMapper:              draMapper,
-		DRABackedResources:     draBackedResources,
+		RoleTracker:               roleTracker,
+		PreemptionExpectations:    preemptionExpectations,
+		CustomLabels:              customLabels,
+		DRAMapper:                 draMapper,
+		DRABackedResources:        draBackedResources,
+		ResourceFormatter:         resourceFormatter,
+		ResourceSliceAPIAvailable: resourceSliceAPIAvailable,
+		ClusterProfileCRDPresent:  clusterProfileCRDPresent,
 	}
-	if err := setupControllers(ctx, mgr, cCache, queues, &cfg, serverVersionFetcher, controllerOpts); err != nil {
+	if err := setupControllers(ctx, mgr, cCache, queues, &cfg, serverVersionFetcher, integrationManager, controllerOpts); err != nil {
 		setupLog.Error(err, "Unable to setup controllers")
 		os.Exit(1)
 	}
@@ -415,20 +471,30 @@ func main() {
 		}()
 	}
 
-	if err := setupScheduler(mgr, cCache, queues, &cfg, roleTracker, preemptionExpectations, customLabels); err != nil {
+	if err := setupScheduler(mgr, cCache, queues, &cfg, roleTracker, preemptionExpectations, customLabels, resourceFormatter); err != nil {
 		setupLog.Error(err, "Could not setup scheduler")
 		os.Exit(1)
 	}
 
-	setupLog.Info("Starting manager")
+	setupLog.V(1).Info("Starting manager")
 	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "Could not run manager")
 		os.Exit(1)
 	}
 }
 
-func setupIndexes(ctx context.Context, mgr ctrl.Manager, cfg *configapi.Configuration) error {
-	err := indexer.Setup(ctx, mgr.GetFieldIndexer())
+func setupIndexes(
+	ctx context.Context,
+	mgr ctrl.Manager,
+	cfg *configapi.Configuration,
+	integrationManager *jobframework.IntegrationManager,
+	resourceSliceAPIAvailable bool,
+) error {
+	var indexerOpts []indexer.Option
+	if waitforpodsready.PodsScheduledTrackingEnabled(cfg.WaitForPodsReady) {
+		indexerOpts = append(indexerOpts, indexer.WithPodWorkloadSliceNameIndex())
+	}
+	err := indexer.Setup(ctx, mgr.GetFieldIndexer(), indexerOpts...)
 	if err != nil {
 		return err
 	}
@@ -455,16 +521,17 @@ func setupIndexes(ctx context.Context, mgr ctrl.Manager, cfg *configapi.Configur
 		}
 	}
 
-	if features.Enabled(features.KueueDRAIntegrationPartitionableDevices) {
+	if resourceSliceAPIAvailable {
 		if err := core.SetupResourceSliceIndexer(ctx, mgr.GetFieldIndexer()); err != nil {
 			return fmt.Errorf("could not setup ResourceSlice indexer: %w", err)
 		}
 	}
 
 	indexOpts := []jobframework.Option{
+		jobframework.WithIntegrationManager(integrationManager),
 		jobframework.WithEnabledFrameworks(cfg.Integrations.Frameworks),
 	}
-	return jobframework.SetupIndexes(ctx, mgr.GetFieldIndexer(), indexOpts...)
+	return integrationManager.SetupIndexes(ctx, mgr.GetFieldIndexer(), indexOpts...)
 }
 
 func setupControllers(
@@ -474,6 +541,7 @@ func setupControllers(
 	queues *qcache.Manager,
 	cfg *configapi.Configuration,
 	serverVersionFetcher *kubeversion.ServerVersionFetcher,
+	integrationManager *jobframework.IntegrationManager,
 	opts core.SetupControllersOpts,
 ) error {
 	if failedCtrl, err := core.SetupControllers(mgr, queues, cCache, cfg, opts); err != nil {
@@ -502,7 +570,7 @@ func setupControllers(
 	}
 
 	if features.Enabled(features.MultiKueue) {
-		adapters, err := jobframework.GetMultiKueueAdapters(sets.New(cfg.Integrations.Frameworks...))
+		adapters, err := integrationManager.GetMultiKueueAdapters(sets.New(cfg.Integrations.Frameworks...))
 		if err != nil {
 			return fmt.Errorf("could not get the enabled multikueue adapters: %w", err)
 		}
@@ -517,7 +585,7 @@ func setupControllers(
 			// Add external framework adapters to the adapters map
 			for _, adapter := range externalAdapters {
 				gvk := adapter.GVK().String()
-				setupLog.Info("Creating external framework MultiKueue adapter", "gvk", gvk)
+				setupLog.V(1).Info("Creating external framework MultiKueue adapter", "gvk", gvk)
 				adapters[gvk] = adapter
 			}
 		}
@@ -529,7 +597,9 @@ func setupControllers(
 			multikueue.WithAdapters(adapters),
 			multikueue.WithDispatcherName(ptr.Deref(cfg.MultiKueue.DispatcherName, configapi.MultiKueueDispatcherModeAllAtOnce)),
 			multikueue.WithClusterProfiles(cfg.MultiKueue.ClusterProfile),
+			multikueue.WithClusterProfileCRDPresent(opts.ClusterProfileCRDPresent),
 			multikueue.WithRoleTracker(opts.RoleTracker),
+			multikueue.WithClientConnection(cfg.ClientConnection),
 		); err != nil {
 			return fmt.Errorf("could not setup MultiKueue controller: %w", err)
 		}
@@ -540,13 +610,20 @@ func setupControllers(
 	}
 
 	if features.Enabled(features.TopologyAwareScheduling) {
-		if failedCtrl, err := tas.SetupControllers(mgr, queues, cCache, cfg, opts.RoleTracker); err != nil {
+		if failedCtrl, err := tas.SetupControllers(mgr, queues, cCache, cfg, opts.RoleTracker, tas.WithCustomLabels(opts.CustomLabels)); err != nil {
 			return fmt.Errorf("could not setup TAS controller %s: %w", failedCtrl, err)
 		}
 	}
 
 	if features.Enabled(features.ElasticJobsViaWorkloadSlices) {
-		if failedCtrl, err := elasticjobs.SetupWithManager(mgr, cfg, opts.RoleTracker); err != nil {
+		if failedCtrl, err := elasticjobs.SetupWithManager(mgr, cfg, opts.RoleTracker, opts.CustomLabels); err != nil {
+			return fmt.Errorf("could not setup %s controller: %w", failedCtrl, err)
+		}
+	}
+
+	if waitforpodsready.PodsScheduledTrackingEnabled(cfg.WaitForPodsReady) {
+		tracker := unscheduledpods.NewTracker(mgr.GetClient(), opts.RoleTracker, cfg.WaitForPodsReady)
+		if failedCtrl, err := tracker.SetupWithManager(mgr, cfg); err != nil {
 			return fmt.Errorf("could not setup %s controller: %w", failedCtrl, err)
 		}
 	}
@@ -557,27 +634,31 @@ func setupControllers(
 		}
 	}
 
+	labelKeysToCopy, annotationsToCopy := getLabelsAndAnnotationsToCopy(cfg)
 	jfOpts := []jobframework.Option{
+		jobframework.WithIntegrationManager(integrationManager),
 		jobframework.WithManageJobsWithoutQueueName(cfg.ManageJobsWithoutQueueName),
 		jobframework.WithWaitForPodsReady(cfg.WaitForPodsReady),
 		jobframework.WithKubeServerVersion(serverVersionFetcher),
 		jobframework.WithEnabledFrameworks(cfg.Integrations.Frameworks),
 		jobframework.WithEnabledExternalFrameworks(cfg.Integrations.ExternalFrameworks),
 		jobframework.WithManagerName(constants.KueueName),
-		jobframework.WithLabelKeysToCopy(cfg.Integrations.LabelKeysToCopy),
+		jobframework.WithLabelKeysToCopy(labelKeysToCopy),
+		jobframework.WithAnnotationsToCopy(annotationsToCopy),
 		jobframework.WithCache(cCache),
 		jobframework.WithQueues(queues),
 		jobframework.WithObjectRetentionPolicies(cfg.ObjectRetentionPolicies),
 		jobframework.WithRoleTracker(opts.RoleTracker),
 		jobframework.WithCustomLabels(opts.CustomLabels),
 	}
+
 	nsSelector, err := metav1.LabelSelectorAsSelector(cfg.ManagedJobsNamespaceSelector)
 	if err != nil {
 		return fmt.Errorf("failed to parse managedJobsNamespaceSelector: %w", err)
 	}
 	jfOpts = append(jfOpts, jobframework.WithManagedJobsNamespaceSelector(nsSelector))
 
-	if err := jobframework.SetupControllers(ctx, mgr, setupLog, jfOpts...); err != nil {
+	if err := integrationManager.SetupControllers(ctx, mgr, setupLog, jfOpts...); err != nil {
 		return fmt.Errorf(
 			"unable to create controller or webhook for kubernetesVersion %v: %w",
 			serverVersionFetcher.GetServerVersion(),
@@ -588,10 +669,17 @@ func setupControllers(
 	return nil
 }
 
-// setupProbeEndpoints registers the health endpoints
-func setupProbeEndpoints(mgr ctrl.Manager, certsReady <-chan struct{}) error {
-	defer setupLog.Info("Probe endpoints are configured on healthz and readyz")
+func getLabelsAndAnnotationsToCopy(cfg *configapi.Configuration) (labelKeysToCopy sets.Set[string], annotationsToCopy sets.Set[string]) {
+	if !features.Enabled(features.CustomMetricLabels) {
+		return sets.New(cfg.Integrations.LabelKeysToCopy...), sets.New[string]()
+	}
+	labelKeysToCopy, annotationsToCopy = metrics.WorkloadCustomLabelSources(cfg.Metrics.CustomLabels)
+	labelKeysToCopy.Insert(cfg.Integrations.LabelKeysToCopy...)
+	return
+}
 
+// setupProbeEndpoints registers the health endpoints
+func setupProbeEndpoints(mgr ctrl.Manager) error {
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		return fmt.Errorf("unable to set up health check: %w", err)
 	}
@@ -600,20 +688,11 @@ func setupProbeEndpoints(mgr ctrl.Manager, certsReady <-chan struct{}) error {
 	// Kueue replica as ready. This allows users to wait with sending the first
 	// requests, requiring webhooks, until the Kueue deployment is available, so
 	// that the early requests are not rejected during the Kueue's startup.
-	// We wrap the call to GetWebhookServer in a closure to delay calling
-	// the function, otherwise a not fully-initialized webhook server (without
-	// ready certs) fails the start of the manager.
-	if err := mgr.AddReadyzCheck("readyz", func(req *http.Request) error {
-		select {
-		case <-certsReady:
-			return mgr.GetWebhookServer().StartedChecker()(req)
-		default:
-			return errors.New("certificates are not ready")
-		}
-	}); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", mgr.GetWebhookServer().StartedChecker()); err != nil {
 		return fmt.Errorf("unable to set up ready check: %w", err)
 	}
 
+	setupLog.V(1).Info("Probe endpoints are configured on healthz and readyz")
 	return nil
 }
 
@@ -625,6 +704,7 @@ func setupScheduler(
 	roleTracker *roletracker.RoleTracker,
 	preemptionExpectations *expectations.Store,
 	customLabels *metrics.CustomLabels,
+	resourceFormatter *resources.ResourceFormatter,
 ) error {
 	sched := scheduler.New(
 		queues,
@@ -638,6 +718,8 @@ func setupScheduler(
 		scheduler.WithRoleTracker(roleTracker),
 		scheduler.WithPreemptionExpectations(preemptionExpectations),
 		scheduler.WithCustomLabels(customLabels),
+		scheduler.WithResourceFormatter(resourceFormatter),
+		scheduler.WithFailedTASReplacementRecoveryTimeout(waitforpodsready.RecoveryTimeout(cfg.WaitForPodsReady)),
 	)
 	if err := mgr.Add(sched); err != nil {
 		return fmt.Errorf("unable to add scheduler to manager: %w", err)
@@ -664,14 +746,18 @@ func setupServerVersionFetcher(mgr ctrl.Manager, kubeConfig *rest.Config) (*kube
 	return serverVersionFetcher, nil
 }
 
+func leaderElectionEnabled(cfg *configapi.Configuration) bool {
+	return cfg.LeaderElection != nil && ptr.Deref(cfg.LeaderElection.LeaderElect, false)
+}
+
 func setupRoleTracker(ctx context.Context, mgr ctrl.Manager, cfg *configapi.Configuration) *roletracker.RoleTracker {
-	if cfg.LeaderElection != nil && ptr.Deref(cfg.LeaderElection.LeaderElect, false) {
+	if leaderElectionEnabled(cfg) {
 		tracker := roletracker.NewRoleTracker(mgr.Elected())
 		go tracker.Start(ctx, setupLog)
-		setupLog.Info("RoleTracker: leader election enabled")
+		setupLog.V(1).Info("RoleTracker: leader election enabled")
 		return tracker
 	}
-	setupLog.Info("RoleTracker: running in standalone mode")
+	setupLog.V(1).Info("RoleTracker: running in standalone mode")
 	return nil
 }
 
@@ -706,6 +792,6 @@ func apply(configFile string) (ctrl.Options, configapi.Configuration, error) {
 	if err != nil {
 		return options, cfg, err
 	}
-	setupLog.Info("Configuration loaded", "config", cfgStr)
+	setupLog.V(1).Info("Configuration loaded", "config", cfgStr)
 	return options, cfg, nil
 }

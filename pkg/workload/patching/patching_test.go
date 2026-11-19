@@ -29,9 +29,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	testingclock "k8s.io/utils/clock/testing"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -76,7 +76,7 @@ func TestSetCheckState(t *testing.T) {
 				Operator:          corev1.TolerationOpEqual,
 				Value:             "t1v",
 				Effect:            corev1.TaintEffectNoSchedule,
-				TolerationSeconds: ptr.To[int64](5),
+				TolerationSeconds: new(int64(5)),
 			},
 		},
 	}
@@ -318,6 +318,38 @@ func TestPatchStatus(t *testing.T) {
 				wl: baseWl.Clone().ResourceVersion("4").Condition(baseCond).Obj(),
 			},
 		},
+		"update returns true with conflict error and WithLooseOnApply then WithStrictApply options": {
+			skipMergePatch: true,
+			conflict:       true,
+			args: args{
+				wl: baseWl.DeepCopy(),
+				update: func(wl *kueue.Workload) (bool, error) {
+					apimeta.SetStatusCondition(&wl.Status.Conditions, baseCond)
+					return true, nil
+				},
+				opts: []PatchStatusOption{WithLooseOnApply(), WithStrictApply()},
+			},
+			want: want{
+				wl:  baseWl.Clone().ResourceVersion("3").Obj(),
+				err: errTestConflict,
+			},
+		},
+		"update returns true with conflict error and StrictPatch cleared then WithStrictPatch options": {
+			skipApplyPatch: true,
+			conflict:       true,
+			args: args{
+				wl: baseWl.DeepCopy(),
+				update: func(wl *kueue.Workload) (bool, error) {
+					apimeta.SetStatusCondition(&wl.Status.Conditions, baseCond)
+					return true, nil
+				},
+				opts: []PatchStatusOption{func(o *patchStatusOptions) { o.StrictPatch = false }, WithStrictPatch()},
+			},
+			want: want{
+				wl:  baseWl.Clone().ResourceVersion("3").Obj(),
+				err: errTestConflict,
+			},
+		},
 		"update returns false": {
 			args: args{
 				wl: baseWl.DeepCopy(),
@@ -397,7 +429,24 @@ func TestPatchStatus(t *testing.T) {
 									}
 								}
 							}
-							return utiltesting.TreatSSAAsStrategicMerge(ctx, c, subResourceName, obj, patch, opts...)
+							return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+						},
+						SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+							if tc.conflict {
+								if subResourceName == "status" && !patched {
+									patched = true
+									// Simulate concurrent modification by another controller
+									wlCopy := wl.DeepCopy()
+									if wlCopy.Labels == nil {
+										wlCopy.Labels = make(map[string]string, 1)
+									}
+									wlCopy.Labels["test.kueue.x-k8s.io/timestamp"] = time.Now().String()
+									if err := c.Update(ctx, wlCopy); err != nil {
+										return err
+									}
+								}
+							}
+							return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, c, subResourceName, applyConf, opts...)
 						},
 					}).
 					Build()
@@ -529,6 +578,38 @@ func TestPatchAdmissionStatus(t *testing.T) {
 				wl: baseWl.Clone().ResourceVersion("4").Condition(baseCond).Obj(),
 			},
 		},
+		"update returns true with conflict error and WithLooseOnApply then WithStrictApply options": {
+			skipMergePatch: true,
+			conflict:       true,
+			args: args{
+				wl: baseWl.DeepCopy(),
+				update: func(wl *kueue.Workload) (bool, error) {
+					apimeta.SetStatusCondition(&wl.Status.Conditions, baseCond)
+					return true, nil
+				},
+				opts: []PatchStatusOption{WithLooseOnApply(), WithStrictApply()},
+			},
+			want: want{
+				wl:  baseWl.Clone().ResourceVersion("3").Obj(),
+				err: errTestConflict,
+			},
+		},
+		"update returns true with conflict error and StrictPatch cleared then WithStrictPatch options": {
+			skipApplyPatch: true,
+			conflict:       true,
+			args: args{
+				wl: baseWl.DeepCopy(),
+				update: func(wl *kueue.Workload) (bool, error) {
+					apimeta.SetStatusCondition(&wl.Status.Conditions, baseCond)
+					return true, nil
+				},
+				opts: []PatchStatusOption{func(o *patchStatusOptions) { o.StrictPatch = false }, WithStrictPatch()},
+			},
+			want: want{
+				wl:  baseWl.Clone().ResourceVersion("3").Obj(),
+				err: errTestConflict,
+			},
+		},
 		"update returns false": {
 			args: args{
 				wl: baseWl.DeepCopy(),
@@ -608,7 +689,24 @@ func TestPatchAdmissionStatus(t *testing.T) {
 									}
 								}
 							}
-							return utiltesting.TreatSSAAsStrategicMerge(ctx, c, subResourceName, obj, patch, opts...)
+							return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+						},
+						SubResourceApply: func(ctx context.Context, c client.Client, subResourceName string, applyConf runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+							if tc.conflict {
+								if subResourceName == "status" && !patched {
+									patched = true
+									// Simulate concurrent modification by another controller
+									wlCopy := wl.DeepCopy()
+									if wlCopy.Labels == nil {
+										wlCopy.Labels = make(map[string]string, 1)
+									}
+									wlCopy.Labels["test.kueue.x-k8s.io/timestamp"] = time.Now().String()
+									if err := c.Update(ctx, wlCopy); err != nil {
+										return err
+									}
+								}
+							}
+							return utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration(ctx, c, subResourceName, applyConf, opts...)
 						},
 					}).
 					Build()

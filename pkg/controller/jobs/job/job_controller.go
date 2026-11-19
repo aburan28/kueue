@@ -17,17 +17,20 @@ limitations under the License.
 package job
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
+	"strings"
 
+	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
@@ -40,9 +43,11 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	jobframeworktas "sigs.k8s.io/kueue/pkg/controller/jobframework/tas"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/podset"
 	clientutil "sigs.k8s.io/kueue/pkg/util/client"
+	"sigs.k8s.io/kueue/pkg/workload"
 )
 
 var (
@@ -57,15 +62,15 @@ const (
 	StoppingAnnotation                       = "kueue.x-k8s.io/stopping"
 )
 
-func init() {
-	utilruntime.Must(jobframework.RegisterIntegration(FrameworkName, jobframework.IntegrationCallbacks{
+func RegisterIntegration(m *jobframework.IntegrationManager) error {
+	return m.RegisterIntegration(FrameworkName, jobframework.IntegrationCallbacks{
 		SetupIndexes:      SetupIndexes,
 		NewJob:            NewJob,
 		NewReconciler:     NewReconciler,
 		SetupWebhook:      SetupWebhook,
 		JobType:           &batchv1.Job{},
 		MultiKueueAdapter: &multiKueueAdapter{},
-	}))
+	})
 }
 
 // +kubebuilder:rbac:groups=scheduling.k8s.io,resources=priorityclasses,verbs=list;get;watch
@@ -112,25 +117,26 @@ func (h *parentWorkloadHandler) queueReconcileForChildJob(ctx context.Context, o
 	if !ok {
 		return
 	}
-	log := ctrl.LoggerFrom(ctx).WithValues("workload", klog.KObj(w))
-	ctx = ctrl.LoggerInto(ctx, log)
-	log.V(5).Info("Queueing reconcile for child jobs")
-	var childJobs batchv1.JobList
 	owner := metav1.GetControllerOf(w)
 	if owner == nil {
 		return
 	}
+	log := ctrl.LoggerFrom(ctx)
+	if logV := log.V(5); logV.Enabled() {
+		logV.Info("Queueing reconcile for child jobs", "workload", klog.KObj(w))
+	}
+	var childJobs batchv1.JobList
 	if err := h.client.List(ctx, &childJobs, client.InNamespace(w.Namespace), client.MatchingFields{indexer.OwnerReferenceUID: string(owner.UID)}); err != nil {
-		klog.Error(err, "Unable to list child jobs")
+		log.Error(err, "Unable to list child jobs", "workload", klog.KObj(w))
 		return
 	}
 	for _, childJob := range childJobs.Items {
-		log.V(5).Info("Queueing reconcile for child job", "job", klog.KObj(&childJob))
+		if logV := log.V(5); logV.Enabled() {
+			logV.Info("Queueing reconcile for child job", "workload", klog.KObj(w), "job", klog.KObj(&childJob))
+		}
 		q.Add(reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      childJob.Name,
-				Namespace: w.Namespace,
-			},
+			Name:      childJob.Name,
+			Namespace: w.Namespace,
 		})
 	}
 }
@@ -211,20 +217,125 @@ func (j *Job) PodLabelSelector() string {
 }
 
 func (j *Job) ReclaimablePods(ctx context.Context, _ client.Client) ([]kueue.ReclaimablePod, error) {
+	log := ctrl.LoggerFrom(ctx)
 	parallelism := ptr.Deref(j.Spec.Parallelism, 1)
-	if parallelism == 1 || j.Status.Succeeded == 0 {
-		return nil, nil
+	completions := ptr.Deref(j.Spec.Completions, parallelism)
+
+	terminalCount := j.Status.Succeeded
+	if ptr.Deref(j.Spec.CompletionMode, batchv1.NonIndexedCompletion) == batchv1.IndexedCompletion {
+		failedIndexes := ptr.Deref(j.Status.FailedIndexes, "")
+		terminalCount = terminalIndexesCount(log, j.Status.CompletedIndexes, failedIndexes, completions)
+		log.V(5).Info("Derived terminal pods from index status for Indexed Job",
+			"completedIndexes", j.Status.CompletedIndexes,
+			"failedIndexes", failedIndexes,
+			"completions", completions,
+			"derivedTerminal", terminalCount,
+			"statusSucceeded", j.Status.Succeeded,
+			"statusFailed", j.Status.Failed)
 	}
 
-	remaining := ptr.Deref(j.Spec.Completions, parallelism) - j.Status.Succeeded
-	if remaining >= parallelism {
-		return nil, nil
+	// A single-pod Job or one with no terminal pods has nothing to reclaim; so
+	// does one whose remaining work still needs every Pod in the PodSet. Measure
+	// against the PodSet count rather than parallelism, which can exceed it.
+	count := j.podsCount()
+	reclaimable := int32(0)
+	if count > 1 && terminalCount > 0 {
+		if remaining := max(completions-terminalCount, 0); remaining < count {
+			reclaimable = count - remaining
+		}
 	}
 
+	log.V(4).Info("Computed reclaimable pods for Job",
+		"parallelism", parallelism,
+		"completions", completions,
+		"podSetCount", count,
+		"terminalCount", terminalCount,
+		"reclaimable", reclaimable)
+
+	if reclaimable == 0 {
+		return nil, nil
+	}
 	return []kueue.ReclaimablePod{{
 		Name:  kueue.DefaultPodSetName,
-		Count: parallelism - remaining,
+		Count: reclaimable,
 	}}, nil
+}
+
+type indexInterval struct {
+	first int
+	last  int
+}
+
+// terminalIndexesCount returns how many of an Indexed Job's indexes will never
+// run again: completed ones, plus failed ones that exhausted backoffLimitPerIndex.
+// Kueue can reclaim their quota. Indexes >= completions are ignored because an
+// elastic scale-down removed them, even if stale status still lists them (kueue#13117).
+func terminalIndexesCount(log logr.Logger, completedIndexes, failedIndexes string, completions int32) int32 {
+	if completions <= 0 {
+		return 0
+	}
+
+	limit := int(completions)
+	var intervals []indexInterval
+	for _, indexes := range []string{completedIndexes, failedIndexes} {
+		if indexes == "" {
+			continue
+		}
+		for interval := range strings.SplitSeq(indexes, ",") {
+			first, last, ok := parseIndexRange(log, interval)
+			if !ok {
+				continue
+			}
+			last = min(last, limit-1)
+			if first <= last {
+				intervals = append(intervals, indexInterval{first: first, last: last})
+			}
+		}
+	}
+	// Older supported Kubernetes versions don't reject overlapping completed and
+	// failed index sets, so count their union to avoid reclaiming quota twice.
+	slices.SortFunc(intervals, func(a, b indexInterval) int {
+		return cmp.Compare(a.first, b.first)
+	})
+
+	count := 0
+	lastCounted := -1
+	for _, interval := range intervals {
+		firstUncounted := max(interval.first, lastCounted+1)
+		if firstUncounted > interval.last {
+			continue
+		}
+		count += interval.last - firstUncounted + 1
+		lastCounted = interval.last
+	}
+	return int32(count)
+}
+
+// parseIndexRange parses a single index interval ("3" or "3-5") into
+// its inclusive [first, last] bounds. It returns ok=false and logs when the
+// interval is malformed or descending; the Job controller always writes
+// well-formed, ascending indexes, so a failure here signals unexpected status
+// content worth surfacing rather than silently skipping.
+func parseIndexRange(log logr.Logger, interval string) (first, last int, ok bool) {
+	firstStr, lastStr, isRange := strings.Cut(interval, "-")
+	first, err := strconv.Atoi(firstStr)
+	if err != nil {
+		log.V(3).Info("Ignoring malformed index interval", "interval", interval, "error", err)
+		return 0, 0, false
+	}
+	last = first
+	if isRange {
+		if last, err = strconv.Atoi(lastStr); err != nil {
+			log.V(3).Info("Ignoring malformed index interval", "interval", interval, "error", err)
+			return 0, 0, false
+		}
+	}
+	// first is never negative, so only a descending range like "5-3" is invalid.
+	if last < first {
+		log.V(3).Info("Ignoring descending index interval", "interval", interval)
+		return 0, 0, false
+	}
+	return first, last, true
 }
 
 // The following labels are managed internally by batch/job controller, we should not
@@ -252,12 +363,12 @@ func (j *Job) PodSets(ctx context.Context, _ client.Client) ([]kueue.PodSet, err
 		Name:     kueue.DefaultPodSetName,
 		Template: *cleanLabels(j.Spec.Template.DeepCopy()),
 		Count:    j.podsCount(),
-		MinCount: j.minPodsCount(),
+		MinCount: j.podSetMinCount(),
 	}
 	if features.Enabled(features.TopologyAwareScheduling) {
-		topologyRequest, err := jobframework.NewPodSetTopologyRequest(
+		topologyRequest, err := jobframeworktas.NewPodSetTopologyRequest(
 			&j.Spec.Template.ObjectMeta).PodIndexLabel(
-			ptr.To(batchv1.JobCompletionIndexAnnotation)).Build()
+			new(batchv1.JobCompletionIndexAnnotation)).Build()
 		if err != nil {
 			return nil, err
 		}
@@ -276,7 +387,7 @@ func (j *Job) RunWithPodSetsInfo(ctx context.Context, _ client.Client, podSetsIn
 
 	info := podSetsInfo[0]
 
-	if j.minPodsCount() != nil {
+	if j.partialAdmissionRequested() {
 		j.Spec.Parallelism = new(info.Count)
 		if j.syncCompletionWithParallelism() {
 			j.Spec.Completions = j.Spec.Parallelism
@@ -292,7 +403,7 @@ func (j *Job) RestorePodSetsInfo(_ context.Context, podSetsInfo []podset.PodSetI
 
 	changed := false
 	// if the job accepts partial admission
-	if j.minPodsCount() != nil && ptr.Deref(j.Spec.Parallelism, 0) != podSetsInfo[0].Count {
+	if j.partialAdmissionRequested() && ptr.Deref(j.Spec.Parallelism, 0) != podSetsInfo[0].Count {
 		changed = true
 		j.Spec.Parallelism = new(podSetsInfo[0].Count)
 		if j.syncCompletionWithParallelism() {
@@ -319,13 +430,20 @@ func (j *Job) Finished(ctx context.Context) (message string, success, finished b
 	return "", true, false
 }
 
-func (j *Job) PodsReady(ctx context.Context, _ client.Client) bool {
+func (j *Job) PodsReady(_ context.Context, _ client.Client, options ...jobframework.PodsReadyOption) bool {
 	ready := ptr.Deref(j.Status.Ready, 0)
 	uncountedTerminatedSucceeded := 0
 	if j.Status.UncountedTerminatedPods != nil {
 		uncountedTerminatedSucceeded = len(j.Status.UncountedTerminatedPods.Succeeded)
 	}
-	return j.Status.Succeeded+ready+int32(uncountedTerminatedSucceeded) >= j.podsCount()
+	target := j.podsCount()
+	wl := jobframework.PodsReadyWorkload(options...)
+	if jobframework.WorkloadSliceEnabled(j) && wl != nil && workload.IsAdmitted(wl) {
+		if granted, ok := workload.ExtractGrantedPodSetCounts(wl)[kueue.DefaultPodSetName]; ok && granted < target {
+			target = granted
+		}
+	}
+	return j.Status.Succeeded+ready+int32(uncountedTerminatedSucceeded) >= target
 }
 
 func (j *Job) CanDefaultManagedBy() bool {
@@ -352,12 +470,26 @@ func (j *Job) podsCount() int32 {
 }
 
 func (j *Job) minPodsCount() *int32 {
-	if strVal, found := j.GetAnnotations()[JobMinParallelismAnnotation]; found {
-		if iVal, err := strconv.Atoi(strVal); err == nil {
-			return new(int32(iVal))
-		}
+	strVal, found := j.GetAnnotations()[JobMinParallelismAnnotation]
+	if !found {
+		return nil
 	}
-	return nil
+	minCount, err := strconv.ParseInt(strVal, 10, 32)
+	if err != nil {
+		return nil
+	}
+	return new(int32(minCount))
+}
+
+func (j *Job) podSetMinCount() *int32 {
+	if jobframework.ElasticPartialScaleUpEnabled(j) {
+		return new(j.podsCount())
+	}
+	return j.minPodsCount()
+}
+
+func (j *Job) partialAdmissionRequested() bool {
+	return j.minPodsCount() != nil
 }
 
 func (j *Job) syncCompletionWithParallelism() bool {

@@ -683,7 +683,7 @@ func TestReconcileInadmissible(t *testing.T) {
 		},
 		"should not write QuotaReserved condition on newly created workload": {
 			featureGates: map[featuregate.Feature]bool{
-				features.UnadmittedWorkloadsObservability: true,
+				features.UnadmittedWorkloadsObservability: false,
 			},
 			cq: utiltestingapi.MakeClusterQueue("cq").Active(metav1.ConditionTrue).Obj(),
 			lq: utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue("cq").Obj(),
@@ -694,6 +694,34 @@ func TestReconcileInadmissible(t *testing.T) {
 			wantWorkload: utiltestingapi.MakeWorkload("wl", "ns").
 				Active(true).
 				Queue("lq").
+				Obj(),
+		},
+		"should write QuotaReserved condition on newly created workload": {
+			featureGates: map[featuregate.Feature]bool{
+				features.UnadmittedWorkloadsObservability:  true,
+				features.UnadmittedWorkloadsExplicitStatus: true,
+			},
+			cq: utiltestingapi.MakeClusterQueue("cq").Active(metav1.ConditionTrue).Obj(),
+			lq: utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue("cq").Obj(),
+			workload: utiltestingapi.MakeWorkload("wl", "ns").
+				Active(true).
+				Queue("lq").
+				Obj(),
+			wantWorkload: utiltestingapi.MakeWorkload("wl", "ns").
+				Active(true).
+				Queue("lq").
+				Condition(metav1.Condition{
+					Type:    kueue.WorkloadAdmitted,
+					Status:  metav1.ConditionFalse,
+					Reason:  kueue.WorkloadAdmittedReasonNoReservation,
+					Message: "The workload has no reservation",
+				}).
+				Condition(metav1.Condition{
+					Type:    kueue.WorkloadQuotaReserved,
+					Status:  metav1.ConditionFalse,
+					Reason:  kueue.WorkloadQuotaReservedReasonPendingEvaluation,
+					Message: "Workload is pending evaluation in the scheduling queue",
+				}).
 				Obj(),
 		},
 		"should set status QuotaReserved conditions to False with reason Suspended if quota not reserved LocalQueue StopPolicy=Hold": {
@@ -780,6 +808,40 @@ func TestReconcileInadmissible(t *testing.T) {
 					Status:  metav1.ConditionFalse,
 					Reason:  kueue.WorkloadQuotaReservedReasonSuspended,
 					Message: "ClusterQueue cq is inactive",
+				}).
+				Condition(metav1.Condition{
+					Type:    kueue.WorkloadAdmitted,
+					Status:  metav1.ConditionFalse,
+					Reason:  kueue.WorkloadAdmittedReasonNoReservation,
+					Message: "The workload has no reservation",
+				}).
+				Obj(),
+		},
+		"should keep the conditions if quota not reserved LocalQueue is not created and QuotaReserved is already Misconfigured": {
+			workload: utiltestingapi.MakeWorkload("wl", "ns").
+				Active(true).
+				Queue("lq").
+				Condition(metav1.Condition{
+					Type:    kueue.WorkloadQuotaReserved,
+					Status:  metav1.ConditionFalse,
+					Reason:  kueue.WorkloadQuotaReservedReasonMisconfigured,
+					Message: "LocalQueue lq doesn't exist",
+				}).
+				Condition(metav1.Condition{
+					Type:    kueue.WorkloadAdmitted,
+					Status:  metav1.ConditionFalse,
+					Reason:  kueue.WorkloadAdmittedReasonNoReservation,
+					Message: "The workload has no reservation",
+				}).
+				Obj(),
+			wantWorkload: utiltestingapi.MakeWorkload("wl", "ns").
+				Active(true).
+				Queue("lq").
+				Condition(metav1.Condition{
+					Type:    kueue.WorkloadQuotaReserved,
+					Status:  metav1.ConditionFalse,
+					Reason:  kueue.WorkloadQuotaReservedReasonMisconfigured,
+					Message: "LocalQueue lq doesn't exist",
 				}).
 				Condition(metav1.Condition{
 					Type:    kueue.WorkloadAdmitted,

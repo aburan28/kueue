@@ -21,6 +21,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	apivalidation "k8s.io/apimachinery/pkg/api/validation"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -33,23 +34,28 @@ import (
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
 	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 	"sigs.k8s.io/kueue/pkg/features"
+	"sigs.k8s.io/kueue/pkg/util/waitforpodsready"
 	"sigs.k8s.io/kueue/pkg/util/webhook"
 )
 
 type Webhook struct {
+	integrationManager           *jobframework.IntegrationManager
 	client                       client.Client
 	manageJobsWithoutQueueName   bool
 	managedJobsNamespaceSelector labels.Selector
 	queues                       *qcache.Manager
+	maxTimeoutOnWorkload         *metav1.Duration
 }
 
 func SetupWebhook(mgr ctrl.Manager, opts ...jobframework.Option) error {
 	options := jobframework.ProcessOptions(opts...)
 	wh := &Webhook{
+		integrationManager:           options.IntegrationManager,
 		client:                       mgr.GetClient(),
 		manageJobsWithoutQueueName:   options.ManageJobsWithoutQueueName,
 		managedJobsNamespaceSelector: options.ManagedJobsNamespaceSelector,
 		queues:                       options.Queues,
+		maxTimeoutOnWorkload:         options.MaxTimeoutOnWorkload,
 	}
 	obj := &appsv1.Deployment{}
 	if options.NoopWebhook {
@@ -72,9 +78,33 @@ func (wh *Webhook) Default(ctx context.Context, obj *appsv1.Deployment) error {
 	log := ctrl.LoggerFrom(ctx).WithName("deployment-webhook")
 	log.V(5).Info("Propagating queue-name")
 
-	jobframework.ApplyDefaultLocalQueue(deployment.Object(), wh.queues.DefaultLocalQueueExist)
-	jobframework.ApplyDefaultWorkloadPriorityClass(ctx, wh.client, deployment.Object())
-	suspend, err := jobframework.WorkloadShouldBeSuspended(ctx, deployment.Object(), wh.client, wh.manageJobsWithoutQueueName, wh.managedJobsNamespaceSelector)
+	oldDeploymentObj, err := webhook.OldObjectFromContext[appsv1.Deployment](ctx)
+	if err != nil {
+		return err
+	}
+	// Do not apply the default LocalQueue to a running Deployment without a
+	// queue-name: an unrelated update (image bump, rollout restart) would move it
+	// under Kueue and start a gated rolling update.
+	if oldDeploymentObj == nil || jobframework.CanApplyDefaultLocalQueue(oldDeploymentObj.Status.ReadyReplicas == 0, oldDeploymentObj) {
+		if err := wh.integrationManager.ApplyDefaultLocalQueue(ctx, wh.client, deployment.Object(), wh.queues.DefaultLocalQueueExist, wh.managedJobsNamespaceSelector); err != nil {
+			return err
+		}
+	}
+	// Do not apply the default WorkloadPriorityClass to a running Deployment without the label:
+	// an unrelated update must not change its priority. Adding the label explicitly is allowed.
+	if oldDeploymentObj == nil || jobframework.CanSetWorkloadPriorityClassName(oldDeploymentObj.Status.ReadyReplicas == 0, oldDeploymentObj) {
+		if err := wh.integrationManager.ApplyDefaultWorkloadPriorityClass(ctx, wh.client, deployment.Object(), wh.managedJobsNamespaceSelector); err != nil {
+			return err
+		}
+	}
+	suspend, err := wh.integrationManager.WorkloadShouldBeSuspended(
+		ctx,
+		deployment.Object(),
+		wh.client,
+		wh.manageJobsWithoutQueueName,
+		wh.managedJobsNamespaceSelector,
+		jobframework.WithDeletingObjectTolerance(true),
+	)
 	if err != nil {
 		return err
 	}
@@ -94,8 +124,14 @@ func (wh *Webhook) Default(ctx context.Context, obj *appsv1.Deployment) error {
 		if priorityClass := jobframework.WorkloadPriorityClassName(deployment.Object()); priorityClass != "" {
 			deployment.Spec.Template.Labels[controllerconstants.WorkloadPriorityClassLabel] = priorityClass
 		}
+		if waitforpodsready.WorkloadLevelWaitForPodsReadyEnabled() {
+			if wfprAnnotationValue := deployment.GetAnnotations()[controllerconstants.WaitForPodsReadyAnnotation]; wfprAnnotationValue != "" {
+				deployment.Spec.Template.Annotations[controllerconstants.WaitForPodsReadyAnnotation] = wfprAnnotationValue
+			} else {
+				delete(deployment.Spec.Template.Annotations, controllerconstants.WaitForPodsReadyAnnotation)
+			}
+		}
 	}
-
 	return nil
 }
 
@@ -115,6 +151,8 @@ func (wh *Webhook) ValidateCreate(ctx context.Context, obj *appsv1.Deployment) (
 	if features.Enabled(features.AdmissionGatedBy) {
 		allErrs = append(allErrs, webhook.ValidateAdmissionGatedByAnnotationOnCreate(deployment.Object())...)
 	}
+
+	allErrs = append(allErrs, jobframework.ValidateWaitForPodsReadyAnnotation(deployment.Object(), wh.maxTimeoutOnWorkload)...)
 
 	return nil, allErrs.ToAggregate()
 }
@@ -137,14 +175,14 @@ func (wh *Webhook) ValidateUpdate(ctx context.Context, oldObj, newObj *appsv1.De
 	allErrs := jobframework.ValidateQueueName(newDeployment.Object())
 	allErrs = append(allErrs, jobframework.ValidateElasticJobAnnotation(newDeployment.Object(), newDeployment.GVK())...)
 
-	// Prevents updating the queue-name if at least one Pod is not suspended
-	// or if the queue-name has been deleted.
-	isSuspended := oldDeployment.Status.ReadyReplicas == 0
-	if !isSuspended || newQueueName == "" {
+	// Removing the queue-name is forbidden.
+	if newQueueName == "" {
 		allErrs = append(allErrs, apivalidation.ValidateImmutableField(newQueueName, oldQueueName, queueNameLabelPath)...)
 	}
-	allErrs = append(allErrs, jobframework.ValidateUpdateForWorkloadPriorityClassName(
-		isSuspended,
+	// A Deployment has no Deployment-level Workload: every Pod gets its own Workload from the
+	// labels of the Pod template. Adding the priority class to a running Deployment therefore
+	// only affects the new Pods that the rolling update creates, so only its removal is rejected.
+	allErrs = append(allErrs, jobframework.ValidateWorkloadPriorityClassNameNotRemoved(
 		oldDeployment.Object(),
 		newDeployment.Object(),
 	)...)
@@ -152,6 +190,8 @@ func (wh *Webhook) ValidateUpdate(ctx context.Context, oldObj, newObj *appsv1.De
 	if features.Enabled(features.AdmissionGatedBy) {
 		allErrs = append(allErrs, webhook.ValidateAdmissionGatedByAnnotationOnUpdate(oldDeployment.Object(), newDeployment.Object())...)
 	}
+
+	allErrs = append(allErrs, jobframework.ValidateWaitForPodsReadyAnnotationOnUpdate(oldDeployment.Object(), newDeployment.Object(), wh.maxTimeoutOnWorkload)...)
 
 	return warnings, allErrs.ToAggregate()
 }

@@ -57,8 +57,9 @@ Running a workload with DRA devices is similar to
 `kueue.x-k8s.io/queue-name` label to select the `LocalQueue` you want to
 submit the workload to.
 
-There are two ways to request DRA devices, depending on how your administrator
-has configured the cluster. Choose the approach that matches your setup.
+There are several ways to request DRA devices, depending on how your
+administrator has configured the cluster. Choose the approach that matches your
+setup.
 
 ### Using a ResourceClaimTemplate
 
@@ -66,6 +67,24 @@ Use this approach when you need to explicitly describe the device you want.
 Create a `ResourceClaimTemplate` and reference it from the workload:
 
 {{< include "examples/dra/sample-dra-rct-job.yaml" "yaml" >}}
+
+### Using a `firstAvailable` request
+
+{{% alert title="Note" color="info" %}}
+This feature requires the `KueueDRAIntegrationPrioritizedList` feature gate,
+which is disabled by default in v0.20.
+{{% /alert %}}
+
+If your administrator has
+[set up `firstAvailable` requests](/docs/tasks/manage/setup_dra/#set-up-firstavailable-requests),
+list the alternative device classes in order of preference. They must use
+`ExactCount`, ask for the same `count`, and map to one logical resource:
+
+{{< include "examples/dra/sample-dra-firstavailable-job.yaml" "yaml" >}}
+
+Kueue charges this one-Pod Job `example.com/gpu: 1`, whichever alternative the
+kube-scheduler
+[allocates](https://kubernetes.io/docs/concepts/resource-management/dynamic-resource-allocation/dra-api/).
 
 ### Using extended resources
 
@@ -85,6 +104,41 @@ ResourceClaimTemplate path above.
 
 {{< include "examples/dra/sample-dra-counter-job.yaml" "yaml" >}}
 
+### Using consumable capacity (shared devices)
+
+{{% alert title="Note" color="info" %}}
+This feature requires the `KueueDRAIntegrationConsumableCapacity` feature gate,
+which is enabled by default since v0.21.
+{{% /alert %}}
+
+If your administrator has configured
+[capacity-based quota](/docs/tasks/manage/setup_dra/#set-up-capacity-based-quota-consumable-capacity),
+your workload is charged by the device's capacity consumption (such as GPU
+memory) rather than device count. You submit workloads using a
+`ResourceClaimTemplate` with `capacity.requests` specifying how much capacity
+you need:
+
+{{< include "examples/dra/sample-dra-capacity-job.yaml" "yaml" >}}
+
+If you omit `capacity.requests`, Kueue charges the device's
+`RequestPolicy.Default` or the full device capacity.
+
+### Using Topology-Aware Scheduling
+
+{{% alert title="Note" color="info" %}}
+This feature requires the `KueueDRADeviceFeasibility` feature gate, which is
+disabled by default in v0.20.
+{{% /alert %}}
+
+If your administrator has set up
+[Topology-Aware Scheduling with DRA](/docs/tasks/manage/setup_dra/#use-topology-aware-scheduling-with-dra)
+for a [Topology-Aware Scheduling](/docs/tasks/run/topology_aware_scheduling/) (TAS)
+queue, Kueue places each Pod only on nodes that can allocate the devices it
+requests. You request devices the same way, with a `ResourceClaimTemplate` or an
+extended resource, and add a topology annotation as for any TAS workload:
+
+{{< include "examples/dra/sample-dra-tas-job.yaml" "yaml" >}}
+
 If you are not sure which approach to use, ask your administrator.
 
 ## 2. Run the workload
@@ -97,11 +151,26 @@ For a ResourceClaimTemplate-based workload:
 kubectl create -f https://kueue.sigs.k8s.io/examples/dra/sample-dra-rct-job.yaml
 ```
 
+For a workload with a `firstAvailable` request:
+
+```shell
+kubectl create -f https://kueue.sigs.k8s.io/examples/dra/sample-dra-firstavailable-job.yaml
+```
+
 For an extended resource-based workload:
 
 ```shell
 kubectl create -f https://kueue.sigs.k8s.io/examples/dra/sample-dra-extended-resource-job.yaml
 ```
+
+For a workload in a Topology-Aware Scheduling queue:
+
+```shell
+kubectl create -f https://kueue.sigs.k8s.io/examples/dra/sample-dra-tas-job.yaml
+```
+
+If you submit the example more than once, `kubectl` reports that the
+`ResourceClaimTemplate` `single-gpu-tas` already exists. The Job is still created.
 
 Internally, Kueue will create a corresponding [Workload](/docs/concepts/workload)
 for this Job.
@@ -130,6 +199,41 @@ resources charged for quota in the
 kubectl -n default get workloads.kueue.x-k8s.io <workload-name> -o yaml
 ```
 
+The Workload does not record which alternative a Pod received. Read it from the
+Pod's generated `ResourceClaim`, using the Job name `kubectl create` returned:
+
+```shell
+kubectl -n default get pods -l batch.kubernetes.io/job-name=<job-name> -o jsonpath='{.items[*].status.resourceClaimStatuses[*].resourceClaimName}'
+```
+
+Then, for each claim name printed:
+
+```shell
+kubectl -n default get resourceclaim <claim-name> -o jsonpath='{.status.allocation.devices.results[*].request}'
+```
+
+The output is similar to the following:
+
+```
+gpu/a100
+```
+
+Each value is `<request>/<alternative>`. The output is empty until the claim is
+allocated.
+
+The example container waits so that you can inspect the claim. When you finish,
+delete each example Job:
+
+```shell
+kubectl -n default delete job <job-name>
+```
+
+Once nothing uses `a100-or-mig`, delete the template:
+
+```shell
+kubectl -n default delete resourceclaimtemplate a100-or-mig
+```
+
 ## Troubleshooting
 
 ### Workload not admitted
@@ -141,6 +245,43 @@ If the Workload stays in `Pending` state:
 - Run `kubectl -n default describe workload <workload-name>` and look at
   the Events section for admission rejection reasons.
 
+### Workload pending with `draNoFit`
+
+Run `kubectl -n default describe workload <workload-name>` and look at the
+`QuotaReserved` condition in the `Conditions` section. If its reason is
+`TopologyPlacementFailed` and its message includes `draNoFit: N`, no node in the
+topology has the devices a single Pod requests. The devices may be in use by other
+workloads, or tainted by an administrator if device taints are enabled. Kueue retries
+when devices change, for example when another workload releases them or a taint is
+removed. If no node can ever satisfy the request, reduce the number of devices each
+Pod requests, or ask your administrator which nodes publish the `DeviceClass` you use.
+
+If the message is `Bypassed scheduling evaluation because an equivalent workload
+recently failed`, Kueue skipped your workload because an equivalent one, with the same
+requests, was just rejected. Look for another workload in the same queue whose message
+includes `draNoFit`; it gives the reason. Both are retried when the devices change.
+
+### `firstAvailable` request not admitted
+
+Run `kubectl -n default describe workload <workload-name>` and look at the
+`QuotaReserved` condition. With reason `DRAResourcesUnresolved` (`Inadmissible`
+if your administrator disabled `UnadmittedWorkloadsObservability`), the message
+names the template and the field at fault. `FirstAvailable device selection is
+not supported` means `KueueDRAIntegrationPrioritizedList` is disabled.
+`deviceClassName: Not found` together with `DeviceClass does not exist` means the
+class is missing from the cluster, and `deviceClassName: Not found` alone means
+the class is not in the mapping. Name a mapped class that exists, or ask your
+administrator to create the class, or to enable the gate or map the class and
+restart the controller. Kueue admits the workload when the class is created. For
+any other message, create a corrected template under a new name and submit a
+new Job.
+
+### Pods pending after the workload is admitted
+
+Kueue checks that a node can serve one Pod, not all the Pods it places there. If a
+node has fewer free devices than the Pods placed on it request, some Pods stay
+`Pending` until devices are released, for example when another workload finishes.
+
 ### Double counting (extended resource path)
 
 If quota usage shows double the expected value (e.g., `2` instead of `1` for
@@ -151,10 +292,17 @@ counting them as both a standard resource request and a DRA device.
 
 ### Missing DeviceClass
 
-For the extended resource path, the `DeviceClass` must exist before you submit
-your workload. If it was created after your workload was rejected, the workload
-may not be re-evaluated until another cluster event triggers requeuing.
-Delete and re-create the workload to force re-evaluation.
+For the extended resource path, Kueue does not charge the request as a DRA device
+while the `DeviceClass` is missing, so the workload can stay pending. Kueue
+re-evaluates the workload when the class is created, so you do not need to
+re-create it.
+
+For the `ResourceClaimTemplate` path, Kueue does not admit the workload while a
+`DeviceClass` that the template names is missing. The message of the
+`QuotaReserved` condition includes `DeviceClass does not exist`. Kueue
+re-evaluates the workload when the class is created, so you do not need to
+re-create it. With MultiKueue, the worker cluster runs this check, so the
+message appears on the worker's copy of the workload.
 
 For general troubleshooting, see the
 [troubleshooting guide](/docs/tasks/troubleshooting).

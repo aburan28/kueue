@@ -194,6 +194,9 @@ type Initializer struct {
 // which contains this label: `trainer.kubeflow.org/trainjob-ancestor-step: dataset-initializer`
 type DatasetInitializer struct {
 	// storageUri is the URI for the dataset provider.
+	// If set, it may be empty, or it must be a valid URI format
+	// (e.g., s3://bucket/path, gs://bucket/path).
+	// +kubebuilder:validation:XValidation:rule="self == '' || self.matches('^[A-Za-z][A-Za-z0-9+.-]*://.+$')",message="storageUri may be empty, or it must be a valid URI (scheme://...)"
 	// +kubebuilder:validation:MaxLength=2048
 	// +optional
 	StorageUri *string `json:"storageUri,omitempty"`
@@ -217,6 +220,9 @@ type DatasetInitializer struct {
 // which contains this label: `trainer.kubeflow.org/trainjob-ancestor-step: dataset-initializer`
 type ModelInitializer struct {
 	// storageUri is the URI for the model provider.
+	// If set, it may be empty, or it must be a valid URI format
+	// (e.g., s3://bucket/path, gs://bucket/path).
+	// +kubebuilder:validation:XValidation:rule="self == '' || self.matches('^[A-Za-z][A-Za-z0-9+.-]*://.+$')",message="storageUri may be empty, or it must be a valid URI (scheme://...)"
 	// +kubebuilder:validation:MaxLength=2048
 	// +optional
 	StorageUri *string `json:"storageUri,omitempty"`
@@ -247,14 +253,14 @@ type Trainer struct {
 	// command for the entrypoint of the training container.
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=128
-	// +kubebuilder:validation:items:MaxLength=65536
+	// +kubebuilder:validation:items:MaxLength=1048576
 	// +optional
 	Command []string `json:"command,omitempty"`
 
 	// args for the entrypoint for the training container.
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=128
-	// +kubebuilder:validation:items:MaxLength=65536
+	// +kubebuilder:validation:items:MaxLength=1048576
 	// +optional
 	Args []string `json:"args,omitempty"`
 
@@ -268,18 +274,54 @@ type Trainer struct {
 
 	// numNodes is the number of training nodes.
 	// TODO (andreyvelich): Do we want to support dynamic num of nodes in TrainJob for PyTorch elastic: `--nnodes=1:4` ?
+	// +kubebuilder:validation:Minimum=0
 	// +optional
 	NumNodes *int32 `json:"numNodes,omitempty"`
 
 	// resourcesPerNode defines the compute resources for each training node.
+	// +kubebuilder:validation:XValidation:rule="!has(self.claims) || size(self.claims) == 0",message="claims must not be set in resourcesPerNode; use resourceClaimsPerNode instead"
 	// +optional
 	ResourcesPerNode *corev1.ResourceRequirements `json:"resourcesPerNode,omitempty"`
+
+	// resourceClaimsPerNode defines the DRA ResourceClaims for each training node.
+	// These claims are added to the trainer node Pod's resourceClaims and automatically
+	// referenced in the node container's resources.claims. To attach a claim to another
+	// container (sidecar or init), use the runtimePatches API.
+	// Claims are merged by name. For a claim of the same name, this field takes precedence over
+	// runtimePatches, which take precedence over the runtime template, matching how
+	// resourcesPerNode overrides patched requests and limits.
+	// This is an alpha feature and requires enabling the TrainJobDynamicResourceAllocation feature gate.
+	// More info: https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	ResourceClaimsPerNode []TrainerResourceClaim `json:"resourceClaimsPerNode,omitempty"`
 
 	// numProcPerNode is the number of processes/workers/slots on every training node.
 	// For the MPI runtime only int value can be set to represent number of slots per node.
 	// For the Torch runtime the value defaults to `auto` and can be overridden with an int.
+	// +kubebuilder:validation:XValidation:rule="self >= 1",message="numProcPerNode must be greater than or equal to 1"
 	// +optional
 	NumProcPerNode *int32 `json:"numProcPerNode,omitempty"`
+}
+
+// TrainerResourceClaim references a ResourceClaimTemplate for every training node Pod.
+type TrainerResourceClaim struct {
+	// name uniquely identifies this resource claim inside the Pod and is what the node
+	// container's resources.claims entry references. Must be a DNS label.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern="^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+	// +required
+	Name string `json:"name,omitempty"`
+
+	// resourceClaimTemplateName is the name of a ResourceClaimTemplate in the TrainJob namespace.
+	// A separate ResourceClaim is created from it for every training node Pod.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +required
+	ResourceClaimTemplateName string `json:"resourceClaimTemplateName,omitempty"`
 }
 
 // RuntimePatch represents a custom patch applied to the TrainJob's training runtime template.
@@ -382,6 +424,15 @@ type PodTemplatePatch struct {
 
 // PodSpecPatch contains the Pod spec fields that managers are permitted to patch.
 type PodSpecPatch struct {
+	// schedulerName patches the scheduler for the Pods in the target job templates.
+	// When omitted, the scheduler specified in the runtime template is preserved.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf", message="field is immutable"
+	// +optional
+	SchedulerName string `json:"schedulerName,omitempty"`
+
 	// serviceAccountName patches the service account for the Pods in the target job templates.
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf", message="field is immutable"
@@ -395,6 +446,18 @@ type PodSpecPatch struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf", message="field is immutable"
 	// +optional
 	Volumes []corev1.Volume `json:"volumes,omitempty"`
+
+	// resourceClaims patches the Pod's resourceClaims, typically for sidecar and init containers.
+	// Entries are merged by name with the runtime template using strategic merge patch.
+	// For a claim of the same name, spec.trainer.resourceClaimsPerNode takes precedence over
+	// this field, which takes precedence over the runtime template. Containers consume a claim
+	// by referencing its name in the container's resources.claims of this runtime patch.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf", message="field is immutable"
+	// +optional
+	ResourceClaims []corev1.PodResourceClaim `json:"resourceClaims,omitempty"`
 
 	// initContainers patches the init containers in the target job templates.
 	// +listType=map
@@ -447,6 +510,13 @@ type PodSpecPatch struct {
 	// +kubebuilder:validation:MaxItems=16
 	// +optional
 	SchedulingGates []corev1.PodSchedulingGate `json:"schedulingGates,omitempty"`
+
+	// terminationGracePeriodSeconds patches the termination grace period for Pods
+	// in the target job templates.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="field is immutable"
+	// +optional
+	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
 }
 
 // ContainerPatch represents parameters that can be patched using PodSpecPatch.
@@ -473,6 +543,14 @@ type ContainerPatch struct {
 	// +kubebuilder:validation:MaxItems=128
 	// +optional
 	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
+
+	// resources patches the container's compute resources, merged with the runtime template
+	// using strategic merge patch. If setting the resources on the main node container, prefer
+	// the higher level spec.trainer.resourcesPerNode and spec.trainer.resourceClaimsPerNode
+	// fields; they take precedence over this field, which takes precedence over the runtime
+	// template.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 
 	// securityContext patches the container's security context.
 	// More info: https://kubernetes.io/docs/tasks/configure-pod-container/security-context/

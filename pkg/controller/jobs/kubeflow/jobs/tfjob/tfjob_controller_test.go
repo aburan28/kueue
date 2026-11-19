@@ -24,7 +24,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/component-base/featuregate"
-	"k8s.io/utils/ptr"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/features"
@@ -295,21 +294,20 @@ func TestPodSets(t *testing.T) {
 						PodSpec(job.Spec.TFReplicaSpecs[kftraining.TFJobReplicaTypeChief].Template.Spec).
 						Annotations(map[string]string{kueue.PodSetRequiredTopologyAnnotation: "cloud.com/rack"}).
 						RequiredTopologyRequest("cloud.com/rack").
-						PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+						PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 						Obj(),
 					*utiltestingapi.MakePodSet(kueue.NewPodSetReference(string(kftraining.TFJobReplicaTypePS)), 1).
 						PodSpec(job.Spec.TFReplicaSpecs[kftraining.TFJobReplicaTypePS].Template.Spec).
 						Annotations(map[string]string{kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block"}).
 						PreferredTopologyRequest("cloud.com/block").
-						PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+						PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 						Obj(),
 					*utiltestingapi.MakePodSet(kueue.NewPodSetReference(string(kftraining.TFJobReplicaTypeWorker)), 1).
 						PodSpec(job.Spec.TFReplicaSpecs[kftraining.TFJobReplicaTypeWorker].Template.Spec).
-						PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+						PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 						Obj(),
 				}
 			},
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
 		},
 		"without required and preferred topology annotation if TAS is disabled": {
 			job: testingtfjob.MakeTFJob("tfjob", "ns").
@@ -400,7 +398,6 @@ func TestValidate(t *testing.T) {
 					},
 				).
 				Obj(),
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
 		},
 		"invalid TAS request": {
 			job: testingtfjob.MakeTFJob("tfjob", "ns").
@@ -446,7 +443,36 @@ func TestValidate(t *testing.T) {
 					`must not contain more than one topology annotation: ["kueue.x-k8s.io/podset-required-topology", `+
 						`"kueue.x-k8s.io/podset-preferred-topology", "kueue.x-k8s.io/podset-unconstrained-topology"]`),
 			},
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
+		},
+		"invalid TAS request is accepted if TAS is disabled": {
+			job: testingtfjob.MakeTFJob("tfjob", "ns").
+				TFReplicaSpecs(
+					testingtfjob.TFReplicaSpecRequirement{
+						ReplicaType:  kftraining.TFJobReplicaTypeChief,
+						ReplicaCount: 1,
+						Annotations: map[string]string{
+							kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/rack",
+							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
+						},
+					},
+					testingtfjob.TFReplicaSpecRequirement{
+						ReplicaType:  kftraining.TFJobReplicaTypePS,
+						ReplicaCount: 1,
+						Annotations: map[string]string{
+							kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/rack",
+							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
+						},
+					},
+					testingtfjob.TFReplicaSpecRequirement{
+						ReplicaType:  kftraining.TFJobReplicaTypeWorker,
+						ReplicaCount: 1,
+						Annotations: map[string]string{
+							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/rack",
+						},
+					},
+				).
+				Obj(),
+			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: false},
 		},
 		"invalid slice topology request - slice size larger than number of podsets": {
 			job: testingtfjob.MakeTFJob("tfjob", "ns").
@@ -503,7 +529,6 @@ func TestValidate(t *testing.T) {
 					"20", "must not be greater than pod set count 10",
 				),
 			},
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
 		},
 	}
 	for name, tc := range testCases {

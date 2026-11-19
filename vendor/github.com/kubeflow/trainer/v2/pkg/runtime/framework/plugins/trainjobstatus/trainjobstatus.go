@@ -63,7 +63,7 @@ type Status struct {
 }
 
 var _ framework.ComponentBuilderPlugin = (*Status)(nil)
-var _ framework.EnforceMLPolicyPlugin = (*Status)(nil)
+var _ framework.EnforcePodSpecPlugin = (*Status)(nil)
 
 func New(_ context.Context, c client.Client, _ client.FieldIndexer, cfg *configapi.Configuration) (framework.Plugin, error) {
 	return &Status{client: c, cfg: cfg}, nil
@@ -73,8 +73,11 @@ func (p *Status) Name() string {
 	return Name
 }
 
-func (p *Status) EnforceMLPolicy(info *runtime.Info, trainJob *trainer.TrainJob) error {
-	if info == nil || trainJob == nil {
+// EnforcePodSpec injects the status server endpoint, its CA certificate, and the
+// projected service account token into every trainer container, so the instrumented
+// runtime can report the TrainJob status back to the control plane.
+func (p *Status) EnforcePodSpec(podSets runtime.PodSets, trainJob *trainer.TrainJob) error {
+	if podSets == nil || trainJob == nil {
 		return nil
 	}
 
@@ -86,7 +89,7 @@ func (p *Status) EnforceMLPolicy(info *runtime.Info, trainJob *trainer.TrainJob)
 	volume := createTokenVolume(trainJob)
 
 	// Inject into all trainer containers
-	trainerPS := info.FindPodSetByAncestor(constants.AncestorTrainer)
+	trainerPS := podSets.FindByAncestor(constants.AncestorTrainer)
 	if trainerPS != nil {
 		for i := range trainerPS.Containers {
 			apply.UpsertEnvVars(&trainerPS.Containers[i].Env, envVars...)
@@ -115,8 +118,7 @@ func (p *Status) createEnvVars(trainJob *trainer.TrainJob) ([]corev1ac.EnvVarApp
 	if p.cfg.StatusServer.Port == nil {
 		return nil, fmt.Errorf("missing status server port")
 	}
-	// TODO: consider renaming the CertManagement.WebhookServiceName name?
-	svc := fmt.Sprintf("https://%s.%s.svc:%d", p.cfg.CertManagement.WebhookServiceName, cert.GetOperatorNamespace(), *p.cfg.StatusServer.Port)
+	svc := fmt.Sprintf("https://%s.%s.svc:%d", p.cfg.CertManagement.ServiceName, cert.GetOperatorNamespace(), *p.cfg.StatusServer.Port)
 	path := statusserver.StatusUrl(trainJob.Namespace, trainJob.Name)
 	statusURL := svc + path
 
@@ -169,15 +171,15 @@ func createTokenVolume(trainJob *trainer.TrainJob) corev1ac.VolumeApplyConfigura
 		)
 }
 
-// buildStatusServerCaCrtConfigMap creates a ConfigMap that will copy the ca.crt from the webhook secret
+// buildStatusServerCaCrtConfigMap creates a ConfigMap that will copy the ca.crt from the TLS secret
 func (p *Status) buildStatusServerCaCrtConfigMap(ctx context.Context, trainJob *trainer.TrainJob) (*corev1ac.ConfigMapApplyConfiguration, error) {
 	configMapName := fmt.Sprintf("%s-tls-config", trainJob.Name)
 
-	// Get the CA cert from the webhook secret
+	// Get the CA cert from the TLS secret
 	secret := &corev1.Secret{}
 	secretKey := client.ObjectKey{
 		Namespace: cert.GetOperatorNamespace(),
-		Name:      p.cfg.CertManagement.WebhookSecretName,
+		Name:      p.cfg.CertManagement.SecretName,
 	}
 
 	var caCertData string

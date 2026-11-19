@@ -27,9 +27,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	jobcontrollers "sigs.k8s.io/kueue/pkg/controller/jobs"
 	"sigs.k8s.io/kueue/pkg/webhooks"
 	"sigs.k8s.io/kueue/test/integration/framework"
-	"sigs.k8s.io/kueue/test/util"
+	"sigs.k8s.io/kueue/test/util/behavioral"
 )
 
 var (
@@ -40,15 +41,16 @@ var (
 )
 
 func TestAPIs(t *testing.T) {
-	util.RunSuite(t, "Setup Controllers Suite")
+	behavioral.RunSuite(t, "Setup Controllers Suite")
 }
 
 func managerSetup(opts ...jobframework.Option) framework.ManagerSetup {
+	ginkgo.GinkgoHelper()
 	return func(ctx context.Context, mgr manager.Manager) {
-		gomega.Expect(jobframework.SetupIndexes(ctx, mgr.GetFieldIndexer(), opts...)).NotTo(gomega.HaveOccurred())
-		// The integration manager is a shared state and that after enabled a framework
-		// will remain enabled until the end of the test suite.
-		gomega.Expect(jobframework.SetupControllers(ctx, mgr, ginkgo.GinkgoLogr, opts...)).NotTo(gomega.HaveOccurred())
+		integrationManager := jobcontrollers.NewIntegrationManager()
+		opts = append(opts, jobframework.WithIntegrationManager(integrationManager))
+		gomega.Expect(integrationManager.SetupIndexes(ctx, mgr.GetFieldIndexer(), opts...)).NotTo(gomega.HaveOccurred())
+		gomega.Expect(integrationManager.SetupControllers(ctx, mgr, ginkgo.GinkgoLogr, opts...)).NotTo(gomega.HaveOccurred())
 
 		failedWebhook, err := webhooks.Setup(mgr, nil)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "webhook", failedWebhook)

@@ -18,13 +18,18 @@ package list
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/cli-runtime/pkg/printers"
+	"k8s.io/kubectl/pkg/util/templates"
 )
 
 const (
@@ -33,8 +38,20 @@ const (
 )
 
 var (
-	errInvalidListRequestLimit = errors.New("invalid list request limit")
+	listRequestLimitDescription = fmt.Sprintf(
+		"%s sets how many objects kueuectl fetches from the Kubernetes API per request. "+
+			"It does not limit the output: all matching objects are listed. "+
+			"The default is %d; 0 fetches all objects in a single request.",
+		KueuectlListRequestLimitEnvName,
+		defaultListRequestLimit,
+	)
+
+	errMultipleActiveFlags = errors.New("only one active flag can be provided")
 )
+
+func listLongDesc(s string) string {
+	return templates.LongDesc(s) + "\n\n" + listRequestLimitDescription
+}
 
 func listRequestLimit() (int64, error) {
 	listRequestLimitEnv := os.Getenv(KueuectlListRequestLimitEnvName)
@@ -44,8 +61,8 @@ func listRequestLimit() (int64, error) {
 	}
 
 	limit, err := strconv.ParseInt(listRequestLimitEnv, 10, 64)
-	if err != nil {
-		return 0, errInvalidListRequestLimit
+	if err != nil || limit < 0 {
+		return 0, fmt.Errorf("invalid list request limit: %s=%q must be a non-negative integer", KueuectlListRequestLimitEnvName, listRequestLimitEnv)
 	}
 
 	return limit, nil
@@ -113,4 +130,49 @@ func decodeResourceTypeName(mapper meta.RESTMapper, s string) (gvk schema.GroupV
 	found = true
 
 	return
+}
+
+// pagedListPrinter prints the pages of a paginated list. Table output is
+// printed page by page. When an output format such as -o yaml or -o json is
+// set, the pages are merged and printed once as the last page arrives, so that
+// the output is a single valid document, as with kubectl.
+type pagedListPrinter struct {
+	merge  bool
+	merged runtime.Object
+}
+
+func newPagedListPrinter(merge bool) *pagedListPrinter {
+	return &pagedListPrinter{merge: merge}
+}
+
+func (p *pagedListPrinter) printPage(page runtime.Object, lastPage bool, printer printers.ResourcePrinterFunc, w io.Writer) error {
+	if !p.merge {
+		return printer(page, w)
+	}
+	if p.merged == nil {
+		p.merged = page
+	} else {
+		items, err := meta.ExtractList(p.merged)
+		if err != nil {
+			return err
+		}
+		pageItems, err := meta.ExtractList(page)
+		if err != nil {
+			return err
+		}
+		if err := meta.SetList(p.merged, append(items, pageItems...)); err != nil {
+			return err
+		}
+	}
+	if !lastPage {
+		return nil
+	}
+	// The pagination metadata of the first page is meaningless for the merged list.
+	listMeta, err := meta.ListAccessor(p.merged)
+	if err != nil {
+		return err
+	}
+	listMeta.SetContinue("")
+	listMeta.SetRemainingItemCount(nil)
+	return printer(p.merged, w)
 }

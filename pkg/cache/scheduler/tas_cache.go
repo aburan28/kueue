@@ -29,29 +29,35 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/resources"
 	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
+	"sigs.k8s.io/kueue/pkg/workload"
 )
 
 type tasCache struct {
 	sync.RWMutex
-	client      client.Client
-	flavors     map[kueue.ResourceFlavorReference]flavorInformation
-	topologies  map[kueue.TopologyReference]topologyInformation
-	flavorCache map[kueue.ResourceFlavorReference]*TASFlavorCache
+	client            client.Client
+	flavors           map[kueue.ResourceFlavorReference]flavorInformation
+	topologies        map[kueue.TopologyReference]topologyInformation
+	flavorCache       map[kueue.ResourceFlavorReference]*TASFlavorCache
+	resourceFormatter *resources.ResourceFormatter
 
 	nonTasUsageCache *nonTasUsageCache
 	nodesCache       *nodesCache
 }
 
-func NewTASCache(client client.Client) tasCache {
+func NewTASCache(client client.Client, resourceFormatter *resources.ResourceFormatter) tasCache {
 	return tasCache{
-		client:      client,
-		flavors:     make(map[kueue.ResourceFlavorReference]flavorInformation),
-		topologies:  make(map[kueue.TopologyReference]topologyInformation),
-		flavorCache: make(map[kueue.ResourceFlavorReference]*TASFlavorCache),
+		client:            client,
+		flavors:           make(map[kueue.ResourceFlavorReference]flavorInformation),
+		topologies:        make(map[kueue.TopologyReference]topologyInformation),
+		flavorCache:       make(map[kueue.ResourceFlavorReference]*TASFlavorCache),
+		resourceFormatter: resourceFormatter,
 		nonTasUsageCache: &nonTasUsageCache{
-			podUsage:  make(map[types.NamespacedName]podUsageValue),
-			nodeUsage: make(map[string]resources.Requests),
-			lock:      sync.RWMutex{},
+			podUsage:               make(map[types.NamespacedName]podUsageValue),
+			nodeUsage:              make(map[string]resources.Requests),
+			tasPodUsage:            make(map[types.NamespacedName]tasPodUsageValue),
+			tasPodsBySliceWorkload: make(map[workload.Reference]map[types.NamespacedName]tasPodUsageValue),
+			tasNodeUsage:           make(map[workload.Reference]map[string]resources.Requests),
+			lock:                   sync.RWMutex{},
 		},
 		nodesCache: newNodesCache(),
 	}
@@ -70,20 +76,30 @@ func (t *tasCache) Clone() map[kueue.ResourceFlavorReference]*TASFlavorCache {
 	return maps.Clone(t.flavorCache)
 }
 
-func (t *tasCache) AddFlavor(flavor *kueue.ResourceFlavor) {
+func (t *tasCache) AddOrUpdateFlavor(flavor *kueue.ResourceFlavor) {
 	t.Lock()
 	defer t.Unlock()
 	name := kueue.ResourceFlavorReference(flavor.Name)
-	if _, ok := t.flavors[name]; !ok {
-		flavorInfo := flavorInformation{
-			TopologyName: *flavor.Spec.TopologyName,
-			NodeLabels:   maps.Clone(flavor.Spec.NodeLabels),
-			Tolerations:  slices.Clone(flavor.Spec.Tolerations),
-		}
+	tolerations := slices.Clone(flavor.Spec.Tolerations)
+	nodeLabels := maps.Clone(flavor.Spec.NodeLabels)
+	if flavorInfo, ok := t.flavors[name]; ok {
+		flavorInfo.Tolerations = tolerations
+		flavorInfo.NodeLabels = nodeLabels
 		t.flavors[name] = flavorInfo
-		if tInfo, ok := t.topologies[flavorInfo.TopologyName]; ok {
-			t.flavorCache[name] = t.NewTASFlavorCache(tInfo, flavorInfo)
+		if flavorCache, ok := t.flavorCache[name]; ok {
+			flavorCache.updateTolerations(tolerations)
+			flavorCache.updateNodeLabels(nodeLabels)
 		}
+		return
+	}
+	flavorInfo := flavorInformation{
+		TopologyName: *flavor.Spec.TopologyName,
+		NodeLabels:   nodeLabels,
+		Tolerations:  tolerations,
+	}
+	t.flavors[name] = flavorInfo
+	if tInfo, ok := t.topologies[flavorInfo.TopologyName]; ok {
+		t.flavorCache[name] = t.NewTASFlavorCache(tInfo, flavorInfo)
 	}
 }
 
@@ -91,15 +107,20 @@ func (t *tasCache) AddTopology(topology *kueue.Topology) {
 	t.Lock()
 	defer t.Unlock()
 	name := kueue.TopologyReference(topology.Name)
-	if _, ok := t.topologies[name]; !ok {
-		tInfo := topologyInformation{
-			Levels: utiltas.Levels(topology),
+	tInfo := topologyInformation{
+		Levels: utiltas.Levels(topology),
+	}
+	t.topologies[name] = tInfo
+	for fName, flavorInfo := range t.flavors {
+		if flavorInfo.TopologyName != name {
+			continue
 		}
-		t.topologies[name] = tInfo
-		for fName, flavorInfo := range t.flavors {
-			if flavorInfo.TopologyName == name {
-				t.flavorCache[fName] = t.NewTASFlavorCache(tInfo, flavorInfo)
-			}
+		if c, ok := t.flavorCache[fName]; ok {
+			// Update the levels in place: rebuilding the cache entry would drop
+			// the usage accumulated from admitted workloads.
+			c.updateTopology(tInfo)
+		} else {
+			t.flavorCache[fName] = t.NewTASFlavorCache(tInfo, flavorInfo)
 		}
 	}
 }
@@ -122,14 +143,26 @@ func (t *tasCache) DeleteTopology(name kueue.TopologyReference) {
 	}
 }
 
-// Update may add a pod to the cache, or
-// delete a terminated pod.
-func (t *tasCache) Update(pod *corev1.Pod, log logr.Logger) {
-	t.nonTasUsageCache.update(pod, log)
+// UpdateNonTASUsage updates the non-TAS resource usage cache for the pod.
+// Returns the node name when capacity may have been freed on a node.
+func (t *tasCache) UpdateNonTASUsage(pod *corev1.Pod, log logr.Logger) string {
+	return t.nonTasUsageCache.update(pod, log)
 }
 
-func (t *tasCache) DeletePodByKey(key client.ObjectKey, log logr.Logger) {
-	t.nonTasUsageCache.delete(key, log)
+// DeleteNonTASUsageByKey removes the pod from the non-TAS resource usage cache.
+// Returns the node name when an entry is removed.
+func (t *tasCache) DeleteNonTASUsageByKey(key client.ObjectKey, log logr.Logger) string {
+	return t.nonTasUsageCache.delete(key, log)
+}
+
+// UpdateTASPodUsage tracks a bound TAS Pod until it terminates or is deleted.
+func (t *tasCache) UpdateTASPodUsage(pod *corev1.Pod, log logr.Logger) string {
+	return t.nonTasUsageCache.updateTAS(pod, log)
+}
+
+// DeleteTASPodUsageByKey removes a TAS Pod's physical usage from the cache.
+func (t *tasCache) DeleteTASPodUsageByKey(key client.ObjectKey, log logr.Logger) string {
+	return t.nonTasUsageCache.deleteTAS(key, log)
 }
 
 func (t *tasCache) SyncNode(node *corev1.Node) {

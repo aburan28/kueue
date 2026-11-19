@@ -27,7 +27,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,10 +34,12 @@ import (
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	jobframeworktas "sigs.k8s.io/kueue/pkg/controller/jobframework/tas"
 	"sigs.k8s.io/kueue/pkg/controller/jobs/ray"
 	"sigs.k8s.io/kueue/pkg/controller/jobs/raycluster"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/podset"
+	"sigs.k8s.io/kueue/pkg/util/equality"
 )
 
 var (
@@ -51,16 +52,18 @@ const (
 	FrameworkName          = "ray.io/rayjob"
 )
 
-func init() {
-	utilruntime.Must(jobframework.RegisterIntegration(FrameworkName, jobframework.IntegrationCallbacks{
-		SetupIndexes:      SetupIndexes,
-		NewJob:            newJob,
-		NewReconciler:     NewReconciler,
-		SetupWebhook:      SetupRayJobWebhook,
-		JobType:           &rayv1.RayJob{},
-		AddToScheme:       rayv1.AddToScheme,
-		MultiKueueAdapter: ray.NewMKAdapter(copyJobSpec, copyJobStatus, getEmptyList, gvk, getManagedBy, setManagedBy),
-	}))
+func RegisterIntegration(m *jobframework.IntegrationManager) error {
+	return m.RegisterIntegration(FrameworkName, jobframework.IntegrationCallbacks{
+		SetupIndexes:  SetupIndexes,
+		NewJob:        newJob,
+		NewReconciler: NewReconciler,
+		SetupWebhook:  SetupRayJobWebhook,
+		JobType:       &rayv1.RayJob{},
+		AddToScheme:   rayv1.AddToScheme,
+		MultiKueueAdapter: ray.NewMKAdapter(copyJobSpec, copyJobStatus, getEmptyList, gvk, getManagedBy, setManagedBy,
+			ray.WithElasticReplicaSync(elasticRuntimeSync()),
+		),
+	})
 }
 
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;watch;update;patch
@@ -91,6 +94,11 @@ var _ jobframework.JobWithManagedBy = (*RayJob)(nil)
 var _ jobframework.JobWithSkip = (*RayJob)(nil)
 var _ jobframework.JobWithCustomAnnotations = (*RayJob)(nil)
 var _ jobframework.ElasticWorkloadNameProvider = (*RayJob)(nil)
+var _ jobframework.JobWithCustomEquivalenceOptions = (*RayJob)(nil)
+
+func (j *RayJob) CustomEquivalenceOptions(_ context.Context, _ client.Client, _ *kueue.Workload) []equality.ComparePodSetsOption {
+	return raycluster.EquivalenceOptions()
+}
 
 func (j *RayJob) Object() client.Object {
 	return (*rayv1.RayJob)(j)
@@ -193,18 +201,19 @@ func (j *RayJob) RunWithPodSetsInfo(ctx context.Context, _ client.Client, podSet
 }
 
 func (j *RayJob) RestorePodSetsInfo(ctx context.Context, podSetsInfo []podset.PodSetInfo) bool {
+	changed := raycluster.ClearRuntimeWorkerStateAnnotations(j.Object())
 	if expected := j.expectedPodSetsCount(); len(podSetsInfo) != expected {
-		ctrl.LoggerFrom(ctx).V(2).Info(
+		ctrl.LoggerFrom(ctx).V(1).Info(
 			"Skipping pod set info restore because the pod set count does not match the admitted workload",
 			"expectedCount", expected,
 			"gotCount", len(podSetsInfo),
 		)
-		return false
+		return changed
 	}
 
 	// RayCluster pod sets come first, the optional submitter pod set is last.
 	rayClusterLen := raycluster.ExpectedPodSetsCount(j.Spec.RayClusterSpec)
-	changed := raycluster.RestorePodSetsInfo(ctx, j.Spec.RayClusterSpec, podSetsInfo[:rayClusterLen])
+	changed = raycluster.RestorePodSetsInfo(ctx, j.Spec.RayClusterSpec, podSetsInfo[:rayClusterLen]) || changed
 
 	// submitter
 	if j.Spec.SubmissionMode == rayv1.K8sJobMode {
@@ -215,6 +224,9 @@ func (j *RayJob) RestorePodSetsInfo(ctx context.Context, podSetsInfo []podset.Po
 
 	return changed
 }
+func (j *RayJob) IsOnHold() bool {
+	return j.Status.JobDeploymentStatus == rayv1.JobDeploymentStatusValidationFailed
+}
 
 func (j *RayJob) Finished(ctx context.Context) (message string, success, finished bool) {
 	message = j.Status.Message
@@ -223,12 +235,12 @@ func (j *RayJob) Finished(ctx context.Context) (message string, success, finishe
 	return message, success, finished
 }
 
-func (j *RayJob) PodsReady(ctx context.Context, _ client.Client) bool {
+func (j *RayJob) PodsReady(ctx context.Context, _ client.Client, _ ...jobframework.PodsReadyOption) bool {
 	return j.Status.RayClusterStatus.State == rayv1.Ready
 }
 
-func (j *RayJob) GetCustomAnnotations(ctx context.Context, c client.Client, podSets []kueue.PodSet) (map[string]string, error) {
-	return raycluster.GetWorkloadslicingRayClusterCustomAnnotations(ctx, c, j.Object(), podSets, j.Status.RayClusterName)
+func (j *RayJob) GetCustomAnnotations(ctx context.Context, c client.Client) (map[string]string, error) {
+	return raycluster.GetWorkloadslicingRayClusterCustomAnnotations(ctx, c, j.Object(), j.Status.RayClusterName)
 }
 
 func (j *RayJob) GetWorkloadNameExtraPart() string {
@@ -259,7 +271,7 @@ func defaultSubmitterResources() corev1.ResourceRequirements {
 	}
 }
 
-// getSubmitterTemplate returns the PodTemplteSpec of the submitter Job used for RayJob when submissionMode=K8sJobMode
+// getSubmitterTemplate returns the PodTemplateSpec of the submitter Job used for RayJob when submissionMode=K8sJobMode
 func getSubmitterTemplate(rayJob *RayJob) *corev1.PodTemplateSpec {
 	if rayJob.Spec.SubmitterPodTemplate != nil {
 		return rayJob.Spec.SubmitterPodTemplate
@@ -297,7 +309,7 @@ func (j *RayJob) addSubmitterPodSet(podSets []kueue.PodSet) ([]kueue.PodSet, err
 	// Create the TopologyRequest for the Submitter Job PodSet, based on the annotations
 	// in rayJob.Spec.SubmitterPodTemplate, which can be specified by the user.
 	if features.Enabled(features.TopologyAwareScheduling) {
-		topologyRequest, err := jobframework.NewPodSetTopologyRequest(&submitterJobPodSet.Template.ObjectMeta).Build()
+		topologyRequest, err := jobframeworktas.NewPodSetTopologyRequest(&submitterJobPodSet.Template.ObjectMeta).Build()
 		if err != nil {
 			return nil, err
 		}
@@ -329,9 +341,7 @@ func (j *RayJob) addSidecarSubmitterToHeadPodSet(podSets []kueue.PodSet) {
 }
 
 func (j *RayJob) CanDefaultManagedBy() bool {
-	jobSpecManagedBy := j.Spec.ManagedBy
-	return features.Enabled(features.MultiKueue) &&
-		(jobSpecManagedBy == nil || *jobSpecManagedBy == rayutils.KubeRayController)
+	return raycluster.CanDefaultManagedBy(j.Spec.ManagedBy)
 }
 
 func (j *RayJob) ManagedBy() *string {

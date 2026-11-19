@@ -30,7 +30,8 @@ import (
 	workloadtrainjob "sigs.k8s.io/kueue/pkg/controller/jobs/trainjob"
 	testingjobset "sigs.k8s.io/kueue/pkg/util/testingjobs/jobset"
 	testingtrainjob "sigs.k8s.io/kueue/pkg/util/testingjobs/trainjob"
-	"sigs.k8s.io/kueue/test/util"
+	utiltrainjob "sigs.k8s.io/kueue/pkg/util/trainjob"
+	"sigs.k8s.io/kueue/test/util/behavioral"
 )
 
 var _ = ginkgo.Describe("Trainjob Webhook", func() {
@@ -38,7 +39,7 @@ var _ = ginkgo.Describe("Trainjob Webhook", func() {
 
 	ginkgo.When("with manageJobsWithoutQueueName disabled", func() {
 		ginkgo.BeforeEach(func() {
-			fwk.StartManager(ctx, cfg, managerSetup(func(mgr ctrl.Manager, opts ...jobframework.Option) error {
+			fwk.StartManagerForSpec(ctx, cfg, managerSetup(func(mgr ctrl.Manager, opts ...jobframework.Option) error {
 				// Necessary to initialize the runtimes
 				if _, err := workloadtrainjob.NewReconciler(
 					ctx,
@@ -50,11 +51,10 @@ var _ = ginkgo.Describe("Trainjob Webhook", func() {
 				}
 				return workloadtrainjob.SetupTrainJobWebhook(mgr, opts...)
 			}))
-			ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "trainjob-")
+			ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "trainjob-")
 		})
 		ginkgo.AfterEach(func() {
-			gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
-			fwk.StopManager(ctx)
+			gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
 		})
 
 		ginkgo.It("should succed creating the TrainJob", func() {
@@ -68,15 +68,15 @@ var _ = ginkgo.Describe("Trainjob Webhook", func() {
 			trainJob := testingtrainjob.MakeTrainJob("trainjob-test", ns.Name).RuntimeRef(kftrainerapi.RuntimeRef{
 				APIGroup: new(kftrainerapi.GroupVersion.Group),
 				Name:     "test",
-				Kind:     ptr.To(kftrainerapi.TrainingRuntimeKind),
+				Kind:     new(kftrainerapi.TrainingRuntimeKind),
 			}).
 				Queue("queue").
 				Suspend(false).
 				Obj()
 
 			ginkgo.By("by creating the TrainJob", func() {
-				util.MustCreate(ctx, k8sClient, testTr)
-				util.MustCreateWithRetry(ctx, k8sClient, trainJob)
+				behavioral.MustCreate(ctx, k8sClient, testTr)
+				behavioral.MustCreateWithRetry(ctx, k8sClient, trainJob)
 			})
 
 			ginkgo.By("suspending it", func() {
@@ -84,9 +84,43 @@ var _ = ginkgo.Describe("Trainjob Webhook", func() {
 				gomega.Eventually(func(g gomega.Gomega) {
 					g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: trainJob.Name, Namespace: ns.Name}, &createdTrainJob)).Should(gomega.Succeed())
 					g.Expect(ptr.Deref(createdTrainJob.Spec.Suspend, false)).Should(gomega.BeTrue())
-					kueueRuntimePatch := testingtrainjob.KueueRuntimePatch(&createdTrainJob)
+					kueueRuntimePatch := utiltrainjob.KueueRuntimePatch(&createdTrainJob)
 					g.Expect(kueueRuntimePatch).ShouldNot(gomega.BeNil())
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+			})
+		})
+
+		ginkgo.It("should preserve an existing Kueue runtime patch without adding a duplicate", func() {
+			testJobSet := testingjobset.MakeJobSet("", "").ReplicatedJobs(
+				testingjobset.ReplicatedJobRequirements{
+					Name:     "node",
+					Replicas: 1,
+				}).
+				Obj()
+			testTr := testingtrainjob.MakeTrainingRuntime("test", ns.Name, testJobSet.Spec)
+			userRuntimePatch := testingtrainjob.MakeRuntimePatch("example.com/user-manager").Obj()
+			kueueRuntimePatch := testingtrainjob.MakeRuntimePatch(utiltrainjob.KueueRuntimePatchManager).
+				Annotation("example.com/key", "value").
+				Obj()
+			trainJob := testingtrainjob.MakeTrainJob("trainjob-test", ns.Name).RuntimeRef(kftrainerapi.RuntimeRef{
+				APIGroup: new(kftrainerapi.GroupVersion.Group),
+				Name:     "test",
+				Kind:     new(kftrainerapi.TrainingRuntimeKind),
+			}).
+				RuntimePatches([]kftrainerapi.RuntimePatch{userRuntimePatch, kueueRuntimePatch}).
+				Obj()
+
+			ginkgo.By("creating the TrainJob with an existing Kueue runtime patch", func() {
+				behavioral.MustCreate(ctx, k8sClient, testTr)
+				behavioral.MustCreateWithRetry(ctx, k8sClient, trainJob)
+			})
+
+			ginkgo.By("preserving the runtime patches", func() {
+				createdTrainJob := kftrainerapi.TrainJob{}
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: trainJob.Name, Namespace: ns.Name}, &createdTrainJob)).Should(gomega.Succeed())
+					g.Expect(createdTrainJob.Spec.RuntimePatches).Should(gomega.Equal([]kftrainerapi.RuntimePatch{userRuntimePatch, kueueRuntimePatch}))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -101,14 +135,14 @@ var _ = ginkgo.Describe("Trainjob Webhook", func() {
 			trainJob := testingtrainjob.MakeTrainJob("trainjob-test", ns.Name).RuntimeRef(kftrainerapi.RuntimeRef{
 				APIGroup: new(kftrainerapi.GroupVersion.Group),
 				Name:     "test",
-				Kind:     ptr.To(kftrainerapi.TrainingRuntimeKind),
+				Kind:     new(kftrainerapi.TrainingRuntimeKind),
 			}).
 				Suspend(false).
 				Obj()
 
 			ginkgo.By("by creating the TrainJob", func() {
-				util.MustCreate(ctx, k8sClient, testTr)
-				util.MustCreateWithRetry(ctx, k8sClient, trainJob)
+				behavioral.MustCreate(ctx, k8sClient, testTr)
+				behavioral.MustCreateWithRetry(ctx, k8sClient, trainJob)
 			})
 
 			ginkgo.By("and not suspending it", func() {
@@ -116,7 +150,7 @@ var _ = ginkgo.Describe("Trainjob Webhook", func() {
 				gomega.Eventually(func(g gomega.Gomega) {
 					g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: trainJob.Name, Namespace: ns.Name}, &createdTrainJob)).Should(gomega.Succeed())
 					g.Expect(ptr.Deref(createdTrainJob.Spec.Suspend, false)).Should(gomega.BeFalse())
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 	})
