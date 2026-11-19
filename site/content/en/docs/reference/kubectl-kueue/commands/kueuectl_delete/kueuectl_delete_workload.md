@@ -16,7 +16,7 @@ The file is auto-generated from the Go source code of the component using the
 If the Workload has associated Jobs, the command will prompt for deletion approval of the affected Jobs, and delete them. The Workload will then be asynchronously deleted by the garbage collector. If there are no associated Jobs, the command will directly delete the Workload.
 
 ```
-kueuectl delete workload NAME [--yes] [--all] [--dry-run STRATEGY]
+kueuectl delete workload (NAME [NAME...] | --all [--all-namespaces]) [--namespace NAMESPACE] [--yes] [--dry-run STRATEGY]
 ```
 
 
@@ -218,6 +218,15 @@ kueuectl delete workload NAME [--yes] [--all] [--dry-run STRATEGY]
         <td></td>
         <td style="line-height: 130%; word-wrap: break-word;">
             <p>If present, the namespace scope for this CLI request</p>
+        </td>
+    </tr>
+    <tr>
+        <td colspan="2">--proxy-url string</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td style="line-height: 130%; word-wrap: break-word;">
+            <p>Proxy URL to use for requests to the API server</p>
         </td>
     </tr>
     <tr>

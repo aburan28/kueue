@@ -1,0 +1,122 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package simulator
+
+import (
+	"context"
+	"iter"
+
+	corev1 "k8s.io/api/core/v1"
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/cache/scheduler/podtracker"
+	"sigs.k8s.io/kueue/pkg/workload"
+)
+
+type simulatorOptions struct {
+	assumedWorkloads []*kueue.Workload
+}
+
+type Option func(*simulatorOptions)
+
+// WithAssumedWorkloads configures the assumed workloads for virtual pod generation and deduplication
+func WithAssumedWorkloads(wls []*kueue.Workload) Option {
+	return func(o *simulatorOptions) {
+		o.assumedWorkloads = wls
+	}
+}
+
+// AssumedWorkloads extracts the assumed workloads from the given snapshot options.
+func AssumedWorkloads(options ...Option) []*kueue.Workload {
+	opts := &simulatorOptions{}
+	for _, opt := range options {
+		if opt != nil {
+			opt(opts)
+		}
+	}
+	return opts.assumedWorkloads
+}
+
+// Factory allows building instances of SchedulerSimulator
+// based on a snapshot of its internal state.
+// This interface is purposed to control Kueue-WAS integration.
+// The "default" (non-WAS) implementation may trivialize some methods.
+type Factory interface {
+	NewSimulator(ctx context.Context, nodes []*corev1.Node, pods *podtracker.Tracker, options ...Option) (SchedulerSimulator, error)
+}
+
+// SchedulerSimulator allows running simulations on a snapshotted cluster state.
+// This interface is purposed to control Kueue-WAS integration.
+// The default (non-WAS) implementation may trivialize some methods.
+type SchedulerSimulator interface {
+	// Simulate executes the provided function.
+	// After the simulation ends, any changes made to the snapshot state
+	// via its built-in methods will be reverted.
+	// The default implementation runs the method directly, as it disallows mutations on the snapshot.
+	Simulate(ctx context.Context, fn func()) error
+	// FindFeasibleNodes returns all candidates that can be scheduled
+	// with the given requirements, based on the current state of the snapshot.
+	FindFeasibleNodes(ctx context.Context, candidates iter.Seq[Candidate], requirements *PodRequirements, stats *NodeExclusionStats) ([]MatchedCandidate, error)
+	// PreemptWorkload preempts the given workload, returning a function that reverts the preemption.
+	// When run inside Simulate, any changes made by the method or the returned revert function
+	// will be reverted regardless of their outcome (error vs success).
+	// The default implementation does not perform any logic here.
+	PreemptWorkload(ctx context.Context, wlKey workload.Reference) (revert func() error, err error)
+	// ScheduleWorkload simulates how the given workload,
+	// represented by the list of its pods, would be scheduled.
+	// Returns:
+	// - the mapping of input pods to their placements
+	//   (including failed placements), OR
+	// - an error and an empty placements mapping, if the call fails completely.
+	ScheduleWorkload(ctx context.Context, workloadPods []*corev1.Pod, opts ...ScheduleOption) SchedulingResult
+	// AddPodGroup adds a PodGroup to the snapshot
+	AddPodGroup(ctx context.Context, pg *schedulingv1beta1.PodGroup) error
+	// RemovePodGroup removes a PodGroup from the snapshot
+	RemovePodGroup(ctx context.Context, pg *schedulingv1beta1.PodGroup) error
+	// AddCompositePodGroup adds a CompositePodGroup to the snapshot
+	AddCompositePodGroup(ctx context.Context, cpg *schedulingv1alpha3.CompositePodGroup) error
+	// RemoveCompositePodGroup removes a CompositePodGroup from the snapshot
+	RemoveCompositePodGroup(ctx context.Context, cpg *schedulingv1alpha3.CompositePodGroup) error
+}
+
+// PodPreemptingSimulator optionally supports temporary removal of individual
+// bound Pods. It is used by residual-TAS capacity probes; removing an entire
+// Workload could release unrelated Pods and produce a false fit.
+type PodPreemptingSimulator interface {
+	PreemptPods(ctx context.Context, pods []PodRef) (revert func() error, err error)
+}
+
+// PodRef includes the UID so a same-name Pod replacement cannot be mistaken
+// for the residual Pod whose capacity is being probed.
+type PodRef struct {
+	Key client.ObjectKey
+	UID types.UID
+}
+
+func AsCandidates[C Candidate](seq iter.Seq[C]) iter.Seq[Candidate] {
+	return func(yield func(Candidate) bool) {
+		for candidate := range seq {
+			if !yield(candidate) {
+				return
+			}
+		}
+	}
+}

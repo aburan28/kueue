@@ -15,8 +15,10 @@ The file is auto-generated from the Go source code of the component using the
 
 Lists LocalQueues that match the given criteria: point to a specific CQ, being active/inactive, belonging to the specified namespace, matching the label selector or the field selector.
 
+KUEUECTL_LIST_REQUEST_LIMIT sets how many objects kueuectl fetches from the Kubernetes API per request. It does not limit the output: all matching objects are listed. The default is 100; 0 fetches all objects in a single request.
+
 ```
-kueuectl list localqueue [-–clusterqueue CLUSTER_QUEUE_NAME] [--selector key1=value1] [--field-selector key1=value1] [--all-namespaces]
+kueuectl list localqueue [--clusterqueue CLUSTER_QUEUE_NAME] [--selector key1=value1] [--field-selector key1=value1] [--active=true|false] [--all-namespaces]
 ```
 
 
@@ -37,6 +39,15 @@ kueuectl list localqueue [-–clusterqueue CLUSTER_QUEUE_NAME] [--selector key1=
         <col span="1" />
     </colgroup>
     <tbody>
+    <tr>
+        <td colspan="2">--active bools&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Default: []</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td style="line-height: 130%; word-wrap: break-word;">
+            <p>Filter by active status. Valid values: &#39;true&#39; and &#39;false&#39;.</p>
+        </td>
+    </tr>
     <tr>
         <td colspan="2">-A, --all-namespaces</td>
     </tr>
@@ -254,6 +265,15 @@ kueuectl list localqueue [-–clusterqueue CLUSTER_QUEUE_NAME] [--selector key1=
         <td></td>
         <td style="line-height: 130%; word-wrap: break-word;">
             <p>If present, the namespace scope for this CLI request</p>
+        </td>
+    </tr>
+    <tr>
+        <td colspan="2">--proxy-url string</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td style="line-height: 130%; word-wrap: break-word;">
+            <p>Proxy URL to use for requests to the API server</p>
         </td>
     </tr>
     <tr>

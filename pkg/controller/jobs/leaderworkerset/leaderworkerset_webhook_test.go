@@ -19,12 +19,13 @@ package leaderworkerset
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/component-base/featuregate"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -35,7 +36,9 @@ import (
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	kueueconstants "sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/constants"
+	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	"sigs.k8s.io/kueue/pkg/controller/jobs/pod"
 	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 	"sigs.k8s.io/kueue/pkg/features"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
@@ -51,10 +54,13 @@ var (
 
 func TestDefault(t *testing.T) {
 	testCases := map[string]struct {
+		oldLWS                     *leaderworkersetv1.LeaderWorkerSet
 		lws                        *leaderworkersetv1.LeaderWorkerSet
 		manageJobsWithoutQueueName bool
 		defaultLqExist             bool
+		defaultWPCExist            bool
 		enableIntegrations         []string
+		featureGates               map[featuregate.Feature]bool
 		want                       *leaderworkersetv1.LeaderWorkerSet
 		wantErr                    error
 	}{
@@ -123,6 +129,205 @@ func TestDefault(t *testing.T) {
 				LeaderTemplate(corev1.PodTemplateSpec{}).
 				Obj(),
 		},
+		"update of a not ready LeaderWorkerSet sets the default LocalQueue": {
+			defaultLqExist: true,
+			oldLWS: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Obj(),
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Obj(),
+			want: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("default").
+				LeaderTemplateSpecLabel(constants.QueueLabel, "default").
+				LeaderTemplateSpecAnnotation(podconstants.SuspendedByParentAnnotation, FrameworkName).
+				LeaderTemplateSpecAnnotation(podconstants.GroupServingAnnotationKey, podconstants.GroupServingAnnotationValue).
+				WorkerTemplateSpecLabel(constants.QueueLabel, "default").
+				WorkerTemplateSpecAnnotation(podconstants.SuspendedByParentAnnotation, FrameworkName).
+				WorkerTemplateSpecAnnotation(podconstants.GroupServingAnnotationKey, podconstants.GroupServingAnnotationValue).
+				WorkerTemplateSpecAnnotation(kueue.PodIndexOffsetAnnotation, "1").
+				Obj(),
+		},
+		"create of a groupIdentity Hash LeaderWorkerSet sets the default LocalQueue": {
+			defaultLqExist: true,
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			want: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Queue("default").
+				LeaderTemplateSpecLabel(constants.QueueLabel, "default").
+				LeaderTemplateSpecAnnotation(podconstants.SuspendedByParentAnnotation, FrameworkName).
+				LeaderTemplateSpecAnnotation(podconstants.GroupServingAnnotationKey, podconstants.GroupServingAnnotationValue).
+				WorkerTemplateSpecLabel(constants.QueueLabel, "default").
+				WorkerTemplateSpecAnnotation(podconstants.SuspendedByParentAnnotation, FrameworkName).
+				WorkerTemplateSpecAnnotation(podconstants.GroupServingAnnotationKey, podconstants.GroupServingAnnotationValue).
+				WorkerTemplateSpecAnnotation(kueue.PodIndexOffsetAnnotation, "1").
+				Obj(),
+		},
+		"update of a not ready groupIdentity Hash LeaderWorkerSet does not set the default LocalQueue": {
+			defaultLqExist: true,
+			oldLWS: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			want: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+		},
+		"update of a not ready groupIdentity Hash LeaderWorkerSet sets the default LocalQueue when LeaderWorkerSetRejectGroupIdentityHash is disabled": {
+			featureGates:   map[featuregate.Feature]bool{features.LeaderWorkerSetRejectGroupIdentityHash: false},
+			defaultLqExist: true,
+			oldLWS: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			want: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Queue("default").
+				LeaderTemplateSpecLabel(constants.QueueLabel, "default").
+				LeaderTemplateSpecAnnotation(podconstants.SuspendedByParentAnnotation, FrameworkName).
+				LeaderTemplateSpecAnnotation(podconstants.GroupServingAnnotationKey, podconstants.GroupServingAnnotationValue).
+				WorkerTemplateSpecLabel(constants.QueueLabel, "default").
+				WorkerTemplateSpecAnnotation(podconstants.SuspendedByParentAnnotation, FrameworkName).
+				WorkerTemplateSpecAnnotation(podconstants.GroupServingAnnotationKey, podconstants.GroupServingAnnotationValue).
+				WorkerTemplateSpecAnnotation(kueue.PodIndexOffsetAnnotation, "1").
+				Obj(),
+		},
+		"update of a ready LeaderWorkerSet without the queue-name label does not set the default LocalQueue": {
+			defaultLqExist: true,
+			oldLWS: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				ReadyReplicas(1).
+				Obj(),
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				ReadyReplicas(1).
+				Obj(),
+			want: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				ReadyReplicas(1).
+				Obj(),
+		},
+		"update of a ready LeaderWorkerSet that drops a non-default queue-name label does not set the default LocalQueue": {
+			defaultLqExist: true,
+			oldLWS: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("foo").
+				ReadyReplicas(1).
+				Obj(),
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				ReadyReplicas(1).
+				Obj(),
+			want: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				ReadyReplicas(1).
+				Obj(),
+		},
+		"update of a ready LeaderWorkerSet that drops the default queue-name label sets the default LocalQueue": {
+			defaultLqExist: true,
+			oldLWS: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("default").
+				ReadyReplicas(1).
+				Obj(),
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				ReadyReplicas(1).
+				Obj(),
+			want: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("default").
+				LeaderTemplateSpecLabel(constants.QueueLabel, "default").
+				LeaderTemplateSpecAnnotation(podconstants.SuspendedByParentAnnotation, FrameworkName).
+				LeaderTemplateSpecAnnotation(podconstants.GroupServingAnnotationKey, podconstants.GroupServingAnnotationValue).
+				WorkerTemplateSpecLabel(constants.QueueLabel, "default").
+				WorkerTemplateSpecAnnotation(podconstants.SuspendedByParentAnnotation, FrameworkName).
+				WorkerTemplateSpecAnnotation(podconstants.GroupServingAnnotationKey, podconstants.GroupServingAnnotationValue).
+				WorkerTemplateSpecAnnotation(kueue.PodIndexOffsetAnnotation, "1").
+				ReadyReplicas(1).
+				Obj(),
+		},
+		"update of a ready groupIdentity Hash LeaderWorkerSet that drops the default queue-name label sets the default LocalQueue": {
+			defaultLqExist: true,
+			oldLWS: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Queue("default").
+				ReadyReplicas(1).
+				Obj(),
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				ReadyReplicas(1).
+				Obj(),
+			want: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Queue("default").
+				LeaderTemplateSpecLabel(constants.QueueLabel, "default").
+				LeaderTemplateSpecAnnotation(podconstants.SuspendedByParentAnnotation, FrameworkName).
+				LeaderTemplateSpecAnnotation(podconstants.GroupServingAnnotationKey, podconstants.GroupServingAnnotationValue).
+				WorkerTemplateSpecLabel(constants.QueueLabel, "default").
+				WorkerTemplateSpecAnnotation(podconstants.SuspendedByParentAnnotation, FrameworkName).
+				WorkerTemplateSpecAnnotation(podconstants.GroupServingAnnotationKey, podconstants.GroupServingAnnotationValue).
+				WorkerTemplateSpecAnnotation(kueue.PodIndexOffsetAnnotation, "1").
+				ReadyReplicas(1).
+				Obj(),
+		},
+		"create sets the default WorkloadPriorityClass": {
+			defaultWPCExist: true,
+			lws:             testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").Obj(),
+			want: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				WorkloadPriorityClass(constants.DefaultWorkloadPriorityClassName).
+				Obj(),
+		},
+		"update of a not ready LeaderWorkerSet sets the default WorkloadPriorityClass": {
+			defaultWPCExist: true,
+			oldLWS:          testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").Obj(),
+			lws:             testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").Obj(),
+			want: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				WorkloadPriorityClass(constants.DefaultWorkloadPriorityClassName).
+				Obj(),
+		},
+		"update of a ready LeaderWorkerSet without the priority class label does not set the default WorkloadPriorityClass": {
+			defaultWPCExist: true,
+			oldLWS:          testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").ReadyReplicas(1).Obj(),
+			lws:             testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").ReadyReplicas(1).Obj(),
+			want:            testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").ReadyReplicas(1).Obj(),
+		},
+		"update that marks a ready LeaderWorkerSet as not ready does not set the default WorkloadPriorityClass": {
+			defaultWPCExist: true,
+			oldLWS:          testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").ReadyReplicas(1).Obj(),
+			lws:             testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").Obj(),
+			want:            testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").Obj(),
+		},
+		"update of a ready LeaderWorkerSet that drops the priority class label sets the default WorkloadPriorityClass": {
+			defaultWPCExist: true,
+			oldLWS: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				WorkloadPriorityClass(constants.DefaultWorkloadPriorityClassName).
+				ReadyReplicas(1).
+				Obj(),
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").ReadyReplicas(1).Obj(),
+			want: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				WorkloadPriorityClass(constants.DefaultWorkloadPriorityClassName).
+				ReadyReplicas(1).
+				Obj(),
+		},
 		"worker-only LWS (no leader template), no offset annotation": {
 			defaultLqExist: true,
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "default").
@@ -189,10 +394,18 @@ func TestDefault(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			t.Cleanup(jobframework.EnableIntegrationsForTest(t, tc.enableIntegrations...))
+			features.SetFeatureGatesDuringTest(t, tc.featureGates)
+			integrationManager := newTestIntegrationManager(t)
+			t.Cleanup(integrationManager.EnableIntegrationsForTest(t, tc.enableIntegrations...))
 			ctx, _ := utiltesting.ContextWithLog(t)
+			if tc.oldLWS != nil {
+				ctx = utiltesting.ContextWithUpdateRequest(ctx, t, tc.oldLWS)
+			}
 
 			builder := utiltesting.NewClientBuilder()
+			if tc.defaultWPCExist {
+				builder = builder.WithObjects(utiltestingapi.MakeWorkloadPriorityClass(constants.DefaultWorkloadPriorityClassName).PriorityValue(100).Obj())
+			}
 			cli := builder.Build()
 			cqCache := schdcache.New(cli)
 			queueManager := qcache.NewManagerForUnitTests(cli, cqCache)
@@ -204,6 +417,7 @@ func TestDefault(t *testing.T) {
 			}
 
 			w := &Webhook{
+				integrationManager:         integrationManager,
 				client:                     cli,
 				manageJobsWithoutQueueName: tc.manageJobsWithoutQueueName,
 				queues:                     queueManager,
@@ -222,11 +436,12 @@ func TestDefault(t *testing.T) {
 
 func TestValidateCreate(t *testing.T) {
 	testCases := map[string]struct {
-		integrations []string
-		lws          *leaderworkersetv1.LeaderWorkerSet
-		featureGates map[featuregate.Feature]bool
-		wantErr      error
-		wantWarns    admission.Warnings
+		integrations               []string
+		manageJobsWithoutQueueName bool
+		lws                        *leaderworkersetv1.LeaderWorkerSet
+		featureGates               map[featuregate.Feature]bool
+		wantErr                    error
+		wantWarns                  admission.Warnings
 	}{
 		"without queue": {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
@@ -282,17 +497,13 @@ func TestValidateCreate(t *testing.T) {
 				LeaderTemplate(corev1.PodTemplateSpec{}).
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				Obj(),
@@ -302,19 +513,15 @@ func TestValidateCreate(t *testing.T) {
 				LeaderTemplate(corev1.PodTemplateSpec{}).
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/block",
-							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/block",
+						kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/block",
-							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/block",
+						kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				Obj(),
@@ -333,22 +540,18 @@ func TestValidateCreate(t *testing.T) {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetRequiredTopologyAnnotation:      "cloud.com/block",
-							kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/block",
-							kueue.PodSetSliceSizeAnnotation:             "2",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetRequiredTopologyAnnotation:      "cloud.com/block",
+						kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/block",
+						kueue.PodSetSliceSizeAnnotation:             "2",
 					},
 				}).
 				Size(4).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetRequiredTopologyAnnotation:      "cloud.com/block",
-							kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/block",
-							kueue.PodSetSliceSizeAnnotation:             "20",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetRequiredTopologyAnnotation:      "cloud.com/block",
+						kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/block",
+						kueue.PodSetSliceSizeAnnotation:             "20",
 					},
 				}).
 				Obj(),
@@ -363,18 +566,14 @@ func TestValidateCreate(t *testing.T) {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetSliceSizeAnnotation: "1",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetSliceSizeAnnotation: "1",
 					},
 				}).
 				Size(4).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetSliceSizeAnnotation: "1",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetSliceSizeAnnotation: "1",
 					},
 				}).
 				Obj(),
@@ -389,18 +588,14 @@ func TestValidateCreate(t *testing.T) {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				Size(4).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				Obj(),
@@ -411,81 +606,97 @@ func TestValidateCreate(t *testing.T) {
 					Key("kueue.x-k8s.io/podset-slice-size"), "must be set when 'kueue.x-k8s.io/podset-slice-required-topology' is specified"),
 			}.ToAggregate(),
 		},
-		"invalid slice topology request - grouping requested together with slicing": {
+		"valid slice topology request - grouping requested together with slicing": {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                       "groupname",
-							kueue.PodSetRequiredTopologyAnnotation:      "cloud.com/block",
-							kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/block",
-							kueue.PodSetSliceSizeAnnotation:             "1",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                       "groupname",
+						kueue.PodSetRequiredTopologyAnnotation:      "cloud.com/block",
+						kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/block",
+						kueue.PodSetSliceSizeAnnotation:             "1",
 					},
 				}).
 				Size(4).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                       "groupname",
-							kueue.PodSetRequiredTopologyAnnotation:      "cloud.com/block",
-							kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/block",
-							kueue.PodSetSliceSizeAnnotation:             "1",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                       "groupname",
+						kueue.PodSetRequiredTopologyAnnotation:      "cloud.com/block",
+						kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/block",
+						kueue.PodSetSliceSizeAnnotation:             "1",
 					},
 				}).
 				Obj(),
-			wantErr: field.ErrorList{
-				field.Forbidden(field.NewPath("spec.leaderWorkerTemplate.leaderTemplate.metadata.annotations").
-					Key("kueue.x-k8s.io/podset-group-name"), "may not be set when 'kueue.x-k8s.io/podset-slice-size' is specified"),
-				field.Forbidden(field.NewPath("spec.leaderWorkerTemplate.leaderTemplate.metadata.annotations").
-					Key("kueue.x-k8s.io/podset-group-name"), "may not be set when 'kueue.x-k8s.io/podset-slice-required-topology' is specified"),
-				field.Forbidden(field.NewPath("spec.leaderWorkerTemplate.workerTemplate.metadata.annotations").
-					Key("kueue.x-k8s.io/podset-group-name"), "may not be set when 'kueue.x-k8s.io/podset-slice-size' is specified"),
-				field.Forbidden(field.NewPath("spec.leaderWorkerTemplate.workerTemplate.metadata.annotations").
-					Key("kueue.x-k8s.io/podset-group-name"), "may not be set when 'kueue.x-k8s.io/podset-slice-required-topology' is specified"),
-			}.ToAggregate(),
+		},
+		"valid slice topology request - grouping with unsliced leader and sliced workers": {
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				LeaderTemplate(corev1.PodTemplateSpec{
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "groupname",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
+					},
+				}).
+				Size(5).
+				WorkerTemplate(corev1.PodTemplateSpec{
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                       "groupname",
+						kueue.PodSetRequiredTopologyAnnotation:      "cloud.com/block",
+						kueue.PodSetSliceRequiredTopologyAnnotation: "cloud.com/rack",
+						kueue.PodSetSliceSizeAnnotation:             "2",
+					},
+				}).
+				Obj(),
 		},
 		"valid PodSet group name request": {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                  "groupname",
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "groupname",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                  "groupname",
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "groupname",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				Obj(),
 			wantErr: nil,
 		},
+		"valid PodSet group name request - pod-index-offset set alongside podset-group-name": {
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				LeaderTemplate(corev1.PodTemplateSpec{
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "groupname",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
+					},
+				}).
+				WorkerTemplate(corev1.PodTemplateSpec{
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "groupname",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
+						kueue.PodIndexOffsetAnnotation:         "1",
+					},
+				}).
+				Obj(),
+		},
 		"invalid PodSet group name request - value is a number": {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                  "1234",
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "1234",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                  "1234",
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "1234",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				Obj(),
@@ -500,11 +711,9 @@ func TestValidateCreate(t *testing.T) {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                  "groupname",
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "groupname",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				WorkerTemplate(corev1.PodTemplateSpec{}).
@@ -522,11 +731,9 @@ func TestValidateCreate(t *testing.T) {
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{}).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                  "groupname",
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "groupname",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				Obj(),
@@ -542,19 +749,15 @@ func TestValidateCreate(t *testing.T) {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                  "groupname1",
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "groupname1",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                  "groupname2",
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "groupname2",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				Obj(),
@@ -575,19 +778,15 @@ func TestValidateCreate(t *testing.T) {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                  "groupname",
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "groupname",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                  "groupname",
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/rack",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "groupname",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/rack",
 					},
 				}).
 				Obj(),
@@ -608,19 +807,15 @@ func TestValidateCreate(t *testing.T) {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                   "groupname",
-							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                   "groupname",
+						kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                   "groupname",
-							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/rack",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                   "groupname",
+						kueue.PodSetPreferredTopologyAnnotation: "cloud.com/rack",
 					},
 				}).
 				Obj(),
@@ -641,19 +836,15 @@ func TestValidateCreate(t *testing.T) {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                  "groupname",
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                  "groupname",
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                   "groupname",
-							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                   "groupname",
+						kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				Obj(),
@@ -674,17 +865,13 @@ func TestValidateCreate(t *testing.T) {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName: "groupname",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName: "groupname",
 					},
 				}).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName: "groupname",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName: "groupname",
 					},
 				}).
 				Obj(),
@@ -699,11 +886,9 @@ func TestValidateCreate(t *testing.T) {
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetGroupName:                   "groupname",
-							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetGroupName:                   "groupname",
+						kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				Obj(),
@@ -856,8 +1041,62 @@ func TestValidateCreate(t *testing.T) {
 				Obj(),
 			wantErr: nil,
 		},
+		"groupIdentity Hash when managed": {
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: groupIdentityPath.String(),
+				},
+			}.ToAggregate(),
+		},
+		"groupIdentity Hash when managed and LeaderWorkerSetRejectGroupIdentityHash is disabled": {
+			featureGates: map[featuregate.Feature]bool{features.LeaderWorkerSetRejectGroupIdentityHash: false},
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+		},
+		"groupIdentity Ordinal when managed": {
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityOrdinal).
+				Obj(),
+		},
+		"groupIdentity Ordinal with a missing owner skips the management lookup": {
+			integrations: []string{FrameworkName},
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityOrdinal).
+				OwnerReference("parent-lws", gvk).
+				Obj(),
+		},
+		"groupIdentity Hash when unmanaged": {
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+		},
+		"groupIdentity Hash without queue when managing jobs without queue name": {
+			manageJobsWithoutQueueName: true,
+			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: groupIdentityPath.String(),
+				},
+			}.ToAggregate(),
+		},
 		"elastic job annotation is rejected": {
-			featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: true},
 			lws: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				Queue("test-queue").
 				LeaderTemplate(corev1.PodTemplateSpec{}).
@@ -874,14 +1113,15 @@ func TestValidateCreate(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			t.Cleanup(jobframework.EnableIntegrationsForTest(t, "pod"))
+			integrationManager := newTestIntegrationManager(t)
+			t.Cleanup(integrationManager.EnableIntegrationsForTest(t, "pod"))
 			for _, integration := range tc.integrations {
-				jobframework.EnableIntegrationsForTest(t, integration)
+				integrationManager.EnableIntegration(integration)
 			}
 			features.SetFeatureGatesDuringTest(t, tc.featureGates)
 			builder := utiltesting.NewClientBuilder()
 			client := builder.Build()
-			w := &Webhook{client: client}
+			w := &Webhook{integrationManager: integrationManager, client: client, manageJobsWithoutQueueName: tc.manageJobsWithoutQueueName}
 			ctx, _ := utiltesting.ContextWithLog(t)
 			warns, err := w.ValidateCreate(ctx, tc.lws)
 			if diff := cmp.Diff(tc.wantErr, err, cmpopts.IgnoreFields(field.Error{}, "BadValue", "Detail")); diff != "" {
@@ -896,11 +1136,14 @@ func TestValidateCreate(t *testing.T) {
 
 func TestValidateUpdate(t *testing.T) {
 	testCases := map[string]struct {
-		integrations []string
-		oldObj       *leaderworkersetv1.LeaderWorkerSet
-		newObj       *leaderworkersetv1.LeaderWorkerSet
-		featureGates map[featuregate.Feature]bool
-		wantErr      error
+		integrations               []string
+		manageJobsWithoutQueueName bool
+		objs                       []runtime.Object
+		oldObj                     *leaderworkersetv1.LeaderWorkerSet
+		newObj                     *leaderworkersetv1.LeaderWorkerSet
+		featureGates               map[featuregate.Feature]bool
+		wantErr                    error
+		wantWarns                  admission.Warnings
 	}{
 		"no changes": {
 			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
@@ -960,6 +1203,1024 @@ func TestValidateUpdate(t *testing.T) {
 				},
 			}.ToAggregate(),
 		},
+		"change size when managed": {
+			featureGates: map[featuregate.Feature]bool{features.LWSImmutableGroupSize: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				Size(2).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				Size(10).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: leaderWorkerTemplateSizePath.String(),
+				},
+			}.ToAggregate(),
+		},
+		"change size when managed and the feature gate is disabled": {
+			featureGates: map[featuregate.Feature]bool{features.LWSImmutableGroupSize: false},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				Size(2).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				Size(10).
+				Obj(),
+		},
+		"same size when managed": {
+			featureGates: map[featuregate.Feature]bool{features.LWSImmutableGroupSize: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				Size(2).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				Size(2).
+				Obj(),
+		},
+		"add tolerations when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowAddingPodTemplateTolerations: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				LeaderTemplateSpecToleration(corev1.Toleration{Key: "old", Operator: corev1.TolerationOpExists}).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				LeaderTemplateSpecToleration(corev1.Toleration{Key: "new", Operator: corev1.TolerationOpExists}).
+				LeaderTemplateSpecToleration(corev1.Toleration{Key: "old", Operator: corev1.TolerationOpExists}).
+				WorkerTemplateSpecToleration(corev1.Toleration{Key: "new", Operator: corev1.TolerationOpExists}).
+				Obj(),
+		},
+		"add tolerations when managed and the feature gate is disabled": {
+			featureGates: map[featuregate.Feature]bool{features.AllowAddingPodTemplateTolerations: false},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				LeaderTemplateSpecToleration(corev1.Toleration{Key: "old", Operator: corev1.TolerationOpExists}).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				LeaderTemplateSpecToleration(corev1.Toleration{Key: "old", Operator: corev1.TolerationOpExists}).
+				LeaderTemplateSpecToleration(corev1.Toleration{Key: "new", Operator: corev1.TolerationOpExists}).
+				WorkerTemplateSpecToleration(corev1.Toleration{Key: "new", Operator: corev1.TolerationOpExists}).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: leaderTemplatePath.Child("spec", "tolerations").String(),
+				},
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: workerTemplatePath.Child("spec", "tolerations").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add tolerations when managed with a rolling update partition": {
+			featureGates: map[featuregate.Feature]bool{features.AllowAddingPodTemplateTolerations: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Partition(1).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Partition(1).
+				WorkerTemplateSpecToleration(corev1.Toleration{Key: "new", Operator: corev1.TolerationOpExists}).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec", "tolerations").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add tolerations when managed and the rolling update partition is reset to 0": {
+			featureGates: map[featuregate.Feature]bool{features.AllowAddingPodTemplateTolerations: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Partition(1).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Partition(0).
+				WorkerTemplateSpecToleration(corev1.Toleration{Key: "new", Operator: corev1.TolerationOpExists}).
+				Obj(),
+		},
+		"keep tolerations when managed with a rolling update partition": {
+			featureGates: map[featuregate.Feature]bool{features.AllowAddingPodTemplateTolerations: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Partition(1).
+				WorkerTemplateSpecToleration(corev1.Toleration{Key: "old", Operator: corev1.TolerationOpExists}).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Partition(2).
+				WorkerTemplateSpecToleration(corev1.Toleration{Key: "old", Operator: corev1.TolerationOpExists}).
+				Obj(),
+		},
+		"remove tolerations when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowAddingPodTemplateTolerations: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				LeaderTemplateSpecToleration(corev1.Toleration{Key: "old", Operator: corev1.TolerationOpExists}).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: leaderTemplatePath.Child("spec", "tolerations").String(),
+				},
+			}.ToAggregate(),
+		},
+		"change tolerationSeconds when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowAddingPodTemplateTolerations: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				WorkerTemplateSpecToleration(corev1.Toleration{Key: "old", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute, TolerationSeconds: new(int64(10))}).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				WorkerTemplateSpecToleration(corev1.Toleration{Key: "old", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute, TolerationSeconds: new(int64(20))}).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec", "tolerations").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add tolerations and change resources when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowAddingPodTemplateTolerations: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				WorkerTemplateSpecToleration(corev1.Toleration{Key: "new", Operator: corev1.TolerationOpExists}).
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add init container that fits in the effective requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceReq(corev1.ResourceCPU, "500m").Obj()).
+				Obj(),
+		},
+		"add init container with a zero request of another resource when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").
+					WithResourceReq(corev1.ResourceCPU, "500m").
+					WithResourceReq(corev1.ResourceMemory, "0").
+					Obj()).
+				Obj(),
+		},
+		"add init container that requests another resource when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").
+					WithResourceReq(corev1.ResourceCPU, "500m").
+					WithResourceReq(corev1.ResourceMemory, "1Gi").
+					Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"replace init container that fits in the effective requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceReq(corev1.ResourceCPU, "500m").Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("other").WithResourceReq(corev1.ResourceCPU, "300m").Obj()).
+				Obj(),
+		},
+		"add init container that increases the effective requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceReq(corev1.ResourceCPU, "2").Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add init container with limits above the effective requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceLimit(corev1.ResourceCPU, "2").Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add init container with a LimitRange default above the effective requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			objs: []runtime.Object{
+				utiltesting.MakeLimitRange("limits", "").WithValue("DefaultRequest", corev1.ResourceCPU, "2").Obj(),
+			},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add init container with a LimitRange default that fits in the effective requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			objs: []runtime.Object{
+				utiltesting.MakeLimitRange("limits", "").WithValue("DefaultRequest", corev1.ResourceCPU, "500m").Obj(),
+			},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").Obj()).
+				Obj(),
+		},
+		"add sidecar container with requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar").AsSidecar().WithResourceReq(corev1.ResourceCPU, "100m").Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add sidecar container with requests after a larger init container when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceReq(corev1.ResourceCPU, "2").Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceReq(corev1.ResourceCPU, "2").Obj()).
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar").AsSidecar().WithResourceReq(corev1.ResourceCPU, "100m").Obj()).
+				Obj(),
+		},
+		"change init container port that is not a host port when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").Port(8080, 0, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").Port(9090, 0, corev1.ProtocolTCP).Obj()).
+				Obj(),
+		},
+		"move init container host port to a sidecar container when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar").AsSidecar().Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").Obj()).
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar").AsSidecar().Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec", "initContainers").Index(1).Child("ports").Index(0).Child("hostPort").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add sidecar container with the host port of another sidecar container when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar").AsSidecar().Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar").AsSidecar().Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar2").AsSidecar().Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec", "initContainers").Index(1).Child("ports").Index(0).Child("hostPort").String(),
+				},
+			}.ToAggregate(),
+		},
+		"change container port with the host network when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecHostNetwork().
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar").AsSidecar().Port(80, 0, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecHostNetwork().
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar").AsSidecar().Port(81, 0, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec", "initContainers").Index(0).Child("ports").Index(0).Child("hostPort").String(),
+				},
+			}.ToAggregate(),
+		},
+		"change container port without the host network when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar").AsSidecar().Port(80, 0, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar").AsSidecar().Port(81, 0, corev1.ProtocolTCP).Obj()).
+				Obj(),
+		},
+		"add init container to the leader with a LimitRange default above the effective requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			objs: []runtime.Object{
+				utiltesting.MakeLimitRange("limits", "").WithValue("DefaultRequest", corev1.ResourceCPU, "2").Obj(),
+			},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{*utiltesting.MakeContainer().Name("leader").WithResourceReq(corev1.ResourceCPU, "1").Obj()}}}).
+				Queue("test-queue").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{*utiltesting.MakeContainer().Name("leader").WithResourceReq(corev1.ResourceCPU, "1").Obj()}}}).
+				Queue("test-queue").
+				LeaderTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: leaderTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"change init container to a sidecar container when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceReq(corev1.ResourceCPU, "500m").Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").AsSidecar().WithResourceReq(corev1.ResourceCPU, "500m").Obj()).
+				Obj(),
+		},
+		"raise init container limit without request when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceLimit(corev1.ResourceCPU, "1").Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceLimit(corev1.ResourceCPU, "2").Obj()).
+				Obj(),
+		},
+		"add limit without request to container when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Limit(corev1.ResourceMemory, "1Gi").
+				Obj(),
+		},
+		"move sidecar container before a larger init container when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceReq(corev1.ResourceCPU, "2").Obj()).
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar").AsSidecar().WithResourceReq(corev1.ResourceCPU, "100m").Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("sidecar").AsSidecar().WithResourceReq(corev1.ResourceCPU, "100m").Obj()).
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceReq(corev1.ResourceCPU, "2").Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"remove init container that fits in the effective requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceReq(corev1.ResourceCPU, "500m").Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+		},
+		"remove init container that sets the effective requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").WithResourceReq(corev1.ResourceCPU, "2").Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add init container and change resources when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "2").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add container without requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("sidecar").Obj()).
+				Obj(),
+		},
+		"remove container without requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("sidecar").Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+		},
+		"change container args and env when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("sidecar").Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("sidecar").Args("--verbose").WithEnvVar(corev1.EnvVar{Name: "DEBUG", Value: "true"}).Obj()).
+				Obj(),
+		},
+		"move requests between containers when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("sidecar").Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "500m").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("sidecar").WithResourceReq(corev1.ResourceCPU, "500m").Obj()).
+				Obj(),
+		},
+		"add container with requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("sidecar").WithResourceReq(corev1.ResourceCPU, "100m").Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"decrease container requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "500m").
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add container with a host port when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("sidecar").Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec", "containers").Index(1).Child("ports").Index(0).Child("hostPort").String(),
+				},
+			}.ToAggregate(),
+		},
+		"move container host port to a sidecar container when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("proxy").AsSidecar().Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				Obj(),
+		},
+		"change container that has a host port when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").Image("proxy:v2").Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				Obj(),
+		},
+		"remove container host port when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").Obj()).
+				Obj(),
+		},
+		"add container port that is not a host port when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").Port(8080, 0, corev1.ProtocolTCP).Obj()).
+				Obj(),
+		},
+		"change container host port when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").Port(8080, 9090, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec", "containers").Index(1).Child("ports").Index(0).Child("hostPort").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add container with requests and a host port when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").WithResourceReq(corev1.ResourceCPU, "100m").Port(8080, 8080, corev1.ProtocolTCP).Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec", "containers").Index(1).Child("ports").Index(0).Child("hostPort").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add container with requests to the leader and the workers when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				LeaderTemplate(corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
+					*utiltesting.MakeContainer().Name("leader").WithResourceReq(corev1.ResourceCPU, "1").Obj(),
+				}}}).
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				LeaderTemplate(corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
+					*utiltesting.MakeContainer().Name("leader").WithResourceReq(corev1.ResourceCPU, "1").Obj(),
+					*utiltesting.MakeContainer().Name("sidecar").WithResourceReq(corev1.ResourceCPU, "100m").Obj(),
+				}}}).
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").WithResourceReq(corev1.ResourceCPU, "100m").Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: leaderTemplatePath.Child("spec").String(),
+				},
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add container without requests when managed and the partition is greater than 0": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Partition(1).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Partition(1).
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").Obj()).
+				Obj(),
+		},
+		"add container with requests within the pod-level requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				PodLevelRequest(corev1.ResourceCPU, "2").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				PodLevelRequest(corev1.ResourceCPU, "2").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").WithResourceReq(corev1.ResourceCPU, "500m").Obj()).
+				Obj(),
+		},
+		"add container with requests above the pod-level requests when managed": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				PodLevelRequest(corev1.ResourceCPU, "2").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				PodLevelRequest(corev1.ResourceCPU, "2").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("proxy").WithResourceReq(corev1.ResourceCPU, "1500m").Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: workerTemplatePath.Child("spec").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add container when managed and the feature gate is disabled": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: false},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecContainer(*utiltesting.MakeContainer().Name("sidecar").Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: workerTemplatePath.Child("spec", "containers").String(),
+				},
+			}.ToAggregate(),
+		},
+		"add init container when managed and the feature gate is disabled": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: false},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				Queue("test-queue").
+				Request(corev1.ResourceCPU, "1").
+				WorkerTemplateSpecInitContainer(*utiltesting.MakeContainer().Name("init").Obj()).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: workerTemplatePath.Child("spec", "initContainers").String(),
+				},
+			}.ToAggregate(),
+		},
+		"change size when unmanaged": {
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Size(2).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Size(10).
+				Obj(),
+		},
+		"groupIdentity Hash when already managed": {
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Replicas(2).
+				Obj(),
+			wantWarns: admission.Warnings{groupIdentityHashWarning},
+		},
+		"groupIdentity Hash when already managed and LeaderWorkerSetRejectGroupIdentityHash is disabled": {
+			featureGates: map[featuregate.Feature]bool{features.LeaderWorkerSetRejectGroupIdentityHash: false},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Replicas(2).
+				Obj(),
+		},
+		"groupIdentity Hash when queue name is added and LeaderWorkerSetRejectGroupIdentityHash is disabled": {
+			featureGates: map[featuregate.Feature]bool{features.LeaderWorkerSetRejectGroupIdentityHash: false},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+		},
+		"groupIdentity Hash when queue name is added": {
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: groupIdentityPath.String(),
+				},
+			}.ToAggregate(),
+		},
+		"groupIdentity Hash when unmanaged": {
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Replicas(2).
+				Obj(),
+		},
+		"groupIdentity Hash without queue when managing jobs without queue name": {
+			manageJobsWithoutQueueName: true,
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Replicas(2).
+				Obj(),
+			wantWarns: admission.Warnings{groupIdentityHashWarning},
+		},
+		"groupIdentity Hash when managed owner is removed": {
+			integrations: []string{FrameworkName},
+			objs: []runtime.Object{
+				testingleaderworkerset.MakeLeaderWorkerSet("parent-lws", "").
+					UID("parent-lws").
+					Queue("parent-queue").
+					Obj(),
+			},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				OwnerReference("parent-lws", gvk).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: groupIdentityPath.String(),
+				},
+			}.ToAggregate(),
+		},
+		"groupIdentity Hash when already managed and deleting": {
+			featureGates: map[featuregate.Feature]bool{features.SkipAncestorCheckForDeletedWorkloads: true},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				DeletionTimestamp(time.Now()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				DeletionTimestamp(time.Now()).
+				Obj(),
+		},
+		"groupIdentity Hash when already managed and deleting and the feature gate is disabled": {
+			featureGates: map[featuregate.Feature]bool{features.SkipAncestorCheckForDeletedWorkloads: false},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				DeletionTimestamp(time.Now()).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				GroupIdentity(leaderworkersetv1.GroupIdentityHash).
+				DeletionTimestamp(time.Now()).
+				Obj(),
+			wantWarns: admission.Warnings{groupIdentityHashWarning},
+		},
 		"change queue name when replicas ready": {
 			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				LeaderTemplate(corev1.PodTemplateSpec{}).
@@ -976,6 +2237,70 @@ func TestValidateUpdate(t *testing.T) {
 					Field: queueNameLabelPath.String(),
 				},
 			}.ToAggregate(),
+		},
+		"change queue name while a group's workload holds a quota reservation": {
+			objs: []runtime.Object{
+				utiltestingapi.MakeWorkload(GetWorkloadName("test-uid", "test-lws", "0"), "").
+					OwnerReference(gvk, "test-lws", "test-uid").
+					Obj(),
+				utiltestingapi.MakeWorkload(GetWorkloadName("test-uid", "test-lws", "1"), "").
+					OwnerReference(gvk, "test-lws", "test-uid").
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").Obj(), time.Now()).
+					Obj(),
+			},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				UID("test-uid").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				Replicas(2).
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				UID("test-uid").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("new-test-queue").
+				Replicas(2).
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: queueNameLabelPath.String(),
+				},
+			}.ToAggregate(),
+		},
+		"change queue name while no workload holds a quota reservation": {
+			objs: []runtime.Object{
+				utiltestingapi.MakeWorkload(GetWorkloadName("test-uid", "test-lws", "0"), "").
+					OwnerReference(gvk, "test-lws", "test-uid").
+					Obj(),
+			},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				UID("test-uid").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				UID("test-uid").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("new-test-queue").
+				Obj(),
+		},
+		"change queue name while another leaderworkerset's workload holds a quota reservation": {
+			objs: []runtime.Object{
+				utiltestingapi.MakeWorkload(GetWorkloadName("other-uid", "other-lws", "0"), "").
+					OwnerReference(gvk, "other-lws", "other-uid").
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").Obj(), time.Now()).
+					Obj(),
+			},
+			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				UID("test-uid").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("test-queue").
+				Obj(),
+			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
+				UID("test-uid").
+				LeaderTemplate(corev1.PodTemplateSpec{}).
+				Queue("new-test-queue").
+				Obj(),
 		},
 		"delete queue name": {
 			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
@@ -1185,7 +2510,8 @@ func TestValidateUpdate(t *testing.T) {
 				WorkerTemplateSpecAnnotation(podconstants.SuspendedByParentAnnotation, FrameworkName).
 				Obj(),
 		},
-		"change resources in container": {
+		"change resources in container when the feature gate is disabled": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: false},
 			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				LeaderTemplate(corev1.PodTemplateSpec{
 					Spec: corev1.PodSpec{
@@ -1287,7 +2613,8 @@ func TestValidateUpdate(t *testing.T) {
 				},
 			}.ToAggregate(),
 		},
-		"change resources in init containers": {
+		"change resources in init containers when the feature gate is disabled": {
+			featureGates: map[featuregate.Feature]bool{features.AllowMutatingContainersWhenEffectiveRequestsDontChange: false},
 			oldObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				LeaderTemplate(corev1.PodTemplateSpec{
 					Spec: corev1.PodSpec{
@@ -1397,17 +2724,13 @@ func TestValidateUpdate(t *testing.T) {
 				Obj(),
 			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetRequiredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				Queue("test-queue").
@@ -1421,19 +2744,15 @@ func TestValidateUpdate(t *testing.T) {
 				Obj(),
 			newObj: testingleaderworkerset.MakeLeaderWorkerSet("test-lws", "").
 				LeaderTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/block",
-							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/block",
+						kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				WorkerTemplate(corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/block",
-							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
-						},
+					Annotations: map[string]string{
+						kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/block",
+						kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
 					},
 				}).
 				Queue("test-queue").
@@ -1534,17 +2853,36 @@ func TestValidateUpdate(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
+			integrationManager := newTestIntegrationManager(t)
 			for _, integration := range tc.integrations {
-				jobframework.EnableIntegrationsForTest(t, integration)
+				integrationManager.EnableIntegration(integration)
 			}
 			features.SetFeatureGatesDuringTest(t, tc.featureGates)
-			wh := &Webhook{}
+			client := utiltesting.NewClientBuilder(leaderworkersetv1.AddToScheme).
+				WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).
+				WithRuntimeObjects(tc.objs...).
+				Build()
+			wh := &Webhook{integrationManager: integrationManager, client: client, manageJobsWithoutQueueName: tc.manageJobsWithoutQueueName}
 
 			ctx, _ := utiltesting.ContextWithLog(t)
-			_, err := wh.ValidateUpdate(ctx, tc.oldObj, tc.newObj)
+			warns, err := wh.ValidateUpdate(ctx, tc.oldObj, tc.newObj)
 			if diff := cmp.Diff(tc.wantErr, err, cmpopts.IgnoreFields(field.Error{}, "BadValue", "Detail")); diff != "" {
 				t.Errorf("Unexpected error (-want,+got):\n%s", diff)
 			}
+			if diff := cmp.Diff(tc.wantWarns, warns); diff != "" {
+				t.Errorf("Unexpected warnings (-want,+got):\n%s", diff)
+			}
 		})
 	}
+}
+
+func newTestIntegrationManager(t *testing.T) *jobframework.IntegrationManager {
+	t.Helper()
+	manager := jobframework.NewIntegrationManager()
+	for _, registerIntegration := range []func(*jobframework.IntegrationManager) error{RegisterIntegration, pod.RegisterIntegration} {
+		if err := registerIntegration(manager); err != nil {
+			t.Fatalf("RegisterIntegration() error = %v", err)
+		}
+	}
+	return manager
 }

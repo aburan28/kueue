@@ -24,8 +24,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	autoscaling "k8s.io/autoscaler/cluster-autoscaler/apis/provisioningrequest/autoscaling.x-k8s.io/v1"
 	"k8s.io/component-base/featuregate"
-	"k8s.io/utils/ptr"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/features"
@@ -65,6 +65,18 @@ func TestFromAssignment(t *testing.T) {
 		NodeLabel("f2l2", "f2v2").
 		Toleration(*toleration3.DeepCopy()).
 		Obj()
+	conflictFlavorA := utiltestingapi.MakeResourceFlavor("conflict-a").
+		NodeLabel("topology.kubernetes.io/zone", "zone-a").
+		Obj()
+	conflictFlavorB := utiltestingapi.MakeResourceFlavor("conflict-b").
+		NodeLabel("topology.kubernetes.io/zone", "zone-b").
+		Obj()
+	sharedFlavorA := utiltestingapi.MakeResourceFlavor("shared-a").
+		NodeLabel("topology.kubernetes.io/zone", "zone-a").
+		Obj()
+	sharedFlavorB := utiltestingapi.MakeResourceFlavor("shared-b").
+		NodeLabel("topology.kubernetes.io/zone", "zone-a").
+		Obj()
 
 	cases := map[string]struct {
 		featureGates map[featuregate.Feature]bool
@@ -81,7 +93,7 @@ func TestFromAssignment(t *testing.T) {
 				Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
 					corev1.ResourceCPU: kueue.ResourceFlavorReference(flavor1.Name),
 				},
-				Count: ptr.To[int32](2),
+				Count: new(int32(2)),
 			},
 			defaultCount: 4,
 			flavors:      []kueue.ResourceFlavor{*flavor1.DeepCopy()},
@@ -95,14 +107,73 @@ func TestFromAssignment(t *testing.T) {
 				Tolerations: []corev1.Toleration{*toleration1.DeepCopy(), *toleration2.DeepCopy()},
 			},
 		},
-		"multiple flavors": {
+		"duplicate flavor": {
+			assignment: &kueue.PodSetAssignment{
+				Name: "name",
+				Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
+					corev1.ResourceCPU:    kueue.ResourceFlavorReference(flavor1.Name),
+					corev1.ResourceMemory: kueue.ResourceFlavorReference(flavor1.Name),
+				},
+				Count: new(int32(2)),
+			},
+			defaultCount: 4,
+			flavors:      []kueue.ResourceFlavor{*flavor1.DeepCopy(), *flavor2.DeepCopy()},
+			wantInfo: PodSetInfo{
+				Name:  "name",
+				Count: 2,
+				NodeSelector: map[string]string{
+					"f1l1": "f1v1",
+					"f1l2": "f1v2",
+				},
+				Tolerations: []corev1.Toleration{*toleration1.DeepCopy(), *toleration2.DeepCopy()},
+			},
+		},
+		"conflicting node labels": {
+			assignment: &kueue.PodSetAssignment{
+				Name: "name",
+				Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
+					corev1.ResourceCPU:    kueue.ResourceFlavorReference(conflictFlavorA.Name),
+					corev1.ResourceMemory: kueue.ResourceFlavorReference(conflictFlavorB.Name),
+				},
+				Count: new(int32(2)),
+			},
+			defaultCount: 4,
+			flavors:      []kueue.ResourceFlavor{*conflictFlavorA.DeepCopy(), *conflictFlavorB.DeepCopy()},
+			wantInfo: PodSetInfo{
+				Name:  "name",
+				Count: 2,
+				NodeSelector: map[string]string{
+					"topology.kubernetes.io/zone": "zone-a",
+				},
+			},
+		},
+		"conflicting node labels follow sorted resource order": {
+			assignment: &kueue.PodSetAssignment{
+				Name: "name",
+				Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
+					corev1.ResourceCPU:    kueue.ResourceFlavorReference(conflictFlavorB.Name),
+					corev1.ResourceMemory: kueue.ResourceFlavorReference(conflictFlavorA.Name),
+				},
+				Count: new(int32(2)),
+			},
+			defaultCount: 4,
+			flavors:      []kueue.ResourceFlavor{*conflictFlavorA.DeepCopy(), *conflictFlavorB.DeepCopy()},
+			wantInfo: PodSetInfo{
+				Name:  "name",
+				Count: 2,
+				NodeSelector: map[string]string{
+					"topology.kubernetes.io/zone": "zone-b",
+				},
+			},
+		},
+		"stable flavor order": {
 			assignment: &kueue.PodSetAssignment{
 				Name: "name",
 				Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
 					corev1.ResourceCPU:    kueue.ResourceFlavorReference(flavor1.Name),
 					corev1.ResourceMemory: kueue.ResourceFlavorReference(flavor2.Name),
 				},
-				Count: ptr.To[int32](2),
+				Count: new(int32(2)),
 			},
 			defaultCount: 4,
 			flavors:      []kueue.ResourceFlavor{*flavor1.DeepCopy(), *flavor2.DeepCopy()},
@@ -118,25 +189,23 @@ func TestFromAssignment(t *testing.T) {
 				Tolerations: []corev1.Toleration{*toleration1.DeepCopy(), *toleration2.DeepCopy(), *toleration3.DeepCopy()},
 			},
 		},
-		"duplicate flavor": {
+		"shared node label value": {
 			assignment: &kueue.PodSetAssignment{
 				Name: "name",
 				Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
-					corev1.ResourceCPU:    kueue.ResourceFlavorReference(flavor1.Name),
-					corev1.ResourceMemory: kueue.ResourceFlavorReference(flavor1.Name),
+					corev1.ResourceCPU:    kueue.ResourceFlavorReference(sharedFlavorA.Name),
+					corev1.ResourceMemory: kueue.ResourceFlavorReference(sharedFlavorB.Name),
 				},
-				Count: ptr.To[int32](2),
+				Count: new(int32(2)),
 			},
 			defaultCount: 4,
-			flavors:      []kueue.ResourceFlavor{*flavor1.DeepCopy(), *flavor2.DeepCopy()},
+			flavors:      []kueue.ResourceFlavor{*sharedFlavorA.DeepCopy(), *sharedFlavorB.DeepCopy()},
 			wantInfo: PodSetInfo{
 				Name:  "name",
 				Count: 2,
 				NodeSelector: map[string]string{
-					"f1l1": "f1v1",
-					"f1l2": "f1v2",
+					"topology.kubernetes.io/zone": "zone-a",
 				},
-				Tolerations: []corev1.Toleration{*toleration1.DeepCopy(), *toleration2.DeepCopy()},
 			},
 		},
 		"flavor not found": {
@@ -145,7 +214,7 @@ func TestFromAssignment(t *testing.T) {
 				Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
 					corev1.ResourceCPU: kueue.ResourceFlavorReference(flavor1.Name),
 				},
-				Count: ptr.To[int32](2),
+				Count: new(int32(2)),
 			},
 			defaultCount: 4,
 			wantError:    apierrors.NewNotFound(schema.GroupResource{Group: kueue.SchemeGroupVersion.Group, Resource: "resourceflavors"}, "flavor1"),
@@ -170,7 +239,6 @@ func TestFromAssignment(t *testing.T) {
 			},
 		},
 		"with topology assignment; TopologyAwareScheduling enabled - scheduling gate added": {
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
 			assignment: &kueue.PodSetAssignment{
 				Name: "name",
 				Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
@@ -252,7 +320,7 @@ func TestFromAssignment(t *testing.T) {
 			}
 
 			if tc.wantError == nil {
-				if diff := cmp.Diff(tc.wantInfo, gotInfo, cmpopts.EquateEmpty(), cmpopts.SortSlices(func(a, b corev1.Toleration) bool { return a.Key < b.Key })); diff != "" {
+				if diff := cmp.Diff(tc.wantInfo, gotInfo, cmpopts.EquateEmpty()); diff != "" {
 					t.Errorf("Unexpected info (-want/+got):\n%s", diff)
 				}
 			}
@@ -412,7 +480,6 @@ func TestMergeRestore(t *testing.T) {
 			wantError: true,
 		},
 		"updated workload slice annotation": {
-			featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: true},
 			podSet: utiltestingapi.MakePodSet("", 1).
 				Annotations(map[string]string{
 					kueue.WorkloadSliceNameAnnotation: "old-slice",
@@ -445,29 +512,101 @@ func TestMergeRestore(t *testing.T) {
 			wantError: true,
 		},
 		"updated workload and workload slice annotations for an elastic admission": {
-			featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: true},
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlicesForProvisioningRequests: true,
+			},
 			podSet: utiltestingapi.MakePodSet("", 1).
 				Annotations(map[string]string{
-					kueue.WorkloadAnnotation:          "old-slice",
-					kueue.WorkloadSliceNameAnnotation: "old-slice",
+					kueue.WorkloadAnnotation:                        "old-slice",
+					kueue.WorkloadSliceNameAnnotation:               "old-slice",
+					autoscaling.ProvisioningRequestPodAnnotationKey: "old-request",
+					autoscaling.ProvisioningClassPodAnnotationKey:   "class",
 				}).
 				Obj(),
 			info: PodSetInfo{
 				Annotations: map[string]string{
-					kueue.WorkloadAnnotation:          "new-slice",
-					kueue.WorkloadSliceNameAnnotation: "new-slice",
+					kueue.WorkloadAnnotation:                        "new-slice",
+					kueue.WorkloadSliceNameAnnotation:               "new-slice",
+					autoscaling.ProvisioningRequestPodAnnotationKey: "new-request",
+					autoscaling.ProvisioningClassPodAnnotationKey:   "class",
 				},
 			},
+			// consume is filtered out of elastic templates; the class annotation is
+			// an ordinary (stable) annotation and is merged like any other.
 			wantPodSet: utiltestingapi.MakePodSet("", 1).
 				Annotations(map[string]string{
-					kueue.WorkloadAnnotation:          "new-slice",
-					kueue.WorkloadSliceNameAnnotation: "new-slice",
+					kueue.WorkloadAnnotation:                      "new-slice",
+					kueue.WorkloadSliceNameAnnotation:             "new-slice",
+					autoscaling.ProvisioningClassPodAnnotationKey: "class",
 				}).
 				Obj(),
 			wantRestoreChanges: true,
 		},
+		"changed provisioning class on an elastic template is a conflict": {
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlicesForProvisioningRequests: true,
+			},
+			podSet: utiltestingapi.MakePodSet("", 1).
+				Annotations(map[string]string{
+					kueue.WorkloadSliceNameAnnotation:             "slice",
+					autoscaling.ProvisioningClassPodAnnotationKey: "old-class",
+				}).
+				Obj(),
+			info: PodSetInfo{
+				Annotations: map[string]string{
+					kueue.WorkloadSliceNameAnnotation:             "slice",
+					autoscaling.ProvisioningClassPodAnnotationKey: "new-class",
+				},
+			},
+			wantError: true,
+		},
+		"strips stale consume annotation from elastic template when absent in admission": {
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlicesForProvisioningRequests: true,
+			},
+			podSet: utiltestingapi.MakePodSet("", 1).
+				Annotations(map[string]string{
+					kueue.WorkloadAnnotation:                        "slice",
+					kueue.WorkloadSliceNameAnnotation:               "slice",
+					autoscaling.ProvisioningRequestPodAnnotationKey: "stale-request",
+					autoscaling.ProvisioningClassPodAnnotationKey:   "class",
+				}).
+				Obj(),
+			info: PodSetInfo{
+				Annotations: map[string]string{
+					kueue.WorkloadAnnotation:                      "slice",
+					kueue.WorkloadSliceNameAnnotation:             "slice",
+					autoscaling.ProvisioningClassPodAnnotationKey: "class",
+				},
+			},
+			wantPodSet: utiltestingapi.MakePodSet("", 1).
+				Annotations(map[string]string{
+					kueue.WorkloadAnnotation:                      "slice",
+					kueue.WorkloadSliceNameAnnotation:             "slice",
+					autoscaling.ProvisioningClassPodAnnotationKey: "class",
+				}).
+				Obj(),
+			wantRestoreChanges: true,
+		},
+		"elastic provisioning behavior disabled preserves legacy conflict": {
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlicesForProvisioningRequests: false,
+			},
+			podSet: utiltestingapi.MakePodSet("", 1).
+				Annotations(map[string]string{
+					kueue.WorkloadSliceNameAnnotation:               "slice",
+					autoscaling.ProvisioningRequestPodAnnotationKey: "old-request",
+				}).
+				Obj(),
+			info: PodSetInfo{
+				Annotations: map[string]string{
+					kueue.WorkloadSliceNameAnnotation:               "slice",
+					autoscaling.ProvisioningRequestPodAnnotationKey: "new-request",
+				},
+			},
+			wantError: true,
+		},
 		"updated workload annotation for a non-elastic admission": {
-			featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: true},
 			podSet: utiltestingapi.MakePodSet("", 1).
 				Annotations(map[string]string{
 					kueue.WorkloadAnnotation: "old-workload",

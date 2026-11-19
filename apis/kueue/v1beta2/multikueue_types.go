@@ -148,35 +148,34 @@ type MultiKueueClusterList struct {
 // MultiKueueConfigSpec defines the desired state of MultiKueueConfig
 type MultiKueueConfigSpec struct {
 	// clusters is a list of MultiKueueClusters names where the workloads from the ClusterQueue should be distributed.
+	// The order of the list is significant: the Incremental dispatcher nominates clusters
+	// following this order, so the most preferred clusters should be listed first.
 	//
-	// +listType=set
+	// +listType=atomic
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=20
 	// +kubebuilder:validation:items:MaxLength=256
+	// +kubebuilder:validation:XValidation:rule="size(self.filter(i, size(self.filter(j, j == i)) > 1)) == 0",message="must be unique"
 	// +required
 	Clusters []string `json:"clusters,omitempty,omitzero"`
 
-	// quotaManagement specifies the management of ClusterQueue quotas
-	// in the manager cluster.
-	// Supported modes:
-	// - `Manual`: Quota automation is manual.
-	// - `Automated`: Quota automation is enabled (provided that the MultiKueueManagerQuotaAutomation feature gate is enabled).
-	// If unspecified, defaults to `Manual`.
+	// quotaManagement is deprecated and ignored since v0.21.
+	// To sum the quotas of the worker ClusterQueues into the manager ClusterQueue,
+	// use a CapacityProvider with a MultiKueueCapacityProviderConfig.
+	// The field is removed in the next API version.
+	//
+	// Deprecated: Kueue ignores this field.
+	//
 	// +optional
 	QuotaManagement *MultiKueueConfigQuotaManagementMode `json:"quotaManagement,omitempty"`
 }
 
-// MultiKueueConfigQuotaManagementMode specifies the automation mode.
+// MultiKueueConfigQuotaManagementMode is deprecated and ignored since v0.21.
 // Supported modes:
-// - `Manual`: Quota automation is manual.
-// - `Automated`: Quota automation is enabled (provided that the MultiKueueManagerQuotaAutomation feature gate is enabled).
+// - `Manual`
+// - `Automated`
 // +kubebuilder:validation:Enum=Manual;Automated
 type MultiKueueConfigQuotaManagementMode string
-
-const (
-	QuotaManagementManual    MultiKueueConfigQuotaManagementMode = "Manual"
-	QuotaManagementAutomated MultiKueueConfigQuotaManagementMode = "Automated"
-)
 
 // +genclient
 // +genclient:nonNamespaced

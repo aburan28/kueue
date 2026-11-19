@@ -18,6 +18,7 @@ package scheduler
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"testing"
 	"time"
@@ -55,7 +56,6 @@ func TestDominantResourceShare(t *testing.T) {
 		clusterQueue        *kueue.ClusterQueue
 		lendingClusterQueue *kueue.ClusterQueue
 		cohorts             []*kueue.Cohort
-		flvResQ             resources.FlavorResourceQuantities
 		want                []fairSharingResult
 	}{
 		"no cohort": {
@@ -309,10 +309,10 @@ func TestDominantResourceShare(t *testing.T) {
 				},
 			},
 		},
-		"usage with workload above nominal": {
+		"cpu is dominant when cpu and gpu both borrow": {
 			usage: resources.FlavorResourceQuantities{
-				{Flavor: "default", Resource: corev1.ResourceCPU}: resources.NewAmount(1_000),
-				{Flavor: "default", Resource: "example.com/gpu"}:  resources.NewAmount(2),
+				{Flavor: "default", Resource: corev1.ResourceCPU}: resources.NewAmount(5_000),
+				{Flavor: "default", Resource: "example.com/gpu"}:  resources.NewAmount(6),
 			},
 			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
 				Cohort("test-cohort").
@@ -332,16 +332,12 @@ func TestDominantResourceShare(t *testing.T) {
 						ResourceQuotaWrapper("example.com/gpu").NominalQuota("5").Append().
 						Obj(),
 				).Obj(),
-			flvResQ: resources.FlavorResourceQuantities{
-				{Flavor: "default", Resource: corev1.ResourceCPU}: resources.NewAmount(4_000),
-				{Flavor: "default", Resource: "example.com/gpu"}:  resources.NewAmount(4),
-			},
 			want: []fairSharingResult{
 				{
 					Name:      "cq",
 					NodeType:  nodeTypeCq,
 					DrName:    corev1.ResourceCPU,
-					DrValue:   300, // (1+4-2)*1000/10
+					DrValue:   300, // (5-2)*1000/10
 					Borrowing: true,
 				},
 				{
@@ -362,8 +358,8 @@ func TestDominantResourceShare(t *testing.T) {
 		},
 		"A resource with zero lendable": {
 			usage: resources.FlavorResourceQuantities{
-				{Flavor: "default", Resource: corev1.ResourceCPU}: resources.NewAmount(1_000),
-				{Flavor: "default", Resource: "example.com/gpu"}:  resources.NewAmount(1),
+				{Flavor: "default", Resource: corev1.ResourceCPU}: resources.NewAmount(5_000),
+				{Flavor: "default", Resource: "example.com/gpu"}:  resources.NewAmount(5),
 			},
 			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
 				Cohort("test-cohort").
@@ -383,16 +379,12 @@ func TestDominantResourceShare(t *testing.T) {
 						ResourceQuotaWrapper("example.com/gpu").NominalQuota("64").LendingLimit("0").Append().
 						Obj(),
 				).Obj(),
-			flvResQ: resources.FlavorResourceQuantities{
-				{Flavor: "default", Resource: corev1.ResourceCPU}: resources.NewAmount(4_000),
-				{Flavor: "default", Resource: "example.com/gpu"}:  resources.NewAmount(4),
-			},
 			want: []fairSharingResult{
 				{
 					Name:      "cq",
 					NodeType:  nodeTypeCq,
 					DrName:    corev1.ResourceCPU,
-					DrValue:   300, // (1+4-2)*1000/10
+					DrValue:   300, // (5-2)*1000/10
 					Borrowing: true,
 				},
 				{
@@ -413,7 +405,7 @@ func TestDominantResourceShare(t *testing.T) {
 		},
 		"multiple flavors": {
 			usage: resources.FlavorResourceQuantities{
-				{Flavor: "on-demand", Resource: corev1.ResourceCPU}: resources.NewAmount(15_000),
+				{Flavor: "on-demand", Resource: corev1.ResourceCPU}: resources.NewAmount(25_000),
 				{Flavor: "spot", Resource: corev1.ResourceCPU}:      resources.NewAmount(5_000),
 			},
 			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
@@ -435,15 +427,12 @@ func TestDominantResourceShare(t *testing.T) {
 						ResourceQuotaWrapper("cpu").NominalQuota("100").Append().
 						Obj(),
 				).Obj(),
-			flvResQ: resources.FlavorResourceQuantities{
-				{Flavor: "on-demand", Resource: corev1.ResourceCPU}: resources.NewAmount(10_000),
-			},
 			want: []fairSharingResult{
 				{
 					Name:      "cq",
 					NodeType:  nodeTypeCq,
 					DrName:    corev1.ResourceCPU,
-					DrValue:   25, // ((15+10-20)+0)*1000/200 (spot under nominal)
+					DrValue:   25, // ((25-20)+0)*1000/200 (spot under nominal)
 					Borrowing: true,
 				},
 				{
@@ -575,7 +564,7 @@ func TestDominantResourceShare(t *testing.T) {
 					Name:      "cq",
 					NodeType:  nodeTypeCq,
 					DrName:    "example.com/gpu",
-					DrValue:   math.MaxInt,
+					DrValue:   math.MaxInt64,
 					Borrowing: true,
 				},
 				{
@@ -587,6 +576,97 @@ func TestDominantResourceShare(t *testing.T) {
 				},
 				{
 					Name:      "test-cohort",
+					NodeType:  nodeTypeCohort,
+					DrName:    "",
+					DrValue:   0,
+					Borrowing: false,
+				},
+			},
+		},
+		// cq has no quota for spot any more, e.g. after the flavor was removed
+		// from its spec, but its admitted Workloads still use 4 cpu there.
+		"usage on a flavor without quota in the ClusterQueue is borrowed": {
+			usage: resources.FlavorResourceQuantities{
+				{Flavor: "spot", Resource: corev1.ResourceCPU}: resources.NewAmount(4_000),
+			},
+			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
+				Cohort("test-cohort").
+				FairWeight(resource.MustParse("1")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("on-demand").
+						ResourceQuotaWrapper("cpu").NominalQuota("0").Append().
+						Obj(),
+				).Obj(),
+			lendingClusterQueue: utiltestingapi.MakeClusterQueue("lending-cq").
+				Cohort("test-cohort").
+				FairWeight(resource.MustParse("1")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("spot").
+						ResourceQuotaWrapper("cpu").NominalQuota("10").Append().
+						Obj(),
+				).Obj(),
+			want: []fairSharingResult{
+				{
+					Name:      "cq",
+					NodeType:  nodeTypeCq,
+					DrName:    corev1.ResourceCPU,
+					DrValue:   400, // (4 / 10) * 1000
+					Borrowing: true,
+				},
+				{
+					Name:      "lending-cq",
+					NodeType:  nodeTypeCq,
+					DrName:    "",
+					DrValue:   0,
+					Borrowing: false,
+				},
+				{
+					Name:      "test-cohort",
+					NodeType:  nodeTypeCohort,
+					DrName:    "",
+					DrValue:   0,
+					Borrowing: false,
+				},
+			},
+		},
+		// Same as above one level down: no node in child-cohort has quota for spot.
+		"usage on a flavor without quota in the Cohort subtree is borrowed": {
+			usage: resources.FlavorResourceQuantities{
+				{Flavor: "spot", Resource: corev1.ResourceCPU}: resources.NewAmount(4_000),
+			},
+			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
+				Cohort("child-cohort").
+				FairWeight(resource.MustParse("1")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("on-demand").
+						ResourceQuotaWrapper("cpu").NominalQuota("0").Append().
+						Obj(),
+				).Obj(),
+			cohorts: []*kueue.Cohort{
+				utiltestingapi.MakeCohort("child-cohort").FairWeight(resource.MustParse("2")).Parent("root").Obj(),
+				utiltestingapi.MakeCohort("root").ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("spot").
+						ResourceQuotaWrapper("cpu").NominalQuota("10").Append().
+						Obj(),
+				).Obj(),
+			},
+			want: []fairSharingResult{
+				{
+					Name:      "cq",
+					NodeType:  nodeTypeCq,
+					DrName:    corev1.ResourceCPU,
+					DrValue:   400, // (4 / 10) * 1000
+					Borrowing: true,
+				},
+				{
+					Name:      "child-cohort",
+					NodeType:  nodeTypeCohort,
+					DrName:    corev1.ResourceCPU,
+					DrValue:   200, // (4 / 10) * 1000 / 2
+					Borrowing: true,
+				},
+				{
+					Name:      "root",
 					NodeType:  nodeTypeCohort,
 					DrName:    "",
 					DrValue:   0,
@@ -733,12 +813,12 @@ func TestDominantResourceShare(t *testing.T) {
 			},
 		},
 		// When the lending CQ holds an "exabyte-scale" quota (1E CPU), AmountFromQuantity
-		// returns Unlimited (math.MaxInt64 sentinel). calculateLendable then aggregates
-		// potentialAvailable and lendable["cpu"] saturates to Unlimited (MaxInt64).
-		// The ratio float64(b.Int64())*1000/float64(lr.Int64()) evaluates to a tiny
+		// is exact past int64. computeLendable then aggregates potentialAvailable
+		// and lendable["cpu"] carries the whole of it.
+		// b.PerThousandOf(lr) divides the exact operands and evaluates to a tiny
 		// positive finite number; math.Ceil rounds it up to 1. This test pins that
 		// behaviour and guards against NaN/Inf regressions.
-		"borrowing against unlimited lendable capacity (exabyte-scale quota)": {
+		"borrowing against an exabyte-scale lendable quota": {
 			usage: resources.FlavorResourceQuantities{
 				{Flavor: "default", Resource: corev1.ResourceCPU}: resources.NewAmount(1_000), // 1 CPU
 			},
@@ -755,7 +835,7 @@ func TestDominantResourceShare(t *testing.T) {
 				FairWeight(resource.MustParse("1")).
 				ResourceGroup(
 					*utiltestingapi.MakeFlavorQuotas("default").
-						// "1E" CPU overflows int64 milliCPU → AmountFromQuantity returns Unlimited.
+						// "1E" CPU is past int64 in milliCPU and is charged as the number it is.
 						ResourceQuotaWrapper("cpu").NominalQuota("1E").Append().
 						Obj(),
 				).Obj(),
@@ -763,7 +843,8 @@ func TestDominantResourceShare(t *testing.T) {
 				{
 					Name:     "cq",
 					NodeType: nodeTypeCq,
-					// ratio = float64(1000)*1000/float64(MaxInt64) ≈ 1.09e-13; math.Ceil → 1.
+					// ratio = 1000*1000/10^21 = 1e-15, the whole 1E quota being lendable;
+					// math.Ceil → 1.
 					DrValue:   1,
 					DrName:    corev1.ResourceCPU,
 					Borrowing: true,
@@ -782,6 +863,220 @@ func TestDominantResourceShare(t *testing.T) {
 					DrName:    "",
 					Borrowing: false,
 				},
+			},
+		},
+		// The Cohort lends nothing of the resource, so the ratio stays 0 while
+		// cq borrows 1 above its nominal quota.
+		"zero weight borrowing only a resource with nothing lendable": {
+			usage: resources.FlavorResourceQuantities{
+				{Flavor: "default", Resource: "example.com/gpu"}: resources.NewAmount(3),
+			},
+			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
+				Cohort("test-cohort").
+				FairWeight(resource.MustParse("0")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("example.com/gpu").NominalQuota("2").LendingLimit("0").Append().
+						Obj(),
+				).Obj(),
+			lendingClusterQueue: utiltestingapi.MakeClusterQueue("lending-cq").
+				Cohort("test-cohort").
+				FairWeight(resource.MustParse("1")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("example.com/gpu").NominalQuota("64").LendingLimit("0").Append().
+						Obj(),
+				).Obj(),
+			want: []fairSharingResult{
+				{Name: "cq", NodeType: nodeTypeCq, DrValue: math.MaxInt64, Borrowing: true},
+				{Name: "lending-cq", NodeType: nodeTypeCq},
+				{Name: "test-cohort", NodeType: nodeTypeCohort},
+			},
+		},
+		"positive weight borrowing only a resource with nothing lendable": {
+			usage: resources.FlavorResourceQuantities{
+				{Flavor: "default", Resource: "example.com/gpu"}: resources.NewAmount(3),
+			},
+			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
+				Cohort("test-cohort").
+				FairWeight(resource.MustParse("1")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("example.com/gpu").NominalQuota("2").LendingLimit("0").Append().
+						Obj(),
+				).Obj(),
+			lendingClusterQueue: utiltestingapi.MakeClusterQueue("lending-cq").
+				Cohort("test-cohort").
+				FairWeight(resource.MustParse("1")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("example.com/gpu").NominalQuota("64").LendingLimit("0").Append().
+						Obj(),
+				).Obj(),
+			want: []fairSharingResult{
+				{Name: "cq", NodeType: nodeTypeCq, Borrowing: true},
+				{Name: "lending-cq", NodeType: nodeTypeCq},
+				{Name: "test-cohort", NodeType: nodeTypeCohort},
+			},
+		},
+		"zero weight cohort borrowing only a resource with nothing lendable": {
+			usage: resources.FlavorResourceQuantities{
+				{Flavor: "default", Resource: "example.com/gpu"}: resources.NewAmount(1),
+			},
+			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
+				Cohort("child-cohort").
+				FairWeight(resource.MustParse("1")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("example.com/gpu").NominalQuota("0").Append().
+						Obj(),
+				).Obj(),
+			cohorts: []*kueue.Cohort{
+				utiltestingapi.MakeCohort("child-cohort").FairWeight(resource.MustParse("0")).Parent("root").Obj(),
+				utiltestingapi.MakeCohort("root").ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("example.com/gpu").NominalQuota("0").Append().
+						Obj(),
+				).Obj(),
+			},
+			want: []fairSharingResult{
+				{Name: "cq", NodeType: nodeTypeCq, Borrowing: true},
+				{Name: "child-cohort", NodeType: nodeTypeCohort, DrValue: math.MaxInt64, Borrowing: true},
+				{Name: "root", NodeType: nodeTypeCohort},
+			},
+		},
+		// 1 * 1000 / 9e18 / 1e308 is about 1.1e-324, which float64 rounds to 0.
+		"share below the smallest float64 stays positive": {
+			usage: resources.FlavorResourceQuantities{
+				{Flavor: "default", Resource: corev1.ResourceCPU}: resources.NewAmount(1),
+			},
+			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
+				Cohort("test-cohort").
+				FairWeight(resource.MustParse("1e308")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("cpu").NominalQuota("0").Append().
+						Obj(),
+				).Obj(),
+			lendingClusterQueue: utiltestingapi.MakeClusterQueue("lending-cq").
+				Cohort("test-cohort").
+				FairWeight(resource.MustParse("1")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("cpu").NominalQuota("9000000000000000").Append().
+						Obj(),
+				).Obj(),
+			want: []fairSharingResult{
+				{Name: "cq", NodeType: nodeTypeCq, DrName: corev1.ResourceCPU, DrValue: 1, Borrowing: true},
+				{Name: "lending-cq", NodeType: nodeTypeCq},
+				{Name: "test-cohort", NodeType: nodeTypeCohort},
+			},
+		},
+		// 1e400 is +Inf as a float64, and 1000 / +Inf is 0.
+		"share with a weight past float64 stays positive": {
+			usage: resources.FlavorResourceQuantities{
+				{Flavor: "default", Resource: corev1.ResourceCPU}: resources.NewAmount(1_000),
+			},
+			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
+				Cohort("test-cohort").
+				FairWeight(resource.MustParse("1e400")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("cpu").NominalQuota("0").Append().
+						Obj(),
+				).Obj(),
+			lendingClusterQueue: utiltestingapi.MakeClusterQueue("lending-cq").
+				Cohort("test-cohort").
+				FairWeight(resource.MustParse("1")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("cpu").NominalQuota("1").Append().
+						Obj(),
+				).Obj(),
+			want: []fairSharingResult{
+				{Name: "cq", NodeType: nodeTypeCq, DrName: corev1.ResourceCPU, DrValue: 1, Borrowing: true},
+				{Name: "lending-cq", NodeType: nodeTypeCq},
+				{Name: "test-cohort", NodeType: nodeTypeCohort},
+			},
+		},
+		// child-cohort borrows 1m from root: 1 * 1000 / 9e18 / 1e308 rounds to 0.
+		"cohort share below the smallest float64 stays positive": {
+			usage: resources.FlavorResourceQuantities{
+				{Flavor: "default", Resource: corev1.ResourceCPU}: resources.NewAmount(1),
+			},
+			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
+				Cohort("child-cohort").
+				FairWeight(resource.MustParse("1")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("cpu").NominalQuota("0").Append().
+						Obj(),
+				).Obj(),
+			cohorts: []*kueue.Cohort{
+				utiltestingapi.MakeCohort("child-cohort").FairWeight(resource.MustParse("1e308")).Parent("root").Obj(),
+				utiltestingapi.MakeCohort("root").ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("cpu").NominalQuota("9000000000000000").Append().
+						Obj(),
+				).Obj(),
+			},
+			want: []fairSharingResult{
+				{Name: "cq", NodeType: nodeTypeCq, DrName: corev1.ResourceCPU, DrValue: 1, Borrowing: true},
+				{Name: "child-cohort", NodeType: nodeTypeCohort, DrName: corev1.ResourceCPU, DrValue: 1, Borrowing: true},
+				{Name: "root", NodeType: nodeTypeCohort},
+			},
+		},
+		// 30_000_000 * 1000 / 1 / 2e-9 = 1.5e19, past the int64 range.
+		"share past int64 is reported as the int64 maximum": {
+			usage: resources.FlavorResourceQuantities{
+				{Flavor: "default", Resource: "example.com/gpu"}: resources.NewAmount(30_000_000),
+			},
+			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
+				Cohort("test-cohort").
+				FairWeight(resource.MustParse("2n")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("example.com/gpu").NominalQuota("0").Append().
+						Obj(),
+				).Obj(),
+			lendingClusterQueue: utiltestingapi.MakeClusterQueue("lending-cq").
+				Cohort("test-cohort").
+				FairWeight(resource.MustParse("1")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("example.com/gpu").NominalQuota("1").Append().
+						Obj(),
+				).Obj(),
+			want: []fairSharingResult{
+				{Name: "cq", NodeType: nodeTypeCq, DrName: "example.com/gpu", DrValue: math.MaxInt64, Borrowing: true},
+				{Name: "lending-cq", NodeType: nodeTypeCq},
+				{Name: "test-cohort", NodeType: nodeTypeCohort},
+			},
+		},
+		"cohort share past int64 is reported as the int64 maximum": {
+			usage: resources.FlavorResourceQuantities{
+				{Flavor: "default", Resource: "example.com/gpu"}: resources.NewAmount(30_000_000),
+			},
+			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
+				Cohort("child-cohort").
+				FairWeight(resource.MustParse("1")).
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("example.com/gpu").NominalQuota("0").Append().
+						Obj(),
+				).Obj(),
+			cohorts: []*kueue.Cohort{
+				utiltestingapi.MakeCohort("child-cohort").FairWeight(resource.MustParse("2n")).Parent("root").Obj(),
+				utiltestingapi.MakeCohort("root").ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("default").
+						ResourceQuotaWrapper("example.com/gpu").NominalQuota("1").Append().
+						Obj(),
+				).Obj(),
+			},
+			want: []fairSharingResult{
+				{Name: "cq", NodeType: nodeTypeCq, DrName: "example.com/gpu", DrValue: 30_000_000_000, Borrowing: true},
+				{Name: "child-cohort", NodeType: nodeTypeCohort, DrName: "example.com/gpu", DrValue: math.MaxInt64, Borrowing: true},
+				{Name: "root", NodeType: nodeTypeCohort},
 			},
 		},
 	}
@@ -811,15 +1106,15 @@ func TestDominantResourceShare(t *testing.T) {
 			i := 0
 			for fr, v := range tc.usage {
 				admission := utiltestingapi.MakeAdmission("cq")
-				quantity := resources.ResourceQuantity(fr.Resource, v.Int64())
+				quantity := resources.NewResourceFormatter().AmountQuantity(fr.Resource, v)
 				admission.PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
 					Assignment(fr.Resource, fr.Flavor, quantity.String()).
 					Obj())
 
 				wl := utiltestingapi.MakeWorkload(fmt.Sprintf("workload-%d", i), "default-namespace").ReserveQuotaAt(admission.Obj(), now).Obj()
 
-				cache.AddOrUpdateWorkload(log, wl)
-				snapshot.AddWorkload(workload.NewInfo(wl))
+				cache.AddOrUpdateWorkload(t.Context(), log, wl)
+				snapshot.AddWorkload(workload.NewInfo(log, wl))
 				i++
 			}
 
@@ -827,7 +1122,7 @@ func TestDominantResourceShare(t *testing.T) {
 			cacheCohortsMap := cache.hm.Cohorts()
 			gotCache := make([]fairSharingResult, 0, len(cacheClusterQueuesMap)+len(cacheCohortsMap))
 			for _, cq := range cacheClusterQueuesMap {
-				drs := dominantResourceShare(cq, tc.flvResQ)
+				drs := dominantResourceShare(cq)
 				drVal, drName := drs.roundedWeightedShare()
 				gotCache = append(gotCache, fairSharingResult{
 					Name:      string(cq.Name),
@@ -838,7 +1133,7 @@ func TestDominantResourceShare(t *testing.T) {
 				})
 			}
 			for _, cohort := range cacheCohortsMap {
-				drs := dominantResourceShare(cohort, tc.flvResQ)
+				drs := dominantResourceShare(cohort)
 				drVal, drName := drs.roundedWeightedShare()
 				gotCache = append(gotCache, fairSharingResult{
 					Name:      string(cohort.Name),
@@ -856,7 +1151,7 @@ func TestDominantResourceShare(t *testing.T) {
 			snapshotCohortsMap := snapshot.Cohorts()
 			gotSnapshot := make([]fairSharingResult, 0, len(snapshotClusterQueuesMap)+len(snapshotCohortsMap))
 			for _, cq := range snapshotClusterQueuesMap {
-				drs := dominantResourceShare(cq, tc.flvResQ)
+				drs := dominantResourceShare(cq)
 				drVal, drName := drs.roundedWeightedShare()
 				gotSnapshot = append(gotSnapshot, fairSharingResult{
 					Name:      string(cq.Name),
@@ -867,7 +1162,7 @@ func TestDominantResourceShare(t *testing.T) {
 				})
 			}
 			for _, cohort := range snapshotCohortsMap {
-				drs := dominantResourceShare(cohort, tc.flvResQ)
+				drs := dominantResourceShare(cohort)
 				drVal, drName := drs.roundedWeightedShare()
 				gotSnapshot = append(gotSnapshot, fairSharingResult{
 					Name:      string(cohort.Name),
@@ -879,6 +1174,94 @@ func TestDominantResourceShare(t *testing.T) {
 			}
 			if diff := cmp.Diff(sets.New(tc.want...), sets.New(gotSnapshot...)); diff != "" {
 				t.Errorf("dominantResourceShare snapshot mismatch: %s", diff)
+			}
+		})
+	}
+}
+
+// Lendable capacity is maintained by the cache next to SubtreeQuota and carried
+// into the snapshot, so fair sharing does not recompute it once per preemption
+// candidate. The carried value must equal a fresh computation, and it must
+// survive the usage changes preemption simulates.
+func TestSnapshotCarriesLendable(t *testing.T) {
+	ctx, log := utiltesting.ContextWithLog(t)
+	cache := New(utiltesting.NewFakeClient())
+	cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
+
+	for _, cohort := range []*kueue.Cohort{
+		utiltestingapi.MakeCohort("root").Obj(),
+		utiltestingapi.MakeCohort("mid").Parent("root").
+			ResourceGroup(utiltestingapi.MakeFlavorQuotas("default").
+				Resource(corev1.ResourceCPU, "10", "", "4").FlavorQuotas).Obj(),
+	} {
+		if err := cache.AddOrUpdateCohort(cohort); err != nil {
+			t.Fatalf("Adding cohort %s: %v", cohort.Name, err)
+		}
+	}
+	cq := utiltestingapi.MakeClusterQueue("cq").Cohort("mid").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").
+			Resource(corev1.ResourceCPU, "6", "", "2").Obj()).Obj()
+	if err := cache.AddClusterQueue(ctx, cq); err != nil {
+		t.Fatalf("Adding ClusterQueue: %v", err)
+	}
+
+	snapshot, err := cache.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshotting: %v", err)
+	}
+
+	for _, cohort := range snapshot.Cohorts() {
+		if cohort.ResourceNode.Lendable == nil {
+			t.Errorf("Cohort %s did not carry lendable from the cache", cohort.Name)
+			continue
+		}
+		if diff := cmp.Diff(computeLendable(cohort), cohort.ResourceNode.Lendable, cmp.Comparer(resources.Equal)); diff != "" {
+			t.Errorf("Cohort %s carried lendable differs from a fresh computation (-fresh,+carried):\n%s", cohort.Name, diff)
+		}
+	}
+
+	// Preemption simulates removing usage. Lendable must not move with it.
+	before := maps.Clone(snapshot.Cohort("mid").ResourceNode.Lendable)
+	snapshot.ClusterQueue("cq").AddUsage(workload.Usage{Quota: workload.ResourceUsage{
+		Assigned: resources.FlavorResourceQuantities{
+			{Flavor: "default", Resource: corev1.ResourceCPU}: resources.NewAmount(5000),
+		},
+	}})
+	if diff := cmp.Diff(before, snapshot.Cohort("mid").ResourceNode.Lendable, cmp.Comparer(resources.Equal)); diff != "" {
+		t.Errorf("Lendable changed after a usage change (-before,+after):\n%s", diff)
+	}
+}
+
+func TestPreciseWeightedShare(t *testing.T) {
+	cases := map[string]struct {
+		drs  DRS
+		want float64
+	}{
+		"a share float64 rounds to zero is floored": {
+			drs:  DRS{fairWeight: 1e308, unweightedRatio: 1000.0 / 9e18, borrowing: true},
+			want: math.SmallestNonzeroFloat64,
+		},
+		"a weight past the float64 range is floored": {
+			drs:  DRS{fairWeight: math.Inf(1), unweightedRatio: 1000, borrowing: true},
+			want: math.SmallestNonzeroFloat64,
+		},
+		"a small share float64 holds is kept": {
+			drs:  DRS{fairWeight: math.Ldexp(1, 1000), unweightedRatio: 1, borrowing: true},
+			want: math.Ldexp(1, -1000),
+		},
+		"a zero ratio stays zero": {
+			drs:  DRS{fairWeight: 1, borrowing: true},
+			want: 0,
+		},
+		"the negative sentinel is unchanged": {
+			drs:  NegativeDRS(),
+			want: -1,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.drs.PreciseWeightedShare(); got != tc.want {
+				t.Errorf("PreciseWeightedShare() = %g, want %g", got, tc.want)
 			}
 		})
 	}
@@ -960,24 +1343,64 @@ func TestIsBorrowingOn(t *testing.T) {
 			i := 0
 			for fr, v := range tc.usage {
 				admission := utiltestingapi.MakeAdmission("cq")
-				quantity := resources.ResourceQuantity(fr.Resource, v.Int64())
+				quantity := resources.NewResourceFormatter().AmountQuantity(fr.Resource, v)
 				admission.PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
 					Assignment(fr.Resource, fr.Flavor, quantity.String()).
 					Obj())
 				wl := utiltestingapi.MakeWorkload(fmt.Sprintf("wl-%d", i), "default-namespace").
 					ReserveQuotaAt(admission.Obj(), now).Obj()
-				cache.AddOrUpdateWorkload(log, wl)
-				snapshot.AddWorkload(workload.NewInfo(wl))
+				cache.AddOrUpdateWorkload(t.Context(), log, wl)
+				snapshot.AddWorkload(workload.NewInfo(log, wl))
 				i++
 			}
 
 			snapshotCQ := snapshot.ClusterQueues()["cq"]
-			drs := dominantResourceShare(snapshotCQ, nil)
+			drs := dominantResourceShare(snapshotCQ)
 			if got := drs.IsBorrowing(); got != tc.wantBorrowing {
 				t.Errorf("IsBorrowing() = %v, want %v", got, tc.wantBorrowing)
 			}
 			if got := drs.IsBorrowingOn(tc.requestedFRs); got != tc.wantBorrowingOnRequested {
 				t.Errorf("IsBorrowingOn() = %v, want %v", got, tc.wantBorrowingOnRequested)
+			}
+			frs := sets.New[resources.FlavorResource]()
+			for fr, q := range tc.requestedFRs {
+				if q.CmpInt64(0) > 0 {
+					frs.Insert(fr)
+				}
+			}
+			if got := drs.IsBorrowingOnAny(frs); got != tc.wantBorrowingOnRequested {
+				t.Errorf("IsBorrowingOnAny() = %v, want %v", got, tc.wantBorrowingOnRequested)
+			}
+		})
+	}
+}
+
+func TestZeroWeightBorrows(t *testing.T) {
+	cases := map[string]struct {
+		drs  DRS
+		want bool
+	}{
+		"zero weight and borrowing returns true": {
+			drs:  DRS{fairWeight: 0, unweightedRatio: 100, borrowing: true},
+			want: true,
+		},
+		"zero weight and borrowing with a zero ratio returns true": {
+			drs:  DRS{fairWeight: 0, unweightedRatio: 0, borrowing: true},
+			want: true,
+		},
+		"zero weight and not borrowing returns false": {
+			drs:  DRS{fairWeight: 0, unweightedRatio: 0},
+			want: false,
+		},
+		"non-zero weight and borrowing returns false": {
+			drs:  DRS{fairWeight: 1, unweightedRatio: 100, borrowing: true},
+			want: false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.drs.ZeroWeightBorrows(); got != tc.want {
+				t.Errorf("ZeroWeightBorrows() = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -989,7 +1412,11 @@ func TestPreciseWeightedShareSerialized(t *testing.T) {
 		want string
 	}{
 		"zero weight returning Inf": {
-			drs:  DRS{fairWeight: 0, unweightedRatio: 100},
+			drs:  DRS{fairWeight: 0, unweightedRatio: 100, borrowing: true},
+			want: "+Inf",
+		},
+		"zero weight borrowing with a zero ratio returns Inf": {
+			drs:  DRS{fairWeight: 0, unweightedRatio: 0, borrowing: true},
 			want: "+Inf",
 		},
 		"zero unweighted ratio returns 0": {
@@ -1010,6 +1437,59 @@ func TestPreciseWeightedShareSerialized(t *testing.T) {
 			got := tc.drs.PreciseWeightedShareSerialized()
 			if diff := cmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("Unexpected string output (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestCompareDRS(t *testing.T) {
+	cases := map[string]struct {
+		a, b DRS
+		want int
+	}{
+		"zero weight borrowing with a zero ratio has a larger share than a finite share": {
+			a:    DRS{fairWeight: 0, borrowing: true},
+			b:    DRS{fairWeight: 1, unweightedRatio: 1000, borrowing: true},
+			want: 1,
+		},
+		"zero weight borrowing with a zero ratio has a larger share than not borrowing": {
+			a:    DRS{fairWeight: 0, borrowing: true},
+			b:    DRS{fairWeight: 0},
+			want: 1,
+		},
+		"zero weight borrowers compare by ratio": {
+			a:    DRS{fairWeight: 0, borrowing: true},
+			b:    DRS{fairWeight: 0, unweightedRatio: 100, borrowing: true},
+			want: -1,
+		},
+		"zero weight borrowers with equal ratios tie": {
+			a:    DRS{fairWeight: 0, borrowing: true},
+			b:    DRS{fairWeight: 0, borrowing: true},
+			want: 0,
+		},
+		"a floored share is above a node that does not borrow": {
+			a:    DRS{fairWeight: 1e308, unweightedRatio: 1000.0 / 9e18, borrowing: true},
+			b:    DRS{fairWeight: 1},
+			want: 1,
+		},
+		"a floored share is below a small share float64 holds": {
+			a:    DRS{fairWeight: 1e308, unweightedRatio: 1000.0 / 9e18, borrowing: true},
+			b:    DRS{fairWeight: 1e20, unweightedRatio: 1, borrowing: true},
+			want: -1,
+		},
+		"two floored shares tie": {
+			a:    DRS{fairWeight: 1e308, unweightedRatio: 1000.0 / 9e18, borrowing: true},
+			b:    DRS{fairWeight: math.Inf(1), unweightedRatio: 1000, borrowing: true},
+			want: 0,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := CompareDRS(tc.a, tc.b); got != tc.want {
+				t.Errorf("CompareDRS(a, b) = %d, want %d", got, tc.want)
+			}
+			if got := CompareDRS(tc.b, tc.a); got != -tc.want {
+				t.Errorf("CompareDRS(b, a) = %d, want %d", got, -tc.want)
 			}
 		})
 	}

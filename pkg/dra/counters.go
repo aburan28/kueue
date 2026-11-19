@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	dracel "k8s.io/dynamic-resource-allocation/cel"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -41,7 +42,7 @@ func GetCounterResourcesForWorkload(
 	wl *kueue.Workload,
 ) (map[kueue.PodSetReference]corev1.ResourceList, field.ErrorList) {
 	log := ctrl.LoggerFrom(ctx)
-	log.V(3).Info("Processing counter resources for workload")
+	log.V(5).Info("Processing counter resources for workload")
 
 	perPodSet := make(map[kueue.PodSetReference]corev1.ResourceList)
 	var allErrs field.ErrorList
@@ -68,7 +69,7 @@ func GetCounterResourcesForWorkload(
 			}
 
 			for reqIdx, req := range spec.Devices.Requests {
-				if req.Exactly == nil {
+				if req.Exactly == nil || isAdminAccessRequest(req.Exactly) {
 					continue
 				}
 				deviceClass := corev1.ResourceName(req.Exactly.DeviceClassName)
@@ -77,16 +78,18 @@ func GetCounterResourcesForWorkload(
 					continue
 				}
 
-				reqPath := field.NewPath("spec", "podSets").Index(i).Child("template", "spec", "resourceClaims").Index(j).Child("devices", "requests").Index(reqIdx)
+				claimPath := field.NewPath("spec", "podSets").Index(i).Child("template", "spec", "resourceClaims").Index(j)
+				reqPath := claimPath.Child("devices", "requests").Index(reqIdx)
 
-				classSelectors, requestSelectors, errs := prepareCounterCharge(ctx, cl, req.Exactly.DeviceClassName, req.Exactly.Selectors, classCache, reqPath)
+				classSelectors, requestSelectors, errs := prepareDeviceSelectors(ctx, cl, req.Exactly.DeviceClassName, req.Exactly.Selectors, classCache, claimPath, reqIdx)
 				if len(errs) > 0 {
 					allErrs = append(allErrs, errs...)
 					return nil, allErrs
 				}
 
+				deviceClassRef := klog.KRef("", req.Exactly.DeviceClassName)
 				for _, cc := range counterConfigs {
-					log.V(4).Info("Processing counter charge", "podSet", ps.Name, "deviceClass", deviceClass, "quotaResource", cc.quotaResource, "count", req.Exactly.Count)
+					log.V(5).Info("Processing counter charge", "podSet", ps.Name, "deviceClass", deviceClassRef, "resource", cc.quotaResource, "count", req.Exactly.Count)
 
 					charges, errs := processCounterCharge(ctx, sliceCache, &cc, cc.quotaResource, classSelectors, requestSelectors, req.Exactly.Count, reqPath)
 					if len(errs) > 0 {
@@ -98,39 +101,88 @@ func GetCounterResourcesForWorkload(
 						existing.Add(qty)
 						aggregated[resName] = existing
 					}
-					log.V(4).Info("Counter charge computed", "podSet", ps.Name, "deviceClass", deviceClass, "charges", charges)
+					log.V(5).Info("Counter charge computed", "podSet", ps.Name, "deviceClass", deviceClassRef, "charges", charges)
 				}
 			}
 		}
 
 		if len(aggregated) > 0 {
 			perPodSet[ps.Name] = aggregated
-			log.V(3).Info("Counter resources aggregated for podSet", "podSet", ps.Name, "resources", aggregated)
+			log.V(4).Info("Counter resources aggregated for podSet", "podSet", ps.Name, "resources", aggregated)
 		}
 	}
 
 	return perPodSet, nil
 }
 
-func prepareCounterCharge(
+func prepareDeviceSelectors(
 	ctx context.Context,
 	cl client.Client,
 	deviceClassName string,
 	selectors []resourcev1.DeviceSelector,
 	classCache map[string]*resourcev1.DeviceClass,
-	reqPath *field.Path,
+	claimPath *field.Path,
+	reqIdx int,
 ) ([]dracel.CompilationResult, []dracel.CompilationResult, field.ErrorList) {
-	classSelectors, classErr := resolveAndCompileDeviceClass(ctx, cl, deviceClassName, classCache, reqPath, 0)
+	classSelectors, classErr := resolveAndCompileDeviceClass(ctx, cl, deviceClassName, classCache, claimPath, reqIdx)
 	if classErr != nil {
 		return nil, nil, field.ErrorList{classErr}
 	}
 
+	reqPath := claimPath.Child("devices", "requests").Index(reqIdx)
 	requestSelectors, compErrs := compileCELSelectors(selectors, reqPath.Child("exactly", "selectors"), "CEL compilation failed")
 	if len(compErrs) > 0 {
 		return nil, nil, compErrs
 	}
 
 	return classSelectors, requestSelectors, nil
+}
+
+// matchDevicesForSource compiles a source config's deviceSelector, lists
+// ResourceSlices for its driver, and returns matching devices.
+func matchDevicesForSource(
+	ctx context.Context,
+	sliceCache *ResourceSliceCache,
+	driver DriverReference,
+	deviceSelector resourcev1.DeviceSelector,
+	classSelectors []dracel.CompilationResult,
+	requestSelectors []dracel.CompilationResult,
+	reqPath *field.Path,
+) ([]resourcev1.Device, field.ErrorList) {
+	log := ctrl.LoggerFrom(ctx)
+
+	selectorSelectors, compErrs := compileCELSelectors(
+		[]resourcev1.DeviceSelector{deviceSelector},
+		reqPath, "deviceSelector CEL compilation failed",
+	)
+	if len(compErrs) > 0 {
+		return nil, compErrs
+	}
+
+	sliceList, err := sliceCache.ListByDriver(ctx, driver)
+	if err != nil {
+		return nil, field.ErrorList{field.InternalError(reqPath, fmt.Errorf("failed to list ResourceSlices: %w", err))}
+	}
+	slices := eligibleSlices(ctx, sliceList)
+	log.V(5).Info("Listed ResourceSlices for device matching", "driver", driver, "slices", len(sliceList), "eligibleSlices", len(slices))
+
+	return matchDevicesWithSelectors(ctx, slices, selectorSelectors, classSelectors, requestSelectors, reqPath)
+}
+
+// safeChargeValue converts a driver-published resource.Quantity to a safe int64
+// charge value. Negative values are clamped to 0 with a log message. If count > 1
+// the value is multiplied using saturating arithmetic.
+func safeChargeValue(log logr.Logger, value resource.Quantity, driver, dimension string, count int64) int64 {
+	intVal := utilmath.SafeValue(value)
+	if value.Sign() < 0 {
+		log.V(1).Info("Unexpected negative device value from driver, clamping to 0",
+			"driver", driver, "dimension", dimension, "value", value.String())
+		intVal = 0
+	}
+	if count > 1 {
+		intVal = utilmath.SaturatingMul(intVal, count)
+	}
+	return intVal
 }
 
 func processCounterCharge(
@@ -145,26 +197,11 @@ func processCounterCharge(
 ) (corev1.ResourceList, field.ErrorList) {
 	log := ctrl.LoggerFrom(ctx)
 
-	selectorSelectors, compErrs := compileCELSelectors(
-		[]resourcev1.DeviceSelector{counterConfig.deviceSelector},
-		reqPath, "deviceSelector CEL compilation failed",
-	)
-	if len(compErrs) > 0 {
-		return nil, compErrs
-	}
-
-	sliceList, err := sliceCache.ListByDriver(ctx, counterConfig.driver)
-	if err != nil {
-		return nil, field.ErrorList{field.InternalError(reqPath, fmt.Errorf("failed to list ResourceSlices: %w", err))}
-	}
-	pools := groupSlicesByPool(sliceList, counterConfig.driver)
-	log.V(4).Info("Listed ResourceSlices for counter processing", "driver", counterConfig.driver, "pools", len(pools), "slices", len(sliceList))
-
-	matched, errs := matchDevicesWithSelectors(ctx, pools, counterConfig.driver, selectorSelectors, classSelectors, requestSelectors, reqPath)
+	matched, errs := matchDevicesForSource(ctx, sliceCache, counterConfig.driver, counterConfig.deviceSelector, classSelectors, requestSelectors, reqPath)
 	if len(errs) > 0 {
 		return nil, errs
 	}
-	log.V(4).Info("Matched devices for counter charge", "matched", len(matched), "requested", count)
+	log.V(5).Info("Matched devices for counter charge", "matched", len(matched), "requested", count)
 
 	if int64(len(matched)) < count {
 		// Cluster-state shortage: retryable until matching ResourceSlices appear.
@@ -190,26 +227,18 @@ func processCounterCharge(
 
 func matchDevicesWithSelectors(
 	ctx context.Context,
-	pools map[string]*poolInfo,
-	driver string,
+	slices []*resourcev1.ResourceSlice,
 	selectorSelectors []dracel.CompilationResult,
 	classSelectors []dracel.CompilationResult,
 	requestSelectors []dracel.CompilationResult,
 	reqPath *field.Path,
 ) ([]resourcev1.Device, field.ErrorList) {
-	log := ctrl.LoggerFrom(ctx)
 	var allMatched []resourcev1.Device
-	for poolName, pool := range pools {
-		if !pool.isComplete() {
-			log.V(4).Info("Skipping incomplete pool", "pool", poolName)
-			continue
-		}
-		devices := pool.collectDevices()
-		log.V(4).Info("Evaluating devices in pool", "pool", poolName, "deviceCount", len(devices))
-		for i := range devices {
-			dev := &devices[i]
+	for _, slice := range slices {
+		for i := range slice.Spec.Devices {
+			dev := &slice.Spec.Devices[i]
 			celDev := dracel.Device{
-				Driver:     driver,
+				Driver:     slice.Spec.Driver,
 				Attributes: dev.Attributes,
 				Capacity:   dev.Capacity,
 			}
@@ -234,63 +263,6 @@ func matchDevicesWithSelectors(
 	}
 
 	return allMatched, nil
-}
-
-type poolInfo struct {
-	name               string
-	generation         int64
-	resourceSliceCount int64
-	slices             []resourcev1.ResourceSlice
-}
-
-func (p *poolInfo) isComplete() bool {
-	return int64(len(p.slices)) == p.resourceSliceCount
-}
-
-func (p *poolInfo) collectDevices() []resourcev1.Device {
-	var devices []resourcev1.Device
-	for i := range p.slices {
-		devices = append(devices, p.slices[i].Spec.Devices...)
-	}
-	return devices
-}
-
-func groupSlicesByPool(slices []resourcev1.ResourceSlice, driver string) map[string]*poolInfo {
-	pools := make(map[string]*poolInfo)
-
-	for i := range slices {
-		slice := &slices[i]
-		if slice.Spec.Driver != driver {
-			continue
-		}
-
-		poolName := slice.Spec.Pool.Name
-		gen := slice.Spec.Pool.Generation
-
-		existing, ok := pools[poolName]
-		if !ok {
-			pools[poolName] = &poolInfo{
-				name:               poolName,
-				generation:         gen,
-				resourceSliceCount: slice.Spec.Pool.ResourceSliceCount,
-				slices:             []resourcev1.ResourceSlice{*slice},
-			}
-			continue
-		}
-
-		if gen > existing.generation {
-			pools[poolName] = &poolInfo{
-				name:               poolName,
-				generation:         gen,
-				resourceSliceCount: slice.Spec.Pool.ResourceSliceCount,
-				slices:             []resourcev1.ResourceSlice{*slice},
-			}
-		} else if gen == existing.generation {
-			existing.slices = append(existing.slices, *slice)
-		}
-	}
-
-	return pools
 }
 
 func computeCounterCharges(
@@ -319,29 +291,6 @@ func computeCounterCharges(
 		return nil
 	}
 
-	// A driver-published counter value is an unvalidated resource.Quantity: the
-	// apiserver accepts any parseable value, including negatives and magnitudes
-	// beyond int64 (maxValue.Value() would then truncate or wrap before the
-	// saturating multiply could clamp it). SafeValue keeps the magnitude within
-	// [MinInt64, MaxInt64], and a negative value is then forced to 0 so the
-	// charge stays in [0, MaxInt64] for every count, including count == 1. The
-	// negative check uses maxValue.Sign() so it reflects the driver's value
-	// directly, independent of how Value() maps out-of-range magnitudes (Value()
-	// can even return 0 for MinInt64). A driver publishing a negative counter is
-	// misbehaving and should never happen, so log it at V(0), visible even at the
-	// most restrictive log level, matching how kueue surfaces other "unexpected
-	// negative" values (see the negative pod-count log in the scheduler cache).
-	intVal := utilmath.SafeValue(maxValue)
-	if maxValue.Sign() < 0 {
-		log.V(0).Info("Unexpected negative device counter value from driver, clamping to 0",
-			"driver", counterConfig.driver, "counter", counterConfig.counterName, "value", maxValue.String())
-		intVal = 0
-	}
-	if count > 1 {
-		// Saturate rather than let intVal*count wrap to a negative quantity,
-		// consistent with countDevicesPerClass after #12897.
-		intVal = utilmath.SaturatingMul(intVal, count)
-	}
-	maxValue = *resource.NewQuantity(intVal, maxValue.Format)
-	return corev1.ResourceList{quotaResource: maxValue}
+	intVal := safeChargeValue(log, maxValue, string(counterConfig.driver), counterConfig.counterName, count)
+	return corev1.ResourceList{quotaResource: *resource.NewQuantity(intVal, maxValue.Format)}
 }

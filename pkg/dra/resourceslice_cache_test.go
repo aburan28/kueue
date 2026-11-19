@@ -28,26 +28,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
+	testingdra "sigs.k8s.io/kueue/pkg/util/testingjobs/dra"
 )
 
-func newSlice(name, driver, pool string) *resourcev1.ResourceSlice {
-	return &resourcev1.ResourceSlice{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Spec: resourcev1.ResourceSliceSpec{
-			Driver: driver,
-			Pool: resourcev1.ResourcePool{
-				Name:               pool,
-				Generation:         1,
-				ResourceSliceCount: 1,
-			},
-		},
-	}
-}
-
 func TestResourceSliceCache_ListByDriver(t *testing.T) {
-	gpuSlice1 := newSlice("gpu-slice-1", "gpu.nvidia.com", "node1")
-	gpuSlice2 := newSlice("gpu-slice-2", "gpu.nvidia.com", "node2")
-	nicSlice := newSlice("nic-slice", "nic.mellanox.com", "node1")
+	gpuSlice1 := testingdra.MakeResourceSlice("gpu-slice-1", "gpu.nvidia.com").Pool("node1", 1, 1).Obj()
+	gpuSlice2 := testingdra.MakeResourceSlice("gpu-slice-2", "gpu.nvidia.com").Pool("node2", 1, 1).Obj()
+	nicSlice := testingdra.MakeResourceSlice("nic-slice", "nic.mellanox.com").Pool("node1", 1, 1).Obj()
 
 	cl := utiltesting.NewClientBuilder().
 		WithIndex(&resourcev1.ResourceSlice{}, "spec.driver", func(obj client.Object) []string {
@@ -60,7 +47,7 @@ func TestResourceSliceCache_ListByDriver(t *testing.T) {
 	cache := NewResourceSliceCache(cl)
 
 	t.Run("returns only requested driver slices", func(t *testing.T) {
-		got, err := cache.ListByDriver(ctx, "gpu.nvidia.com")
+		got, err := cache.ListByDriver(ctx, DriverReference("gpu.nvidia.com"))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -70,15 +57,21 @@ func TestResourceSliceCache_ListByDriver(t *testing.T) {
 	})
 
 	t.Run("second call returns cached result", func(t *testing.T) {
-		got1, _ := cache.ListByDriver(ctx, "gpu.nvidia.com")
-		got2, _ := cache.ListByDriver(ctx, "gpu.nvidia.com")
+		got1, err := cache.ListByDriver(ctx, DriverReference("gpu.nvidia.com"))
+		if err != nil {
+			t.Fatalf("unexpected error on first call: %v", err)
+		}
+		got2, err := cache.ListByDriver(ctx, DriverReference("gpu.nvidia.com"))
+		if err != nil {
+			t.Fatalf("unexpected error on second call: %v", err)
+		}
 		if diff := cmp.Diff(got1, got2, cmpopts.IgnoreFields(metav1.ObjectMeta{}, "ResourceVersion")); diff != "" {
 			t.Errorf("cached result mismatch (-first +second):\n%s", diff)
 		}
 	})
 
 	t.Run("different driver returns different slices", func(t *testing.T) {
-		got, err := cache.ListByDriver(ctx, "nic.mellanox.com")
+		got, err := cache.ListByDriver(ctx, DriverReference("nic.mellanox.com"))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -89,8 +82,8 @@ func TestResourceSliceCache_ListByDriver(t *testing.T) {
 }
 
 func TestResourceSliceCache_ListAll(t *testing.T) {
-	gpuSlice := newSlice("gpu-slice", "gpu.nvidia.com", "node1")
-	nicSlice := newSlice("nic-slice", "nic.mellanox.com", "node1")
+	gpuSlice := testingdra.MakeResourceSlice("gpu-slice", "gpu.nvidia.com").Pool("node1", 1, 1).Obj()
+	nicSlice := testingdra.MakeResourceSlice("nic-slice", "nic.mellanox.com").Pool("node1", 1, 1).Obj()
 
 	cl := utiltesting.NewClientBuilder().
 		WithObjects(gpuSlice, nicSlice).
@@ -110,8 +103,14 @@ func TestResourceSliceCache_ListAll(t *testing.T) {
 	})
 
 	t.Run("second call returns cached result", func(t *testing.T) {
-		got1, _ := cache.ListAll(ctx)
-		got2, _ := cache.ListAll(ctx)
+		got1, err := cache.ListAll(ctx)
+		if err != nil {
+			t.Fatalf("unexpected error on first call: %v", err)
+		}
+		got2, err := cache.ListAll(ctx)
+		if err != nil {
+			t.Fatalf("unexpected error on second call: %v", err)
+		}
 		if diff := cmp.Diff(got1, got2, cmpopts.IgnoreFields(metav1.ObjectMeta{}, "ResourceVersion")); diff != "" {
 			t.Errorf("cached result mismatch (-first +second):\n%s", diff)
 		}
@@ -119,9 +118,9 @@ func TestResourceSliceCache_ListAll(t *testing.T) {
 }
 
 func TestResourceSliceCache_ListAllThenListByDriver(t *testing.T) {
-	gpuSlice1 := newSlice("gpu-slice-1", "gpu.nvidia.com", "node1")
-	gpuSlice2 := newSlice("gpu-slice-2", "gpu.nvidia.com", "node2")
-	nicSlice := newSlice("nic-slice", "nic.mellanox.com", "node1")
+	gpuSlice1 := testingdra.MakeResourceSlice("gpu-slice-1", "gpu.nvidia.com").Pool("node1", 1, 1).Obj()
+	gpuSlice2 := testingdra.MakeResourceSlice("gpu-slice-2", "gpu.nvidia.com").Pool("node2", 1, 1).Obj()
+	nicSlice := testingdra.MakeResourceSlice("nic-slice", "nic.mellanox.com").Pool("node1", 1, 1).Obj()
 
 	listCallCount := 0
 	cl := utiltesting.NewClientBuilder().
@@ -153,7 +152,7 @@ func TestResourceSliceCache_ListAllThenListByDriver(t *testing.T) {
 	}
 
 	// Second call: ListByDriver filters from cached all-slices, no extra API call
-	gpuSlices, err := cache.ListByDriver(ctx, "gpu.nvidia.com")
+	gpuSlices, err := cache.ListByDriver(ctx, DriverReference("gpu.nvidia.com"))
 	if err != nil {
 		t.Fatalf("ListByDriver failed: %v", err)
 	}
@@ -166,8 +165,8 @@ func TestResourceSliceCache_ListAllThenListByDriver(t *testing.T) {
 }
 
 func TestResourceSliceCache_ListByDriverThenListByDriverDifferent(t *testing.T) {
-	gpuSlice := newSlice("gpu-slice", "gpu.nvidia.com", "node1")
-	nicSlice := newSlice("nic-slice", "nic.mellanox.com", "node1")
+	gpuSlice := testingdra.MakeResourceSlice("gpu-slice", "gpu.nvidia.com").Pool("node1", 1, 1).Obj()
+	nicSlice := testingdra.MakeResourceSlice("nic-slice", "nic.mellanox.com").Pool("node1", 1, 1).Obj()
 
 	listCallCount := 0
 	cl := utiltesting.NewClientBuilder().
@@ -186,18 +185,24 @@ func TestResourceSliceCache_ListByDriverThenListByDriverDifferent(t *testing.T) 
 	ctx := t.Context()
 	cache := NewResourceSliceCache(cl)
 
-	_, _ = cache.ListByDriver(ctx, "gpu.nvidia.com")
+	if _, err := cache.ListByDriver(ctx, DriverReference("gpu.nvidia.com")); err != nil {
+		t.Fatalf("unexpected error listing gpu driver: %v", err)
+	}
 	if listCallCount != 1 {
 		t.Errorf("expected 1 API call, got %d", listCallCount)
 	}
 
-	_, _ = cache.ListByDriver(ctx, "nic.mellanox.com")
+	if _, err := cache.ListByDriver(ctx, DriverReference("nic.mellanox.com")); err != nil {
+		t.Fatalf("unexpected error listing nic driver: %v", err)
+	}
 	if listCallCount != 2 {
 		t.Errorf("expected 2 API calls for different drivers, got %d", listCallCount)
 	}
 
 	// Same driver again — should be cached
-	_, _ = cache.ListByDriver(ctx, "gpu.nvidia.com")
+	if _, err := cache.ListByDriver(ctx, DriverReference("gpu.nvidia.com")); err != nil {
+		t.Fatalf("unexpected error listing cached gpu driver: %v", err)
+	}
 	if listCallCount != 2 {
 		t.Errorf("expected still 2 API calls (gpu cached), got %d", listCallCount)
 	}

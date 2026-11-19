@@ -28,23 +28,22 @@ import (
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/utils/ptr"
-	inventoryv1alpha1 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha1"
+	inventoryv1alpha2 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha2"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	config "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/multikueue"
-	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	jobcontrollers "sigs.k8s.io/kueue/pkg/controller/jobs"
 	workloadjob "sigs.k8s.io/kueue/pkg/controller/jobs/job"
 	"sigs.k8s.io/kueue/pkg/features"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
@@ -52,7 +51,8 @@ import (
 	testingjob "sigs.k8s.io/kueue/pkg/util/testingjobs/job"
 	"sigs.k8s.io/kueue/pkg/webhooks"
 	"sigs.k8s.io/kueue/test/integration/framework"
-	"sigs.k8s.io/kueue/test/util"
+	"sigs.k8s.io/kueue/test/util/behavioral"
+	"sigs.k8s.io/kueue/test/util/behavioral/integration"
 )
 
 var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:multikueue"), ginkgo.Ordered, ginkgo.ContinueOnFailure, func() {
@@ -79,19 +79,15 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 	)
 
 	ginkgo.BeforeAll(func() {
-		managerTestCluster.fwk.StartManager(managerTestCluster.ctx, managerTestCluster.cfg, func(ctx context.Context, mgr manager.Manager) {
+		managerTestCluster.fwk.StartManagerForSpec(managerTestCluster.ctx, managerTestCluster.cfg, func(ctx context.Context, mgr manager.Manager) {
 			managerAndMultiKueueSetup(ctx, mgr, 2*time.Second, defaultEnabledIntegrations, config.MultiKueueDispatcherModeAllAtOnce)
 		})
 	})
 
-	ginkgo.AfterAll(func() {
-		managerTestCluster.fwk.StopManager(managerTestCluster.ctx)
-	})
-
 	ginkgo.BeforeEach(func() {
-		managerNs = util.CreateNamespaceFromPrefixWithLog(managerTestCluster.ctx, managerTestCluster.client, "multikueue-")
-		worker1Ns = util.CreateNamespaceWithLog(worker1TestCluster.ctx, worker1TestCluster.client, managerNs.Name)
-		worker2Ns = util.CreateNamespaceWithLog(worker2TestCluster.ctx, worker2TestCluster.client, managerNs.Name)
+		managerNs = behavioral.CreateNamespaceFromPrefixWithLog(managerTestCluster.ctx, managerTestCluster.client, "multikueue-")
+		worker1Ns = behavioral.CreateNamespaceWithLog(worker1TestCluster.ctx, worker1TestCluster.client, managerNs.Name)
+		worker2Ns = behavioral.CreateNamespaceWithLog(worker2TestCluster.ctx, worker2TestCluster.client, managerNs.Name)
 
 		w1Kubeconfig, err := worker1TestCluster.kubeConfigBytes()
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
@@ -118,45 +114,45 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 			ControllerName(kueue.MultiKueueControllerName).
 			Parameters(kueue.SchemeGroupVersion.Group, "MultiKueueConfig", managerMultiKueueConfig.Name).
 			Obj()
-		util.CreateAdmissionChecksAndWaitForActive(managerTestCluster.ctx, managerTestCluster.client, multiKueueAC)
+		behavioral.CreateAdmissionChecksAndWaitForActive(managerTestCluster.ctx, managerTestCluster.client, multiKueueAC)
 
 		managerFlavor = utiltestingapi.MakeResourceFlavor(string(multikueueTestFlavor)).Obj()
-		util.MustCreate(managerTestCluster.ctx, managerTestCluster.client, managerFlavor)
+		behavioral.MustCreate(managerTestCluster.ctx, managerTestCluster.client, managerFlavor)
 
 		managerCq = utiltestingapi.MakeClusterQueue("q1").
 			ResourceGroup(*utiltestingapi.MakeFlavorQuotas(string(multikueueTestFlavor)).Resource(corev1.ResourceCPU, "5").Obj()).
 			AdmissionChecks(kueue.AdmissionCheckReference(multiKueueAC.Name)).
 			Obj()
-		util.CreateClusterQueuesAndWaitForActive(managerTestCluster.ctx, managerTestCluster.client, managerCq)
+		behavioral.CreateClusterQueuesAndWaitForActive(managerTestCluster.ctx, managerTestCluster.client, managerCq)
 
 		managerLq = utiltestingapi.MakeLocalQueue(managerCq.Name, managerNs.Name).ClusterQueue(managerCq.Name).Obj()
-		util.CreateLocalQueuesAndWaitForActive(managerTestCluster.ctx, managerTestCluster.client, managerLq)
+		behavioral.CreateLocalQueuesAndWaitForActive(managerTestCluster.ctx, managerTestCluster.client, managerLq)
 
 		worker1Cq = utiltestingapi.MakeClusterQueue("q1").Obj()
-		util.CreateClusterQueuesAndWaitForActive(worker1TestCluster.ctx, worker1TestCluster.client, worker1Cq)
+		behavioral.CreateClusterQueuesAndWaitForActive(worker1TestCluster.ctx, worker1TestCluster.client, worker1Cq)
 		worker1Lq = utiltestingapi.MakeLocalQueue(worker1Cq.Name, worker1Ns.Name).ClusterQueue(worker1Cq.Name).Obj()
-		util.CreateLocalQueuesAndWaitForActive(worker1TestCluster.ctx, worker1TestCluster.client, worker1Lq)
+		behavioral.CreateLocalQueuesAndWaitForActive(worker1TestCluster.ctx, worker1TestCluster.client, worker1Lq)
 
 		worker2Cq = utiltestingapi.MakeClusterQueue("q1").Obj()
-		util.CreateClusterQueuesAndWaitForActive(worker2TestCluster.ctx, worker2TestCluster.client, worker2Cq)
+		behavioral.CreateClusterQueuesAndWaitForActive(worker2TestCluster.ctx, worker2TestCluster.client, worker2Cq)
 		worker2Lq = utiltestingapi.MakeLocalQueue(worker2Cq.Name, worker2Ns.Name).ClusterQueue(worker2Cq.Name).Obj()
-		util.CreateLocalQueuesAndWaitForActive(worker2TestCluster.ctx, worker2TestCluster.client, worker2Lq)
+		behavioral.CreateLocalQueuesAndWaitForActive(worker2TestCluster.ctx, worker2TestCluster.client, worker2Lq)
 	})
 
 	ginkgo.AfterEach(func() {
-		gomega.Expect(util.DeleteNamespace(managerTestCluster.ctx, managerTestCluster.client, managerNs)).To(gomega.Succeed())
-		gomega.Expect(util.DeleteNamespace(worker1TestCluster.ctx, worker1TestCluster.client, worker1Ns)).To(gomega.Succeed())
-		gomega.Expect(util.DeleteNamespace(worker2TestCluster.ctx, worker2TestCluster.client, worker2Ns)).To(gomega.Succeed())
-		util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, managerCq, true)
-		util.ExpectObjectToBeDeleted(worker1TestCluster.ctx, worker1TestCluster.client, worker1Cq, true)
-		util.ExpectObjectToBeDeleted(worker2TestCluster.ctx, worker2TestCluster.client, worker2Cq, true)
-		util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, managerFlavor, true)
-		util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, multiKueueAC, true)
-		util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, managerMultiKueueConfig, true)
-		util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, workerCluster1, true)
-		util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, workerCluster2, true)
-		util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, managerMultiKueueSecret1, true)
-		util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, managerMultiKueueSecret2, true)
+		gomega.Expect(behavioral.DeleteNamespace(managerTestCluster.ctx, managerTestCluster.client, managerNs)).To(gomega.Succeed())
+		gomega.Expect(behavioral.DeleteNamespace(worker1TestCluster.ctx, worker1TestCluster.client, worker1Ns)).To(gomega.Succeed())
+		gomega.Expect(behavioral.DeleteNamespace(worker2TestCluster.ctx, worker2TestCluster.client, worker2Ns)).To(gomega.Succeed())
+		behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, managerCq, true)
+		behavioral.ExpectObjectToBeDeleted(worker1TestCluster.ctx, worker1TestCluster.client, worker1Cq, true)
+		behavioral.ExpectObjectToBeDeleted(worker2TestCluster.ctx, worker2TestCluster.client, worker2Cq, true)
+		behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, managerFlavor, true)
+		behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, multiKueueAC, true)
+		behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, managerMultiKueueConfig, true)
+		behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, workerCluster1, true)
+		behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, workerCluster2, true)
+		behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, managerMultiKueueSecret1, true)
+		behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, managerMultiKueueSecret2, true)
 	})
 	ginkgo.It("Should properly manage the active condition of AdmissionChecks and MultiKueueClusters, kubeconfig provided by secret", func() {
 		ac := utiltestingapi.MakeAdmissionCheck("testing-ac").
@@ -178,16 +174,36 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 							Status:  metav1.ConditionFalse,
 							Reason:  "BadConfig",
 							Message: `Cannot load the AdmissionChecks parameters: MultiKueueConfig.kueue.x-k8s.io "testing-config" not found`,
-						}, util.IgnoreConditionTimestampsAndObservedGeneration),
+						}, behavioral.IgnoreConditionTimestampsAndObservedGeneration),
 					))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
 		ginkgo.By("creating a config with duplicate clusters should fail", func() {
 			badConfig := utiltestingapi.MakeMultiKueueConfig("bad-config").Clusters("c1", "c2", "c1").Obj()
-			gomega.Expect(managerTestCluster.client.Create(managerTestCluster.ctx, badConfig).Error()).Should(gomega.Equal(
-				`MultiKueueConfig.kueue.x-k8s.io "bad-config" is invalid: spec.clusters[2]: Duplicate value: "c1"`))
+			err := managerTestCluster.client.Create(managerTestCluster.ctx, badConfig)
+			gomega.Expect(err).To(gomega.HaveOccurred())
+			gomega.Expect(err.Error()).To(gomega.ContainSubstring("must be unique"))
+		})
+
+		// A ClusterQueue referencing the check, so the worker cluster's status is
+		// reported under it. It stays inactive, which is fine: the metric is reported
+		// from the admission check and its config, not from the ClusterQueue's state.
+		// It deliberately uses its own ResourceFlavor reference rather than the shared
+		// one, so it can never hold that flavor in use and block the suite cleanup.
+		testingCq := utiltestingapi.MakeClusterQueue("testing-cq").
+			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("testing-flavor").Resource(corev1.ResourceCPU, "5").Obj()).
+			AdmissionChecks(kueue.AdmissionCheckReference(ac.Name)).
+			Obj()
+		ginkgo.By("creating a ClusterQueue referencing the check", func() {
+			behavioral.MustCreate(managerTestCluster.ctx, managerTestCluster.client, testingCq)
+			// Wait for the ClusterQueue to be gone, not just for the delete to be
+			// accepted: while it lingers it holds the ResourceFlavor in use and the
+			// suite-level cleanup of that flavor fails.
+			ginkgo.DeferCleanup(func() {
+				behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, testingCq, true)
+			})
 		})
 
 		config := utiltestingapi.MakeMultiKueueConfig("testing-config").Clusters("testing-cluster").Obj()
@@ -205,8 +221,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionFalse,
 						Reason:  "NoUsableClusters",
 						Message: `Missing clusters: [testing-cluster]`,
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -225,8 +241,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionFalse,
 						Reason:  "BadKubeConfig",
 						Message: `load client config failed: Secret "testing-secret" not found`,
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("wait for the check's active state update", func() {
@@ -239,8 +255,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionFalse,
 						Reason:  "NoUsableClusters",
 						Message: `Inactive clusters: [testing-cluster]`,
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -262,8 +278,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionTrue,
 						Reason:  "Active",
 						Message: "Connected",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("wait for the check's active state update", func() {
@@ -276,8 +292,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionTrue,
 						Reason:  "Active",
 						Message: "The admission check is active",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 	})
@@ -304,9 +320,9 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 							Status:  metav1.ConditionFalse,
 							Reason:  "BadConfig",
 							Message: `Cannot load the AdmissionChecks parameters: MultiKueueConfig.kueue.x-k8s.io "testing-config" not found`,
-						}, util.IgnoreConditionTimestampsAndObservedGeneration),
+						}, behavioral.IgnoreConditionTimestampsAndObservedGeneration),
 					))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -328,8 +344,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionFalse,
 						Reason:  "NoUsableClusters",
 						Message: `Missing clusters: [testing-cluster]`,
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -348,8 +364,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionFalse,
 						Reason:  "BadKubeConfig",
 						Message: fmt.Sprintf("load client config failed: open %s: no such file or directory", fsKubeConfig),
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("wait for the check's active state update", func() {
@@ -362,8 +378,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionFalse,
 						Reason:  "NoUsableClusters",
 						Message: `Inactive clusters: [testing-cluster]`,
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -382,8 +398,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionTrue,
 						Reason:  "Active",
 						Message: "Connected",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("wait for the check's active state update", func() {
@@ -396,8 +412,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionTrue,
 						Reason:  "Active",
 						Message: "The admission check is active",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 	})
@@ -453,8 +469,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionFalse,
 						Reason:  "InsecureKubeConfig",
 						Message: "load client config failed: certificate-authority file paths are not allowed, use certificate-authority-data for cluster default-cluster",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("wait for the check's active state update", func() {
@@ -467,8 +483,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionFalse,
 						Reason:  "NoUsableClusters",
 						Message: "Inactive clusters: [testing-cluster]",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -494,8 +510,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionTrue,
 						Reason:  "Active",
 						Message: "Connected",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 			ginkgo.By("wait for the check's active state update", func() {
 				updatedAc := kueue.AdmissionCheck{}
@@ -507,8 +523,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionTrue,
 						Reason:  "Active",
 						Message: "The admission check is active",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 	})
@@ -567,8 +583,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionFalse,
 						Reason:  "InsecureKubeConfig",
 						Message: "load client config failed: tokenFile is not allowed",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 			ginkgo.By("wait for the check's active state update", func() {
 				updatedAc := kueue.AdmissionCheck{}
@@ -580,8 +596,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionFalse,
 						Reason:  "NoUsableClusters",
 						Message: "Inactive clusters: [testing-cluster]",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -600,8 +616,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionTrue,
 						Reason:  "Active",
 						Message: "Connected",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 			ginkgo.By("wait for the check's active state update", func() {
 				updatedAc := kueue.AdmissionCheck{}
@@ -613,8 +629,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionTrue,
 						Reason:  "Active",
 						Message: "The admission check is active",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 	})
@@ -654,7 +670,7 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 				g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionFalse))
 				g.Expect(cond.Reason).To(gomega.Equal("BadKubeConfig"))
 				g.Expect(cond.Message).To(gomega.ContainSubstring("kubeconfig path is not under the allowed prefix"))
-			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 		})
 
 		ginkgo.By("creating a cluster with relative path, the cluster is rejected", func() {
@@ -671,7 +687,7 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 				g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionFalse))
 				g.Expect(cond.Reason).To(gomega.Equal("BadKubeConfig"))
 				g.Expect(cond.Message).To(gomega.ContainSubstring("path must be absolute"))
-			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 		})
 
 		ginkgo.By("creating a cluster with dot-dot traversal path, the cluster is rejected", func() {
@@ -688,7 +704,7 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 				g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionFalse))
 				g.Expect(cond.Reason).To(gomega.Equal("BadKubeConfig"))
 				g.Expect(cond.Message).To(gomega.ContainSubstring("kubeconfig path is not under the allowed prefix"))
-			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 		})
 	})
 
@@ -733,8 +749,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionFalse,
 						Reason:  "InsecureKubeConfig",
 						Message: "load client config failed: certificate-authority file paths are not allowed, use certificate-authority-data for cluster default-cluster",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 
 				gomega.Eventually(func(g gomega.Gomega) {
 					g.Expect(managerTestCluster.client.Get(managerTestCluster.ctx, acKey, multiKueueAC)).To(gomega.Succeed())
@@ -743,8 +759,8 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 						Status:  metav1.ConditionTrue,
 						Reason:  "SomeActiveClusters",
 						Message: "Inactive clusters: [worker1]",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -752,14 +768,14 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 			Queue(kueue.LocalQueueName(managerLq.Name)).
 			Obj()
 		ginkgo.By("create a job and reserve quota, only existing remoteClients are part of the NominatedClusterNames", func() {
-			util.MustCreate(managerTestCluster.ctx, managerTestCluster.client, job)
+			behavioral.MustCreate(managerTestCluster.ctx, managerTestCluster.client, job)
 			wlLookupKey := types.NamespacedName{Name: workloadjob.GetWorkloadNameForJob(job.Name, job.UID), Namespace: managerNs.Name}
 
 			ginkgo.By("setting workload reservation in the management cluster", func() {
 				admission := utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(managerCq.Name)).
 					PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
 						Flavor(corev1.ResourceCPU, multikueueTestFlavor).Obj()).Obj()
-				util.SetQuotaReservation(managerTestCluster.ctx, managerTestCluster.client, wlLookupKey, admission)
+				integration.SetQuotaReservation(managerTestCluster.ctx, managerTestCluster.client, wlLookupKey, admission)
 			})
 
 			ginkgo.By("verify remote clients are managed correctly: worker1 was removed and worker2 is still active", func() {
@@ -772,93 +788,9 @@ var _ = ginkgo.Describe("MultiKueue", ginkgo.Label("area:multikueue", "feature:m
 					createdWorkload := &kueue.Workload{}
 					g.Expect(worker1TestCluster.client.Get(worker1TestCluster.ctx, wlLookupKey, createdWorkload)).To(utiltesting.BeNotFoundError())
 					g.Expect(worker2TestCluster.client.Get(worker2TestCluster.ctx, wlLookupKey, createdWorkload)).To(gomega.Succeed())
-					g.Expect(createdWorkload.Spec).To(gomega.BeComparableTo(managerWl.Spec))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					behavioral.ExpectRemoteWorkloadSpec(g, createdWorkload, managerWl)
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
-		})
-	})
-
-	ginkgo.Context("Manager quota automation", func() {
-		ginkgo.BeforeEach(func() {
-			ginkgo.By("set up resource groups and flavor quotas on worker1 and worker2 ClusterQueues")
-			gomega.Eventually(func(g gomega.Gomega) {
-				w1Cq := &kueue.ClusterQueue{}
-				g.Expect(worker1TestCluster.client.Get(worker1TestCluster.ctx, client.ObjectKeyFromObject(worker1Cq), w1Cq)).To(gomega.Succeed())
-				w1Cq.Spec.ResourceGroups = []kueue.ResourceGroup{
-					{
-						CoveredResources: []corev1.ResourceName{corev1.ResourceCPU},
-						Flavors: []kueue.FlavorQuotas{
-							*utiltestingapi.MakeFlavorQuotas(string(multikueueTestFlavor)).Resource(corev1.ResourceCPU, "10").Obj(),
-						},
-					},
-				}
-				g.Expect(worker1TestCluster.client.Update(worker1TestCluster.ctx, w1Cq)).To(gomega.Succeed())
-			}, util.Timeout, util.Interval).Should(gomega.Succeed())
-
-			gomega.Eventually(func(g gomega.Gomega) {
-				w2Cq := &kueue.ClusterQueue{}
-				g.Expect(worker2TestCluster.client.Get(worker2TestCluster.ctx, client.ObjectKeyFromObject(worker2Cq), w2Cq)).To(gomega.Succeed())
-				w2Cq.Spec.ResourceGroups = []kueue.ResourceGroup{
-					{
-						CoveredResources: []corev1.ResourceName{corev1.ResourceCPU},
-						Flavors: []kueue.FlavorQuotas{
-							*utiltestingapi.MakeFlavorQuotas(string(multikueueTestFlavor)).Resource(corev1.ResourceCPU, "10").Obj(),
-						},
-					},
-				}
-				g.Expect(worker2TestCluster.client.Update(worker2TestCluster.ctx, w2Cq)).To(gomega.Succeed())
-			}, util.Timeout, util.Interval).Should(gomega.Succeed())
-
-			ginkgo.By("enable quota automation on the MultiKueueConfig")
-			gomega.Eventually(func(g gomega.Gomega) {
-				mkc := &kueue.MultiKueueConfig{}
-				g.Expect(managerTestCluster.client.Get(managerTestCluster.ctx, client.ObjectKeyFromObject(managerMultiKueueConfig), mkc)).To(gomega.Succeed())
-				mkc.Spec.QuotaManagement = ptr.To(kueue.QuotaManagementAutomated)
-				g.Expect(managerTestCluster.client.Update(managerTestCluster.ctx, mkc)).To(gomega.Succeed())
-			}, util.Timeout, util.Interval).Should(gomega.Succeed())
-
-			ginkgo.By("verify manager ClusterQueue CPU quota is aggregated")
-			cqKey := client.ObjectKeyFromObject(managerCq)
-			gomega.Eventually(func(g gomega.Gomega) {
-				cq := &kueue.ClusterQueue{}
-				g.Expect(managerTestCluster.client.Get(managerTestCluster.ctx, cqKey, cq)).To(gomega.Succeed())
-				g.Expect(cq.Spec.ResourceGroups).To(gomega.HaveLen(1))
-				g.Expect(cq.Spec.ResourceGroups[0].Flavors).To(gomega.HaveLen(1))
-				g.Expect(cq.Spec.ResourceGroups[0].Flavors[0].Resources).To(gomega.HaveLen(1))
-				g.Expect(cq.Spec.ResourceGroups[0].Flavors[0].Resources[0].Name).To(gomega.Equal(corev1.ResourceCPU))
-				g.Expect(cq.Spec.ResourceGroups[0].Flavors[0].Resources[0].NominalQuota.String()).To(gomega.Equal("20"))
-			}, util.Timeout, util.Interval).Should(gomega.Succeed())
-		})
-
-		ginkgo.It("Should update manager ClusterQueue quota when worker ClusterQueue quota changes", func() {
-			ginkgo.By("decrease worker1 ClusterQueue quota")
-			gomega.Eventually(func(g gomega.Gomega) {
-				w1Cq := &kueue.ClusterQueue{}
-				g.Expect(worker1TestCluster.client.Get(worker1TestCluster.ctx, client.ObjectKeyFromObject(worker1Cq), w1Cq)).To(gomega.Succeed())
-				w1Cq.Spec.ResourceGroups[0].Flavors[0].Resources[0].NominalQuota = resource.MustParse("5")
-				g.Expect(worker1TestCluster.client.Update(worker1TestCluster.ctx, w1Cq)).To(gomega.Succeed())
-			}, util.Timeout, util.Interval).Should(gomega.Succeed())
-
-			ginkgo.By("verify manager ClusterQueue quota drops accordingly")
-			cqKey := client.ObjectKeyFromObject(managerCq)
-			gomega.Eventually(func(g gomega.Gomega) {
-				cq := &kueue.ClusterQueue{}
-				g.Expect(managerTestCluster.client.Get(managerTestCluster.ctx, cqKey, cq)).To(gomega.Succeed())
-				g.Expect(cq.Spec.ResourceGroups[0].Flavors[0].Resources[0].NominalQuota.String()).To(gomega.Equal("15"))
-			}, util.Timeout, util.Interval).Should(gomega.Succeed())
-		})
-
-		ginkgo.It("Should update manager ClusterQueue quota when worker LocalQueue is removed", func() {
-			ginkgo.By("delete worker1 LocalQueue")
-			util.ExpectObjectToBeDeleted(worker1TestCluster.ctx, worker1TestCluster.client, worker1Lq, true)
-
-			ginkgo.By("verify manager ClusterQueue quota drops accordingly")
-			cqKey := client.ObjectKeyFromObject(managerCq)
-			gomega.Eventually(func(g gomega.Gomega) {
-				cq := &kueue.ClusterQueue{}
-				g.Expect(managerTestCluster.client.Get(managerTestCluster.ctx, cqKey, cq)).To(gomega.Succeed())
-				g.Expect(cq.Spec.ResourceGroups[0].Flavors[0].Resources[0].NominalQuota.String()).To(gomega.Equal("10"))
-			}, util.Timeout, util.Interval).Should(gomega.Succeed())
 		})
 	})
 })
@@ -868,26 +800,25 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 		var (
 			mkc1 *kueue.MultiKueueCluster
 			mkc2 *kueue.MultiKueueCluster
-			cp1  *inventoryv1alpha1.ClusterProfile
-			cp2  *inventoryv1alpha1.ClusterProfile
+			cp1  *inventoryv1alpha2.ClusterProfile
+			cp2  *inventoryv1alpha2.ClusterProfile
 		)
 
 		ginkgo.BeforeEach(func() {
 			// The flag must be called before multikueue.SetupIndexer so that MultiKueueCluster ClusterProfile indexer is registered.
 			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.MultiKueueClusterProfile, true)
 
-			managerTestCluster.fwk.StartManager(managerTestCluster.ctx, managerTestCluster.cfg, func(ctx context.Context, mgr manager.Manager) {
-				managerAndMultiKueueSetup(ctx, mgr, 2*time.Second, defaultEnabledIntegrations, config.MultiKueueDispatcherModeAllAtOnce)
+			managerTestCluster.fwk.StartManagerForSpec(managerTestCluster.ctx, managerTestCluster.cfg, func(ctx context.Context, mgr manager.Manager) {
+				managerAndMultiKueueSetup(ctx, mgr, 2*time.Second, defaultEnabledIntegrations, config.MultiKueueDispatcherModeAllAtOnce, multikueue.WithClusterProfileCRDPresent(true))
 			})
 		})
 
 		ginkgo.AfterEach(func() {
-			util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, mkc1, true)
-			util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, mkc2, true)
-			util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, cp1, true)
-			util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, cp2, true)
+			behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, mkc1, true)
+			behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, mkc2, true)
+			behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, cp1, true)
+			behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, cp2, true)
 			mkc1, mkc2, cp1, cp2 = nil, nil, nil, nil
-			managerTestCluster.fwk.StopManager(managerTestCluster.ctx)
 		})
 
 		ginkgo.It("Should report no cluster providers configured", func() {
@@ -907,8 +838,8 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 						Status:  metav1.ConditionFalse,
 						Reason:  "BadClusterProfile",
 						Message: "load client config failed: ClusterProfile.multicluster.x-k8s.io \"test-profile\" not found",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Create ClusterProfile and trigger MultiKueueCluster reconciliation", func() {
@@ -925,8 +856,8 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 						Status:  metav1.ConditionFalse,
 						Reason:  "BadClusterProfile",
 						Message: "load client config failed: no access provider configured",
-					}, util.IgnoreConditionTimestampsAndObservedGeneration)))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -950,7 +881,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					g.Expect(active.Status).To(gomega.Equal(metav1.ConditionFalse))
 					g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 					g.Expect(active.Message).To(gomega.ContainSubstring("not found"))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Create the referenced ClusterProfile", func() {
@@ -968,11 +899,11 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					g.Expect(active.Status).To(gomega.Equal(metav1.ConditionFalse))
 					g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 					g.Expect(active.Message).To(gomega.ContainSubstring("no access provider configured"))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Delete the referenced ClusterProfile", func() {
-				util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, cp1, true)
+				behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, cp1, true)
 			})
 
 			ginkgo.By("Wait for status to go back to 'not found'", func() {
@@ -985,7 +916,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					g.Expect(active.Status).To(gomega.Equal(metav1.ConditionFalse))
 					g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 					g.Expect(active.Message).To(gomega.ContainSubstring("not found"))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Re-create the referenced ClusterProfile", func() {
@@ -1003,7 +934,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					g.Expect(active.Status).To(gomega.Equal(metav1.ConditionFalse))
 					g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 					g.Expect(active.Message).To(gomega.ContainSubstring("no access provider configured"))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -1031,7 +962,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 						g.Expect(active.Status).To(gomega.Equal(metav1.ConditionFalse))
 						g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 						g.Expect(active.Message).To(gomega.ContainSubstring("not found"))
-					}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 				}
 			})
 
@@ -1052,7 +983,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 						g.Expect(active.Status).To(gomega.Equal(metav1.ConditionFalse))
 						g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 						g.Expect(active.Message).To(gomega.ContainSubstring("no access provider configured"))
-					}, util.Timeout, util.Interval).Should(gomega.Succeed())
+					}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 				}
 			})
 		})
@@ -1065,7 +996,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 			ginkgo.By("Create a non-system namespace", func() {
 				gomega.Expect(managerTestCluster.client.Create(managerTestCluster.ctx, otherNS)).To(gomega.Succeed())
 				ginkgo.DeferCleanup(func() {
-					gomega.Expect(util.DeleteNamespace(managerTestCluster.ctx, managerTestCluster.client, otherNS)).To(gomega.Succeed())
+					gomega.Expect(behavioral.DeleteNamespace(managerTestCluster.ctx, managerTestCluster.client, otherNS)).To(gomega.Succeed())
 				})
 			})
 
@@ -1084,7 +1015,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					g.Expect(active).NotTo(gomega.BeNil())
 					g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 					g.Expect(active.Message).To(gomega.ContainSubstring("not found"))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Create ClusterProfile with the same name in a different namespace", func() {
@@ -1100,7 +1031,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					g.Expect(active).NotTo(gomega.BeNil())
 					g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 					g.Expect(active.Message).To(gomega.ContainSubstring("not found"))
-				}, util.ConsistentDuration, util.ShortInterval).Should(gomega.Succeed())
+				}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Create ClusterProfile in the configured namespace", func() {
@@ -1117,7 +1048,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					g.Expect(active).NotTo(gomega.BeNil())
 					g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 					g.Expect(active.Message).To(gomega.ContainSubstring("no access provider configured"))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -1141,7 +1072,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					g.Expect(active).NotTo(gomega.BeNil())
 					g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 					g.Expect(active.Message).To(gomega.ContainSubstring("not found"))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Create cp1 and wait for 'no access provider configured'", func() {
@@ -1156,7 +1087,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					g.Expect(active).NotTo(gomega.BeNil())
 					g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 					g.Expect(active.Message).To(gomega.ContainSubstring("no access provider configured"))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Switch cluster to reference cp2 (missing) and wait for 'not found'", func() {
@@ -1166,7 +1097,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					mkc.Spec.ClusterSource.KubeConfig = nil
 					mkc.Spec.ClusterSource.ClusterProfileRef = &kueue.ClusterProfileReference{Name: cpName2}
 					g.Expect(managerTestCluster.client.Update(managerTestCluster.ctx, mkc)).To(gomega.Succeed())
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 
 				gomega.Eventually(func(g gomega.Gomega) {
 					mkc := &kueue.MultiKueueCluster{}
@@ -1176,7 +1107,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					g.Expect(active).NotTo(gomega.BeNil())
 					g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 					g.Expect(active.Message).To(gomega.ContainSubstring("not found"))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Create cp2 and wait for 'no access provider configured'", func() {
@@ -1191,7 +1122,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					g.Expect(active).NotTo(gomega.BeNil())
 					g.Expect(active.Reason).To(gomega.Equal("BadClusterProfile"))
 					g.Expect(active.Message).To(gomega.ContainSubstring("no access provider configured"))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 	})
@@ -1199,20 +1130,21 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 	ginkgo.When("Feature gate disabled", ginkgo.Ordered, func() {
 		var (
 			mkc *kueue.MultiKueueCluster
-			cp  *inventoryv1alpha1.ClusterProfile
+			cp  *inventoryv1alpha2.ClusterProfile
 		)
 
 		ginkgo.BeforeEach(func() {
-			managerTestCluster.fwk.StartManager(managerTestCluster.ctx, managerTestCluster.cfg, func(ctx context.Context, mgr manager.Manager) {
+			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.MultiKueueClusterProfile, false)
+
+			managerTestCluster.fwk.StartManagerForSpec(managerTestCluster.ctx, managerTestCluster.cfg, func(ctx context.Context, mgr manager.Manager) {
 				managerAndMultiKueueSetup(ctx, mgr, 2*time.Second, defaultEnabledIntegrations, config.MultiKueueDispatcherModeAllAtOnce)
 			})
 		})
 
 		ginkgo.AfterEach(func() {
-			util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, mkc, true)
-			util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, cp, true)
+			behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, mkc, true)
+			behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, cp, true)
 			mkc, cp = nil, nil
-			managerTestCluster.fwk.StopManager(managerTestCluster.ctx)
 		})
 
 		ginkgo.It("Should report feature gate disabled when ClusterProfileRef is set", func() {
@@ -1235,7 +1167,7 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					g.Expect(active.Status).To(gomega.Equal(metav1.ConditionFalse))
 					g.Expect(active.Reason).To(gomega.Equal("MultiKueueClusterProfileFeatureDisabled"))
 					g.Expect(active.Message).To(gomega.ContainSubstring("feature gate is disabled"))
-				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 
 			ginkgo.By("Creating a ClusterProfile should not make the cluster active (still feature disabled)", func() {
@@ -1248,7 +1180,174 @@ var _ = ginkgo.Describe("MultiKueue with ClusterProfile", ginkgo.Label("area:mul
 					active := apimeta.FindStatusCondition(mkc.Status.Conditions, kueue.MultiKueueClusterActive)
 					g.Expect(active).NotTo(gomega.BeNil())
 					g.Expect(active.Reason).To(gomega.Equal("MultiKueueClusterProfileFeatureDisabled"))
-				}, util.ConsistentDuration, util.ShortInterval).Should(gomega.Succeed())
+				}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
+			})
+		})
+	})
+
+	ginkgo.When("Feature gate enabled but ClusterProfile CRD not installed", ginkgo.Ordered, func() {
+		var (
+			cluster *kueue.MultiKueueCluster
+			secret  *corev1.Secret
+			cp      *inventoryv1alpha2.ClusterProfile
+		)
+
+		ginkgo.BeforeEach(func() {
+			// The flag must be set before multikueue.SetupIndexer so the ClusterProfile indexer is registered.
+			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.MultiKueueClusterProfile, true)
+
+			// Simulate a cluster where the ClusterProfile CRD is absent at startup: the
+			// feature gate is enabled, but WithClusterProfileCRDPresent(false) makes the
+			// controller skip the manager-cache ClusterProfile watch, so the manager still
+			// starts and kubeconfig-based clusters keep working. The watch is added once
+			// the ClusterProfile API is served.
+			managerTestCluster.fwk.StartManagerForSpec(managerTestCluster.ctx, managerTestCluster.cfg, func(ctx context.Context, mgr manager.Manager) {
+				managerAndMultiKueueSetup(ctx, mgr, 2*time.Second, defaultEnabledIntegrations, config.MultiKueueDispatcherModeAllAtOnce, multikueue.WithClusterProfileCRDPresent(false))
+			})
+		})
+
+		ginkgo.AfterEach(func() {
+			behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, cluster, true)
+			if secret != nil {
+				gomega.Expect(client.IgnoreNotFound(managerTestCluster.client.Delete(managerTestCluster.ctx, secret))).To(gomega.Succeed())
+			}
+			behavioral.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, cp, true)
+			cluster, secret, cp = nil, nil, nil
+		})
+
+		ginkgo.It("Should still connect a kubeconfig-based MultiKueueCluster", func() {
+			ginkgo.By("Create the worker kubeconfig secret", func() {
+				w1Kubeconfig, err := worker1TestCluster.kubeConfigBytes()
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				secret = utiltesting.MakeSecret("multikueue-crd-absent", managersConfigNamespace.Name).
+					Data(kueue.MultiKueueConfigSecretKey, w1Kubeconfig).Obj()
+				gomega.Expect(managerTestCluster.client.Create(managerTestCluster.ctx, secret)).To(gomega.Succeed())
+			})
+
+			ginkgo.By("Create a kubeconfig-based MultiKueueCluster", func() {
+				cluster = utiltestingapi.MakeMultiKueueCluster("worker-crd-absent").
+					KubeConfig(kueue.SecretLocationType, secret.Name).Obj()
+				gomega.Expect(managerTestCluster.client.Create(managerTestCluster.ctx, cluster)).To(gomega.Succeed())
+			})
+
+			ginkgo.By("Verify the cluster becomes active despite the ClusterProfile CRD being absent", func() {
+				clusterKey := client.ObjectKeyFromObject(cluster)
+				updatedCluster := kueue.MultiKueueCluster{}
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(managerTestCluster.client.Get(managerTestCluster.ctx, clusterKey, &updatedCluster)).To(gomega.Succeed())
+					g.Expect(updatedCluster.Status.Conditions).To(gomega.ContainElement(gomega.BeComparableTo(metav1.Condition{
+						Type:    kueue.MultiKueueClusterActive,
+						Status:  metav1.ConditionTrue,
+						Reason:  "Active",
+						Message: "Connected",
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration)))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+			})
+		})
+
+		// The ClusterProfile CRD is installed in this environment, so the API is already served
+		// when the manager starts and the ClusterProfile watch is added right away.
+		ginkgo.It("Should watch ClusterProfiles once the ClusterProfile API is served", func() {
+			ginkgo.By("Create a MultiKueueCluster with ClusterProfile", func() {
+				cluster = utiltestingapi.MakeMultiKueueCluster("cp-worker-late").ClusterProfile("cp-late").Obj()
+				gomega.Expect(managerTestCluster.client.Create(managerTestCluster.ctx, cluster)).To(gomega.Succeed())
+			})
+
+			clusterKey := client.ObjectKeyFromObject(cluster)
+			ginkgo.By("Verify the MultiKueueCluster reports the missing ClusterProfile", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					mkc := &kueue.MultiKueueCluster{}
+					g.Expect(managerTestCluster.client.Get(managerTestCluster.ctx, clusterKey, mkc)).To(gomega.Succeed())
+					g.Expect(apimeta.FindStatusCondition(mkc.Status.Conditions, kueue.MultiKueueClusterActive)).To(gomega.BeComparableTo(&metav1.Condition{
+						Type:    kueue.MultiKueueClusterActive,
+						Status:  metav1.ConditionFalse,
+						Reason:  "BadClusterProfile",
+						Message: "load client config failed: ClusterProfile.multicluster.x-k8s.io \"cp-late\" not found",
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Create the ClusterProfile", func() {
+				cp = utiltestingapi.MakeClusterProfile("cp-late", config.DefaultNamespace).Obj()
+				gomega.Expect(managerTestCluster.client.Create(managerTestCluster.ctx, cp)).To(gomega.Succeed())
+			})
+
+			ginkgo.By("Verify the ClusterProfile watch reconciles the MultiKueueCluster", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					mkc := &kueue.MultiKueueCluster{}
+					g.Expect(managerTestCluster.client.Get(managerTestCluster.ctx, clusterKey, mkc)).To(gomega.Succeed())
+					g.Expect(apimeta.FindStatusCondition(mkc.Status.Conditions, kueue.MultiKueueClusterActive)).To(gomega.BeComparableTo(&metav1.Condition{
+						Type:    kueue.MultiKueueClusterActive,
+						Status:  metav1.ConditionFalse,
+						Reason:  "BadClusterProfile",
+						Message: "load client config failed: no access provider configured",
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+			})
+		})
+	})
+
+	ginkgo.When("Feature gate enabled and ClusterProfile CRD installed after startup", func() {
+		ginkgo.It("Should watch ClusterProfiles once the ClusterProfile CRD is installed", func() {
+			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.MultiKueueClusterProfile, true)
+
+			// A dedicated control plane is used so that the ClusterProfile CRD can be
+			// installed while the manager runs without affecting the shared clusters.
+			lateCRDCluster := createClusterWithDepCRDs(nil, depCRDPathsWithoutClusterProfile)
+			ginkgo.DeferCleanup(lateCRDCluster.stopAndTeardown)
+			ctx, k8sClient := lateCRDCluster.ctx, lateCRDCluster.client
+			behavioral.MustCreate(ctx, k8sClient, utiltesting.MakeNamespace(managersConfigNamespace.Name))
+
+			lateCRDCluster.fwk.StartManager(ctx, lateCRDCluster.cfg, func(ctx context.Context, mgr manager.Manager) {
+				managerAndMultiKueueSetup(ctx, mgr, 2*time.Second, defaultEnabledIntegrations, config.MultiKueueDispatcherModeAllAtOnce, multikueue.WithClusterProfileCRDPresent(false))
+			})
+
+			var mkc *kueue.MultiKueueCluster
+			ginkgo.By("Create a MultiKueueCluster with ClusterProfile", func() {
+				mkc = utiltestingapi.MakeMultiKueueCluster("cp-worker-crd-late").ClusterProfile("cp-crd-late").Obj()
+				gomega.Expect(k8sClient.Create(ctx, mkc)).To(gomega.Succeed())
+			})
+
+			mkcKey := client.ObjectKeyFromObject(mkc)
+			ginkgo.By("Verify the MultiKueueCluster reports that the ClusterProfile API is not served", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					updated := &kueue.MultiKueueCluster{}
+					g.Expect(k8sClient.Get(ctx, mkcKey, updated)).To(gomega.Succeed())
+					g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, kueue.MultiKueueClusterActive)).To(gomega.BeComparableTo(&metav1.Condition{
+						Type:    kueue.MultiKueueClusterActive,
+						Status:  metav1.ConditionFalse,
+						Reason:  "BadClusterProfile",
+						Message: "load client config failed: the ClusterProfile API is not served",
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration))
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Install the ClusterProfile CRD", func() {
+				_, err := envtest.InstallCRDs(lateCRDCluster.cfg, envtest.CRDInstallOptions{
+					Paths:              []string{behavioral.ClusterProfileCrds},
+					ErrorIfPathMissing: true,
+				})
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			})
+
+			ginkgo.By("Create the ClusterProfile", func() {
+				cp := utiltestingapi.MakeClusterProfile("cp-crd-late", managersConfigNamespace.Name).Obj()
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(k8sClient.Create(ctx, cp)).To(gomega.Succeed())
+				}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Verify the ClusterProfile watch reconciles the MultiKueueCluster", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					updated := &kueue.MultiKueueCluster{}
+					g.Expect(k8sClient.Get(ctx, mkcKey, updated)).To(gomega.Succeed())
+					g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, kueue.MultiKueueClusterActive)).To(gomega.BeComparableTo(&metav1.Condition{
+						Type:    kueue.MultiKueueClusterActive,
+						Status:  metav1.ConditionFalse,
+						Reason:  "BadClusterProfile",
+						Message: "load client config failed: no access provider configured",
+					}, behavioral.IgnoreConditionTimestampsAndObservedGeneration))
+				}, behavioral.LongTimeout, behavioral.Interval).Should(gomega.Succeed())
 			})
 		})
 	})
@@ -1295,23 +1394,19 @@ func (c *interceptedCache) hasWatch(kind string) bool {
 	return c.requestedWatches.Has(kind)
 }
 
-var _ = ginkgo.Describe("Manager quota automation feature gate", ginkgo.Label("area:multikueue", "feature:multikueue"), ginkgo.Ordered, ginkgo.ContinueOnFailure, func() {
+var _ = ginkgo.Describe("MultiKueue CapacityProvider feature gate", ginkgo.Label("area:multikueue", "feature:multikueue"), ginkgo.Ordered, ginkgo.ContinueOnFailure, func() {
 	const cqTypeName = "*v1beta2.ClusterQueue"
-
-	ginkgo.AfterEach(func() {
-		managerTestCluster.fwk.StopManager(managerTestCluster.ctx)
-	})
 
 	ginkgo.When("Feature gate disabled", func() {
 		ginkgo.It("Should not watch manager-side ClusterQueues", func() {
-			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.MultiKueueManagerQuotaAutomation, false)
+			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.DQOMultiKueueCapacityProvider, false)
 
 			ic, newCacheFunc := newInterceptedCache()
-			managerTestCluster.fwk.StartManager(managerTestCluster.ctx, managerTestCluster.cfg, func(ctx context.Context, mgr manager.Manager) {
+			managerTestCluster.fwk.StartManagerForSpec(managerTestCluster.ctx, managerTestCluster.cfg, func(ctx context.Context, mgr manager.Manager) {
 				err := multikueue.SetupIndexer(ctx, mgr.GetFieldIndexer(), managersConfigNamespace.Name)
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
-				adapters, err := jobframework.GetMultiKueueAdapters(defaultEnabledIntegrations)
+				adapters, err := jobcontrollers.NewIntegrationManager().GetMultiKueueAdapters(defaultEnabledIntegrations)
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 				err = multikueue.SetupControllers(mgr, managersConfigNamespace.Name,
@@ -1329,26 +1424,25 @@ var _ = ginkgo.Describe("Manager quota automation feature gate", ginkgo.Label("a
 
 			gomega.Consistently(func(g gomega.Gomega) {
 				g.Expect(ic.hasWatch(cqTypeName)).To(gomega.BeFalse())
-			}, util.ConsistentDuration, util.ShortInterval).Should(gomega.Succeed())
+			}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
 		})
 	})
 
-	// This test does not test any user-observable effects
-	// (for this, we have other test cases above).
+	// This test does not test any user-observable effects.
 	// Its purpose is just to verify that `cqTypeName` is indeed the value
 	// which should be checked in the "FG disabled" case just above.
 	ginkgo.When("Feature gate enabled", func() {
 		ginkgo.It("Should watch manager-side ClusterQueues", func() {
-			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.MultiKueueManagerQuotaAutomation, true)
+			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.DQOMultiKueueCapacityProvider, true)
 
 			ic, newCacheFunc := newInterceptedCache()
-			managerTestCluster.fwk.StartManager(managerTestCluster.ctx, managerTestCluster.cfg, func(ctx context.Context, mgr manager.Manager) {
+			managerTestCluster.fwk.StartManagerForSpec(managerTestCluster.ctx, managerTestCluster.cfg, func(ctx context.Context, mgr manager.Manager) {
 				managerSetup(ctx, mgr)
 
 				err := multikueue.SetupIndexer(ctx, mgr.GetFieldIndexer(), managersConfigNamespace.Name)
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
-				adapters, err := jobframework.GetMultiKueueAdapters(defaultEnabledIntegrations)
+				adapters, err := jobcontrollers.NewIntegrationManager().GetMultiKueueAdapters(defaultEnabledIntegrations)
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 				err = multikueue.SetupControllers(mgr, managersConfigNamespace.Name,
@@ -1366,7 +1460,7 @@ var _ = ginkgo.Describe("Manager quota automation feature gate", ginkgo.Label("a
 
 			gomega.Eventually(func(g gomega.Gomega) {
 				g.Expect(ic.hasWatch(cqTypeName)).To(gomega.BeTrue())
-			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 		})
 	})
 })

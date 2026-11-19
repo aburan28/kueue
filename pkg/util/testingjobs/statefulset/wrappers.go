@@ -47,11 +47,9 @@ func MakeStatefulSet(name, ns string) *StatefulSetWrapper {
 		labelValue = fmt.Sprintf("%s-pod", name)
 	}
 	return &StatefulSetWrapper{appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Namespace:   ns,
-			Annotations: make(map[string]string, 1),
-		},
+		Name:        name,
+		Namespace:   ns,
+		Annotations: make(map[string]string, 1),
 		Spec: appsv1.StatefulSetSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
@@ -260,9 +258,27 @@ func (ss *StatefulSetWrapper) RequestAndLimit(r corev1.ResourceName, v string) *
 	return ss.Request(r, v).Limit(r, v)
 }
 
+// VolumeMount adds a volume mount to the default container.
+func (ss *StatefulSetWrapper) VolumeMount(m corev1.VolumeMount) *StatefulSetWrapper {
+	ss.Spec.Template.Spec.Containers[0].VolumeMounts = append(ss.Spec.Template.Spec.Containers[0].VolumeMounts, m)
+	return ss
+}
+
+// VolumeClaimTemplate adds a volume claim template.
+func (ss *StatefulSetWrapper) VolumeClaimTemplate(pvc corev1.PersistentVolumeClaim) *StatefulSetWrapper {
+	ss.Spec.VolumeClaimTemplates = append(ss.Spec.VolumeClaimTemplates, pvc)
+	return ss
+}
+
 // TerminationGracePeriod sets terminationGracePeriodSeconds for the pod object
 func (ss *StatefulSetWrapper) TerminationGracePeriod(seconds int64) *StatefulSetWrapper {
 	ss.Spec.Template.Spec.TerminationGracePeriodSeconds = &seconds
+	return ss
+}
+
+// ReadinessProbe sets the readiness probe of the default container.
+func (ss *StatefulSetWrapper) ReadinessProbe(probe *corev1.Probe) *StatefulSetWrapper {
+	ss.Spec.Template.Spec.Containers[0].ReadinessProbe = probe
 	return ss
 }
 

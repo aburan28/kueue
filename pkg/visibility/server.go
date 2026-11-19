@@ -43,9 +43,9 @@ import (
 
 	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	generatedopenapi "sigs.k8s.io/kueue/apis/visibility/openapi"
-	visibilityv1beta1 "sigs.k8s.io/kueue/apis/visibility/v1beta1"
 	visibilityv1beta2 "sigs.k8s.io/kueue/apis/visibility/v1beta2"
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
+	"sigs.k8s.io/kueue/pkg/util/cert"
 	"sigs.k8s.io/kueue/pkg/util/tlsconfig"
 	"sigs.k8s.io/kueue/pkg/visibility/storage"
 
@@ -65,12 +65,14 @@ var (
 		validatingwebhook.PluginName,
 		mutatingwebhook.PluginName,
 	}
-	certDir = "/visibility"
+	certDir = cert.VisibilityCertDir
+	// externalCertDir is where InternalCertManagement documents mounting a third
+	// party certificate when internal cert management is disabled.
+	externalCertDir = "/visibility"
 )
 
 func init() {
 	utilruntime.Must(visibilityv1beta2.AddToScheme(scheme))
-	utilruntime.Must(visibilityv1beta1.AddToScheme(scheme))
 	metav1.AddToGroupVersion(scheme, schema.GroupVersion{Version: "v1"})
 }
 
@@ -104,16 +106,14 @@ func CreateAndStartVisibilityServer(ctx context.Context, kueueMgr *qcache.Manage
 func createVisibilityServerOptions(cfg *configapi.Configuration) *genericoptions.RecommendedOptions {
 	o := genericoptions.NewRecommendedOptions("", codecs.LegacyCodec(
 		visibilityv1beta2.SchemeGroupVersion,
-		visibilityv1beta1.SchemeGroupVersion,
 	))
 	o.Etcd = nil
+	dir := externalCertDir
 	if cfg.InternalCertManagement != nil && *cfg.InternalCertManagement.Enable {
-		// The directory where TLS certs will be created
-		o.SecureServing.ServerCert.CertDirectory = certDir
-	} else {
-		o.SecureServing.ServerCert.CertKey.CertFile = certDir + "/tls.crt"
-		o.SecureServing.ServerCert.CertKey.KeyFile = certDir + "/tls.key"
+		dir = certDir
 	}
+	o.SecureServing.ServerCert.CertKey.CertFile = dir + "/tls.crt"
+	o.SecureServing.ServerCert.CertKey.KeyFile = dir + "/tls.key"
 
 	applyVisibilityServerSecureServingOptions(o.SecureServing, cfg)
 
@@ -130,10 +130,6 @@ func createVisibilityServerOptions(cfg *configapi.Configuration) *genericoptions
 
 func applyVisibilityServerOptions(config *genericapiserver.RecommendedConfig, cfg *configapi.Configuration, tlsOpts *tlsconfig.TLS) error {
 	o := createVisibilityServerOptions(cfg)
-
-	if err := o.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{net.ParseIP("127.0.0.1")}); err != nil {
-		return fmt.Errorf("error creating self-signed certificates: %v", err)
-	}
 
 	if err := o.ApplyTo(config); err != nil {
 		return err
@@ -166,7 +162,7 @@ func applyVisibilityServerSecureServingOptions(o *genericoptions.SecureServingOp
 func newVisibilityServerConfig(kubeConfig *rest.Config) *genericapiserver.RecommendedConfig {
 	c := genericapiserver.NewRecommendedConfig(codecs)
 	versionInfo := version.Get()
-	version := strings.Split(versionInfo.String(), "-")[0]
+	version, _, _ := strings.Cut(versionInfo.String(), "-")
 	// enable OpenAPI schemas
 	c.EffectiveVersion = compatibility.NewEffectiveVersionFromString(version, "", "")
 	c.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(generatedopenapi.GetOpenAPIDefinitions, openapinamer.NewDefinitionNamer(scheme))
@@ -187,7 +183,6 @@ func install(server *genericapiserver.GenericAPIServer, kueueMgr *qcache.Manager
 	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(visibilityv1beta2.SchemeGroupVersion.Group, scheme, parameterCodec, codecs)
 	storage := storage.NewStorage(kueueMgr)
 	apiGroupInfo.VersionedResourcesStorageMap[visibilityv1beta2.SchemeGroupVersion.Version] = storage
-	apiGroupInfo.VersionedResourcesStorageMap[visibilityv1beta1.SchemeGroupVersion.Version] = storage
-	apiGroupInfo.PrioritizedVersions = []schema.GroupVersion{visibilityv1beta2.SchemeGroupVersion, visibilityv1beta1.SchemeGroupVersion}
+	apiGroupInfo.PrioritizedVersions = []schema.GroupVersion{visibilityv1beta2.SchemeGroupVersion}
 	return server.InstallAPIGroups(&apiGroupInfo)
 }

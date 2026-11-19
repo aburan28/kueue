@@ -15,6 +15,8 @@ The file is auto-generated from the Go source code of the component using the
 
 Lists Workloads that match the provided criteria.
 
+KUEUECTL_LIST_REQUEST_LIMIT sets how many objects kueuectl fetches from the Kubernetes API per request. It does not limit the output: all matching objects are listed. The default is 100; 0 fetches all objects in a single request.
+
 ```
 kueuectl list workload [--clusterqueue CLUSTER_QUEUE_NAME] [--localqueue LOCAL_QUEUE_NAME] [--status STATUS] [--selector key1=value1] [--field-selector key1=value1] [--all-namespaces] [--for TYPE[.API-GROUP]/NAME]
 ```
@@ -133,7 +135,7 @@ kueuectl list workload [--clusterqueue CLUSTER_QUEUE_NAME] [--localqueue LOCAL_Q
     <tr>
         <td></td>
         <td style="line-height: 130%; word-wrap: break-word;">
-            <p>Filter workloads by status. Must be &#34;all&#34;, &#34;pending&#34;, &#34;admitted&#34; or &#34;finished&#34;</p>
+            <p>Filter workloads by status. Must be &#34;all&#34;, &#34;pending&#34;, &#34;quotareserved&#34;, &#34;admitted&#34; or &#34;finished&#34;</p>
         </td>
     </tr>
     <tr>
@@ -281,6 +283,15 @@ kueuectl list workload [--clusterqueue CLUSTER_QUEUE_NAME] [--localqueue LOCAL_Q
         <td></td>
         <td style="line-height: 130%; word-wrap: break-word;">
             <p>If present, the namespace scope for this CLI request</p>
+        </td>
+    </tr>
+    <tr>
+        <td colspan="2">--proxy-url string</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td style="line-height: 130%; word-wrap: break-word;">
+            <p>Proxy URL to use for requests to the API server</p>
         </td>
     </tr>
     <tr>

@@ -93,7 +93,7 @@ and passing the readiness probe) within the specified time. If the timeout
 is exceeded, then the workload is evicted.</p>
 </td>
 </tr>
-<tr><td><code>clientConnection</code> <B>[Required]</B><br/>
+<tr><td><code>clientConnection</code><br/>
 <a href="#config-kueue-x-k8s-io-v1beta2-ClientConnection"><code>ClientConnection</code></a>
 </td>
 <td>
@@ -221,20 +221,22 @@ Defaults to 1.</p>
 <tbody>
     
   
-<tr><td><code>qps</code> <B>[Required]</B><br/>
+<tr><td><code>qps</code><br/>
 <code>float32</code>
 </td>
 <td>
    <p>QPS controls the number of queries per second allowed for K8S api server
 connection.</p>
-<p>Setting this to a negative value will disable client-side ratelimiting.</p>
+<p>Setting this to a negative value will disable client-side ratelimiting.
+Zero is not allowed. Defaults to 1000.</p>
 </td>
 </tr>
-<tr><td><code>burst</code> <B>[Required]</B><br/>
+<tr><td><code>burst</code><br/>
 <code>int32</code>
 </td>
 <td>
-   <p>Burst allows extra queries to accumulate when a client is exceeding its rate.</p>
+   <p>Burst allows extra queries to accumulate when a client is exceeding its rate.
+Must be greater than 0 unless QPS is negative. Defaults to 1000.</p>
 </td>
 </tr>
 </tbody>
@@ -265,7 +267,7 @@ using the ClusterProfile API.</p>
 </td>
 </tr>
 <tr><td><code>credentialsProviders</code><br/>
-<a href="#config-kueue-x-k8s-io-v1beta2-ClusterProfileAccessProvider"><code>[]ClusterProfileAccessProvider</code></a>
+<a href="#config-kueue-x-k8s-io-v1beta2-ClusterProfileCredentialsProvider"><code>[]ClusterProfileCredentialsProvider</code></a>
 </td>
 <td>
    <p>CredentialsProviders defines a list of providers to obtain credentials of worker clusters
@@ -309,6 +311,19 @@ are mutually exclusive.</p>
 </tr>
 </tbody>
 </table>
+
+## `ClusterProfileCredentialsProvider`     {#config-kueue-x-k8s-io-v1beta2-ClusterProfileCredentialsProvider}
+    
+
+**Appears in:**
+
+- [ClusterProfile](#config-kueue-x-k8s-io-v1beta2-ClusterProfile)
+
+
+<p>ClusterProfileAccessProvider defines an access provider in the ClusterProfile API.</p>
+
+
+
 
 ## `ControllerConfigurationSpec`     {#config-kueue-x-k8s-io-v1beta2-ControllerConfigurationSpec}
     
@@ -483,6 +498,21 @@ registered within this manager.</p>
 <tbody>
     
   
+<tr><td><code>accessControlMode</code><br/>
+<a href="#config-kueue-x-k8s-io-v1beta2-MetricsAccessControlMode"><code>MetricsAccessControlMode</code></a>
+</td>
+<td>
+   <p>AccessControlMode selects how the metrics listener authenticates and authorizes requests.
+Requires the MetricsAccessControl feature gate.
+Possible values are:</p>
+<ul>
+<li>Delegated: each request needs a bearer token that passes TokenReview and SubjectAccessReview.</li>
+<li>None: no authentication or authorization. For enabled metrics, requires the
+loopback IP and port in bindAddress.
+Defaults to Delegated when the feature gate is enabled.</li>
+</ul>
+</td>
+</tr>
 <tr><td><code>bindAddress</code><br/>
 <code>string</code>
 </td>
@@ -639,6 +669,55 @@ must be named tls.key and tls.crt, respectively.</p>
 </tbody>
 </table>
 
+## `DeviceClassCapacitySource`     {#config-kueue-x-k8s-io-v1beta2-DeviceClassCapacitySource}
+    
+
+**Appears in:**
+
+- [DeviceClassSourceConfig](#config-kueue-x-k8s-io-v1beta2-DeviceClassSourceConfig)
+
+
+<p>DeviceClassCapacitySource configures capacity-based quota tracking
+for devices that allow multiple allocations (KEP-5075).</p>
+
+
+<table class="table">
+<thead><tr><th width="30%">Field</th><th>Description</th></tr></thead>
+<tbody>
+    
+  
+<tr><td><code>name</code> <B>[Required]</B><br/>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#qualifiedname-v1-resource"><code>k8s.io/api/resource/v1.QualifiedName</code></a>
+</td>
+<td>
+   <p>Name identifies the capacity dimension to track for quota
+(e.g., &quot;gpu.example.com/memory&quot;).
+Must be a valid DRA QualifiedName.</p>
+</td>
+</tr>
+<tr><td><code>driver</code> <B>[Required]</B><br/>
+<code>string</code>
+</td>
+<td>
+   <p>Driver is the DRA driver name used to filter relevant ResourceSlices.
+Must match the spec.driver field on ResourceSlice objects.
+Must not exceed 63 characters.</p>
+</td>
+</tr>
+<tr><td><code>deviceSelector</code> <B>[Required]</B><br/>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#deviceselector-v1-resource"><code>k8s.io/api/resource/v1.DeviceSelector</code></a>
+</td>
+<td>
+   <p>DeviceSelector scopes which devices are eligible for quota accounting.
+Matches devices whose capacity dimensions should be tracked against
+the quota pool.
+The selector is compiled at config load time using the upstream dracel
+compiler.</p>
+</td>
+</tr>
+</tbody>
+</table>
+
 ## `DeviceClassCounterSource`     {#config-kueue-x-k8s-io-v1beta2-DeviceClassCounterSource}
     
 
@@ -660,8 +739,8 @@ must be named tls.key and tls.crt, respectively.</p>
 </td>
 <td>
    <p>Name is the counter name within the device's consumesCounters
-entries to track for quota. Must match a counter name published by
-the driver in ResourceSlice devices' consumesCounters field.
+entries to track for quota. Must be a DNS label and match a counter
+name published by the driver in ResourceSlice devices' consumesCounters field.
 Counter set names are per-device identifiers (e.g., gpu-0-counter-set,
 gpu-1-counter-set), so name matches across all counter sets
 for a given driver without requiring one mapping per device.
@@ -673,8 +752,8 @@ The total length must not exceed 63 characters.</p>
 </td>
 <td>
    <p>Driver is the DRA driver name used to filter relevant ResourceSlices.
-Must match the spec.driver field on ResourceSlice objects.
-The total length must not exceed 253 characters.</p>
+Must be a lowercase DNS subdomain and match the spec.driver field on ResourceSlice objects.
+The total length must not exceed 63 characters.</p>
 </td>
 </tr>
 <tr><td><code>deviceSelector</code> <B>[Required]</B><br/>
@@ -720,7 +799,13 @@ followed by a slash and a DNS label, or just a DNS label.
 DNS labels consist of lower-case alphanumeric characters or hyphens,
 and must start and end with an alphanumeric character.
 DNS subdomain prefixes follow the same rules as DNS labels but can contain periods.
-The total length must not exceed 253 characters.</p>
+The total length must not exceed 253 characters.
+With KueueDRAIntegration enabled it must not be <code>pods</code>; that exact name is
+reserved for Kueue's internal Pod-count accounting. A qualified name such
+as <code>example.com/pods</code> is allowed.
+Disabling the ReservedResourceNameValidation feature gate lets such a
+configuration load for an upgrade; flavor assignment still overwrites the
+key with the PodSet count.</p>
 </td>
 </tr>
 <tr><td><code>deviceClassNames</code> <B>[Required]</B><br/>
@@ -742,10 +827,10 @@ The total length of each name must not exceed 253 characters.</p>
 <td>
    <p>Sources configures resource accounting sources for this mapping.
 Each source defines how quota is tracked for this DeviceClass.
-Currently only counter sources are supported (for partitionable devices).
 Extended resource requests that resolve to a DeviceClass with sources
 configured are marked inadmissible.
-Requires the KueueDRAIntegrationPartitionableDevices feature gate.</p>
+Counter sources require KueueDRAIntegrationPartitionableDevices (enabled by default since v0.19).
+Capacity sources require KueueDRAIntegrationConsumableCapacity.</p>
 </td>
 </tr>
 </tbody>
@@ -760,7 +845,7 @@ Requires the KueueDRAIntegrationPartitionableDevices feature gate.</p>
 
 
 <p>DeviceClassSourceConfig defines a resource accounting source for a DeviceClassMapping.
-Exactly one of the source types must be set.</p>
+Exactly one of the source types must be set per entry.</p>
 
 
 <table class="table">
@@ -774,6 +859,16 @@ Exactly one of the source types must be set.</p>
 <td>
    <p>Counter configures counter-based quota for partitionable devices.
 Maps a DRA driver counter to the parent DeviceClassMapping's Kueue quota resource.</p>
+</td>
+</tr>
+<tr><td><code>capacity</code><br/>
+<a href="#config-kueue-x-k8s-io-v1beta2-DeviceClassCapacitySource"><code>DeviceClassCapacitySource</code></a>
+</td>
+<td>
+   <p>Capacity configures capacity-based quota for devices that allow
+multiple allocations (consumable capacity, KEP-5075).
+Maps a device capacity dimension to the parent DeviceClassMapping's Kueue quota resource.
+Requires the KueueDRAIntegrationConsumableCapacity feature gate.</p>
 </td>
 </tr>
 </tbody>
@@ -800,20 +895,35 @@ Maps a DRA driver counter to the parent DeviceClassMapping's Kueue quota resourc
    <p>preemptionStrategies indicates which constraints should a preemption satisfy.
 The preemption algorithm will only use the next strategy in the list if the
 incoming workload (preemptor) doesn't fit after using the previous strategies.
+AlmostLCA(x, y) is the last but one node on the path from x to the
+lowest common ancestor of x and y in the cohort hierarchy (see KEP-1714).
+The strategies compare the shares of AlmostLCA(preemptor, preemptee) and
+AlmostLCA(preemptee, preemptor). These are the shares of ClusterQueues themselves
+only when both ClusterQueues share the same parent Cohort.
 Possible values are:</p>
 <ul>
-<li>LessThanOrEqualToFinalShare: Only preempt a workload if the share of the preemptor CQ
-with the preemptor workload is less than or equal to the share of the preemptee CQ
+<li>LessThanOrEqualToFinalShare: Only preempt a workload if the share of
+AlmostLCA(preemptor, preemptee) with the preemptor workload admitted is
+less than or equal to the share of AlmostLCA(preemptee, preemptor)
 without the workload to be preempted.
 This strategy might favor preemption of smaller workloads in the preemptee CQ,
-regardless of priority or start time, in an effort to keep the share of the CQ
+regardless of priority or start time, in an effort to keep the share of AlmostLCA(preemptee, preemptor)
 as high as possible.</li>
-<li>LessThanInitialShare: Only preempt a workload if the share of the preemptor CQ
-with the incoming workload is strictly less than the share of the preemptee CQ.
+<li>LessThanInitialShare: Only preempt a workload if the share of
+AlmostLCA(preemptor, preemptee) with the preemptor workload admitted is
+strictly less than the share of AlmostLCA(preemptee, preemptor) with the
+workload to be preempted.
 This strategy doesn't depend on the share usage of the workload being preempted.
 As a result, the strategy chooses to preempt workloads with the lowest priority and
 newest start time first.</li>
 </ul>
+<p>Only the following lists are supported:</p>
+<ul>
+<li>[&quot;LessThanOrEqualToFinalShare&quot;]</li>
+<li>[&quot;LessThanInitialShare&quot;]</li>
+<li>[&quot;LessThanOrEqualToFinalShare&quot;, &quot;LessThanInitialShare&quot;]</li>
+</ul>
+<p>Any other combination or ordering fails configuration validation.</p>
 </td>
 </tr>
 </tbody>
@@ -909,7 +1019,10 @@ of creating a workload from a composable job (pod group), if multiple objects
 have labels with some key from the list, the values of these labels must
 match or otherwise the workload creation would fail. The labels are copied only
 during the workload creation and are not updated even if the labels of the
-underlying job are changed.</p>
+underlying job are changed.
+Kueue never copies its internal labels kueue.x-k8s.io/multikueue-origin,
+kueue.x-k8s.io/concurrent-admission-parent and kueue.x-k8s.io/job-uid from
+the job.</p>
 </td>
 </tr>
 </tbody>
@@ -998,6 +1111,20 @@ If left empty, then metrics will expose for all local queues across namespaces.<
 </tr>
 </tbody>
 </table>
+
+## `MetricsAccessControlMode`     {#config-kueue-x-k8s-io-v1beta2-MetricsAccessControlMode}
+    
+(Alias of `string`)
+
+**Appears in:**
+
+- [ControllerMetrics](#config-kueue-x-k8s-io-v1beta2-ControllerMetrics)
+
+
+<p>MetricsAccessControlMode specifies how access to the metrics listener is controlled.</p>
+
+
+
 
 ## `MultiKueue`     {#config-kueue-x-k8s-io-v1beta2-MultiKueue}
     
@@ -1257,7 +1384,12 @@ re-queuing an evicted workload.</p>
 <a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#resourcename-v1-core"><code>k8s.io/api/core/v1.ResourceName</code></a>
 </td>
 <td>
-   <p>Input is the name of the input resource.</p>
+   <p>Input is the name of the input resource.
+It must not be <code>pods</code>; that exact name is reserved for Kueue's internal
+Pod-count accounting. A qualified name such as <code>example.com/pods</code> is allowed.
+Disabling the ReservedResourceNameValidation feature gate lets such a
+configuration load for an upgrade; flavor assignment still overwrites the
+key with the PodSet count.</p>
 </td>
 </tr>
 <tr><td><code>strategy</code> <B>[Required]</B><br/>
@@ -1275,7 +1407,14 @@ Defaults to Retain</p>
    <p>MultiplyBy indicates the resource name requested by a workload, if
 specified.
 The requested amount of the resource is used to multiply the requested
-amount of the resource indicated by the &quot;input&quot; field.</p>
+amount of the resource indicated by the &quot;input&quot; field when computing
+&quot;outputs&quot;. It does not change the quantity retained under &quot;input&quot; when
+&quot;strategy&quot; is Retain.
+It must not be <code>pods</code>; that exact name is reserved for Kueue's internal
+Pod-count accounting. A qualified name such as <code>example.com/pods</code> is allowed.
+Disabling the ReservedResourceNameValidation feature gate lets such a
+configuration load for an upgrade; flavor assignment still overwrites the
+key with the PodSet count.</p>
 </td>
 </tr>
 <tr><td><code>outputs</code> <B>[Required]</B><br/>
@@ -1283,6 +1422,12 @@ amount of the resource indicated by the &quot;input&quot; field.</p>
 </td>
 <td>
    <p>Outputs specifies the output resources and quantities per unit of input resource.
+An output resource name must not be <code>pods</code>; that exact name is reserved for
+Kueue's internal Pod-count accounting. A qualified name such as
+<code>example.com/pods</code> is allowed.
+Disabling the ReservedResourceNameValidation feature gate lets such a
+configuration load for an upgrade; flavor assignment still overwrites the
+key with the PodSet count.
 An empty Outputs combined with a <code>Replace</code> Strategy causes the Input resource to be ignored by Kueue.</p>
 </td>
 </tr>
@@ -1343,6 +1488,23 @@ This is intended to be a map with Input as the key (enforced by validation code)
 <td>
    <p>DeviceClassMappings defines mappings from device classes to logical resources
 for Dynamic Resource Allocation support.</p>
+</td>
+</tr>
+<tr><td><code>excludeDeviceClassNames</code><br/>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#resourcename-v1-core"><code>[]k8s.io/api/core/v1.ResourceName</code></a>
+</td>
+<td>
+   <p>ExcludeDeviceClassNames lists DeviceClasses that Kueue does not charge quota for,
+such as companion devices taken next to accelerators that are charged another way.
+Kueue does not reject a ResourceClaimTemplate request for a listed DeviceClass because
+of its allocation mode or a missing mapping, unless it is one alternative of a
+firstAvailable request that also names an unlisted DeviceClass. While the
+KueueDRAIntegrationExtendedResource feature gate is enabled, Kueue does not charge
+requests for an extended resource backed by a listed DeviceClass either.
+A DeviceClass listed here must not appear in DeviceClassMappings.
+Each name follows the rules of DeviceClassMapping.DeviceClassNames.
+At most 16 names are allowed.
+Requires the KueueDRAExcludeDeviceClasses feature gate.</p>
 </td>
 </tr>
 </tbody>
@@ -1472,8 +1634,9 @@ evicted and requeued in the same cluster queue.</p>
 <code>bool</code>
 </td>
 <td>
-   <p>BlockAdmission when true, the cluster queue will block admissions for all
-subsequent jobs until the jobs reach the PodsReady=true condition.
+   <p>BlockAdmission when true, Kueue blocks admission of all workloads across
+all ClusterQueues until every previously-admitted workload reaches the
+PodsReady=true condition.
 Defaults to false.</p>
 </td>
 </tr>
@@ -1495,6 +1658,35 @@ is awaited to be scheduled.
 After exceeding the timeout the corresponding job gets suspended again
 and requeued after the backoff delay.
 Defaults to the value of timeout. Setting to &quot;0s&quot; disables recovery timeout checking.</p>
+</td>
+</tr>
+<tr><td><code>unscheduledTimeout</code><br/>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#duration-v1-meta"><code>k8s.io/apimachinery/pkg/apis/meta/v1.Duration</code></a>
+</td>
+<td>
+   <p>UnscheduledTimeout defines a timeout, measured since the transition to the
+Admitted=True condition, for all the Pods required by the admission to be
+scheduled or to have succeeded. The deadline never exceeds timeout since
+admission. Exceeding it evicts the Workload with the PodsReadyTimeout reason
+and requeues it after the backoff delay.
+A current-admission PodsScheduled=False observation is required for eviction;
+a late observation does not restart the timeout.
+Must be non-negative and must not exceed timeout. When unset or &quot;0s&quot;, scheduling
+tracking, readiness propagation, scheduling timeouts and scheduling-history resets are disabled.
+Requires the WaitForPodsReadyUnscheduledTimeout feature gate, even for &quot;0s&quot;.
+Enabling this gate together with DisableWaitForPodsReady is rejected.</p>
+</td>
+</tr>
+<tr><td><code>maxTimeoutOnWorkload</code><br/>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#duration-v1-meta"><code>k8s.io/apimachinery/pkg/apis/meta/v1.Duration</code></a>
+</td>
+<td>
+   <p>MaxTimeoutOnWorkload defines the upper bound allowed for a per-workload
+PodsReady timeoutSeconds and recoveryTimeoutSeconds override (set via the <code>kueue.x-k8s.io/wait-for-pods-ready</code>
+annotation). If a workload requests a timeoutSeconds or recoveryTimeoutSeconds greater than
+MaxTimeoutOnWorkload, the job is rejected by the admission webhook.
+When unset, the default maximum of 2 hours is enforced.
+It has no effect on workloads that don't set a per-workload override.</p>
 </td>
 </tr>
 </tbody>

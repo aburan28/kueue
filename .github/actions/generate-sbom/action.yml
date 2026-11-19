@@ -1,0 +1,35 @@
+name: Generate SBOM
+description: Generates an SPDX SBOM and uploads it to the GitHub release.
+
+inputs:
+  tag:
+    description: Release tag (e.g. v0.20.0)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Determine Go minor version
+      id: go-minor
+      shell: bash
+      run: echo "minor=$(awk '/^go /{split($2, v, "."); print v[1] "." v[2]; exit}' go.mod)" >> "$GITHUB_OUTPUT"
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '${{ steps.go-minor.outputs.minor }}.x'
+        check-latest: true
+        cache: true
+    - name: Install bom
+      uses: kubernetes-sigs/release-actions/setup-bom@3f8e1ebff5c0bf20a49a2a63d53feb12195548ab # main
+      with:
+        bom-release: '0.7.1'
+    - name: Generate SBOM
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+      run: bom generate --format=json -o "/tmp/kueue-$TAG.spdx.json" .
+    - name: Upload SBOM
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        TAG: ${{ inputs.tag }}
+      run: gh release upload "$TAG" "/tmp/kueue-$TAG.spdx.json"

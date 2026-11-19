@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/kueue/pkg/features"
+	utilstrings "sigs.k8s.io/kueue/pkg/util/strings"
 )
 
 const (
@@ -53,14 +54,6 @@ func maxPrefixLength() int {
 	return maxWorkloadNameLength() - 1 - hashLength
 }
 
-// truncate returns the first n characters of a string.
-func truncate(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
-}
-
 func GetWorkloadNameForOwnerWithGVK(ownerName string, ownerUID types.UID, ownerGVK schema.GroupVersionKind) string {
 	return GenerateWorkloadNameWithExtra(ownerName, ownerUID, ownerGVK, "")
 }
@@ -74,7 +67,7 @@ func GetWorkloadNameForVariant(parentName string, ownerUID types.UID, ownerGVK s
 }
 
 func GenerateWorkloadNamePrefix(ownerName string, ownerUID types.UID, ownerGVK schema.GroupVersionKind) string {
-	return truncate(strings.ToLower(ownerGVK.Kind)+"-"+ownerName, maxPrefixLength())
+	return utilstrings.TruncateNamePrefix(strings.ToLower(ownerGVK.Kind)+"-"+ownerName, maxPrefixLength())
 }
 
 func GetWorkloadNameForOwnerWithGVKAndGeneration(ownerName string, ownerUID types.UID, ownerGVK schema.GroupVersionKind, generation int64) string {
@@ -90,15 +83,20 @@ func GenerateWorkloadNameWithExtra(ownerName string, ownerUID types.UID, ownerGV
 func generateWorkloadNameWithHash(prefix string, ownerName string, ownerUID types.UID, ownerGVK schema.GroupVersionKind, extra string) string {
 	return fmt.Sprintf(
 		"%s-%s",
-		truncate(prefix, maxPrefixLength()),
+		utilstrings.TruncateNamePrefix(prefix, maxPrefixLength()),
 		getHash(ownerName, ownerUID, ownerGVK, extra)[:hashLength],
 	)
 }
 
-// getWorkloadBaseName returns the base name of a workload by removing the hash suffix.
+// getWorkloadBaseName returns the base name of a workload by removing the hash suffix, or the whole
+// name when it has no separator to remove.
 func getWorkloadBaseName(name string) string {
-	// workload name is generated as <prefix>-<hash>, so we can get the prefix by removing the hash and separator
-	return name[:strings.LastIndex(name, "-")]
+	// Kueue generates workload names as <prefix>-<hash>; a Workload created directly by a user need
+	// not follow that shape.
+	if before, _, found := strings.CutLast(name, "-"); found {
+		return before
+	}
+	return name
 }
 
 func getHash(ownerName string, ownerUID types.UID, gvk schema.GroupVersionKind, extra string) string {

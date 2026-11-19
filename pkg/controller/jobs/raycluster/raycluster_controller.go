@@ -22,10 +22,11 @@ import (
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/controller/jobs/ray"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/podset"
+	"sigs.k8s.io/kueue/pkg/util/equality"
 )
 
 var (
@@ -45,16 +47,17 @@ const (
 	FrameworkName       = "ray.io/raycluster"
 )
 
-func init() {
-	utilruntime.Must(jobframework.RegisterIntegration(FrameworkName, jobframework.IntegrationCallbacks{
-		SetupIndexes:      SetupIndexes,
-		NewJob:            NewJob,
-		NewReconciler:     NewReconciler,
-		SetupWebhook:      SetupRayClusterWebhook,
-		JobType:           &rayv1.RayCluster{},
-		AddToScheme:       rayv1.AddToScheme,
-		MultiKueueAdapter: ray.NewMKAdapter(copyJobSpec, copyJobStatus, getEmptyList, gvk, getManagedBy, setManagedBy),
-	}))
+func RegisterIntegration(m *jobframework.IntegrationManager) error {
+	return m.RegisterIntegration(FrameworkName, jobframework.IntegrationCallbacks{
+		SetupIndexes:  SetupIndexes,
+		NewJob:        NewJob,
+		NewReconciler: NewReconciler,
+		SetupWebhook:  SetupRayClusterWebhook,
+		JobType:       &rayv1.RayCluster{},
+		AddToScheme:   rayv1.AddToScheme,
+		MultiKueueAdapter: ray.NewMKAdapter(copyJobSpec, copyJobStatus, getEmptyList, gvk, getManagedBy, setManagedBy,
+			ray.WithElasticReplicaSync(elasticReplicaSync())),
+	})
 }
 
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;watch;update;patch
@@ -77,6 +80,11 @@ type RayCluster rayv1.RayCluster
 
 var _ jobframework.GenericJob = (*RayCluster)(nil)
 var _ jobframework.JobWithManagedBy = (*RayCluster)(nil)
+var _ jobframework.JobWithCustomEquivalenceOptions = (*RayCluster)(nil)
+
+func (j *RayCluster) CustomEquivalenceOptions(_ context.Context, _ client.Client, _ *kueue.Workload) []equality.ComparePodSetsOption {
+	return EquivalenceOptions()
+}
 
 func (j *RayCluster) Object() client.Object {
 	return (*rayv1.RayCluster)(j)
@@ -103,7 +111,19 @@ func (j *RayCluster) PodLabelSelector() string {
 }
 
 func (j *RayCluster) PodSets(ctx context.Context, _ client.Client) ([]kueue.PodSet, error) {
-	return BuildPodSets(&j.Spec, j.Annotations)
+	podSets, err := BuildPodSets(&j.Spec, j.Annotations)
+	if err != nil {
+		return nil, err
+	}
+	// On a MultiKueue manager an autoscaling RayCluster's worker replicas are
+	// owned by the worker cluster: the manager spec keeps the user-declared
+	// values and the live per-group counts are reflected here as an annotation
+	// by the MultiKueue workload controller. Non-autoscaling scaling edits the
+	// spec directly, so BuildPodSets already reflects it.
+	if ptr.Deref(j.Spec.ManagedBy, "") == kueue.MultiKueueControllerName && ptr.Deref(j.Spec.EnableInTreeAutoscaling, false) {
+		podSets = applyRuntimeCountsAnnotation(ctrl.LoggerFrom(ctx), podSets, j.Object())
+	}
+	return podSets, nil
 }
 
 func (j *RayCluster) RunWithPodSetsInfo(ctx context.Context, _ client.Client, podSetsInfo []podset.PodSetInfo) error {
@@ -123,7 +143,8 @@ func (j *RayCluster) RunWithPodSetsInfo(ctx context.Context, _ client.Client, po
 }
 
 func (j *RayCluster) RestorePodSetsInfo(ctx context.Context, podSetsInfo []podset.PodSetInfo) bool {
-	return RestorePodSetsInfo(ctx, &j.Spec, podSetsInfo)
+	changed := RestorePodSetsInfo(ctx, &j.Spec, podSetsInfo)
+	return ClearRuntimeWorkerStateAnnotations(j.Object()) || changed
 }
 
 func (j *RayCluster) Finished(ctx context.Context) (message string, success, finished bool) {
@@ -131,8 +152,25 @@ func (j *RayCluster) Finished(ctx context.Context) (message string, success, fin
 	return j.Status.Reason, j.Status.State != rayv1.Failed, false
 }
 
-func (j *RayCluster) PodsReady(ctx context.Context, _ client.Client) bool {
-	return j.Status.State == rayv1.Ready
+func (j *RayCluster) PodsReady(ctx context.Context, _ client.Client, _ ...jobframework.PodsReadyOption) bool {
+	if !features.Enabled(features.RayClusterHeadPodReady) {
+		return j.Status.State == rayv1.Ready
+	}
+	// RayClusters are commonly used as devboxes, where users may already be
+	// working on a ready head while workers are still unready. Check only
+	// HeadPodReady to avoid interrupting those users with PodsReadyTimeout
+	// evictions.
+	return apimeta.IsStatusConditionTrue(j.Status.Conditions, string(rayv1.HeadPodReady))
+}
+
+// GetWorkloadNameExtraPart folds the worker-reflected RayCluster generation
+// (RayClusterGenerationAnnotation) into the elastic workload-slice name. A
+// worker-side autoscale reflects the new size onto the manager as an annotation,
+// which never bumps the manager RayCluster's metadata.generation; without this the
+// slice name would key on that generation alone, so a second scale-up would recompute
+// an already-existing slice name and fail to mint its replacement.
+func (j *RayCluster) GetWorkloadNameExtraPart() string {
+	return GetWorkloadNameExtraPart(j.Object())
 }
 
 func SetupIndexes(ctx context.Context, indexer client.FieldIndexer) error {
@@ -148,9 +186,7 @@ func fromObject(o runtime.Object) *RayCluster {
 }
 
 func (j *RayCluster) CanDefaultManagedBy() bool {
-	jobSpecManagedBy := j.Spec.ManagedBy
-	return features.Enabled(features.MultiKueue) &&
-		(jobSpecManagedBy == nil || *jobSpecManagedBy == rayutils.KubeRayController)
+	return CanDefaultManagedBy(j.Spec.ManagedBy)
 }
 
 func (j *RayCluster) ManagedBy() *string {

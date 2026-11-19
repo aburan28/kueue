@@ -16,20 +16,23 @@ limitations under the License.
 
 package cmp
 
-// CompareBool compares two boolean values and returns:
+import "time"
+
+// CompareBool compares two boolean values following standard ordering
+// (false < true, matching cmp.Compare semantics) and returns:
 // - 0 if they are equal
-// - -1 if a is true and b is false
-// - 1 if a is false and b is true
+// - -1 if a is false and b is true
+// - 1 if a is true and b is false
 func CompareBool(a, b bool) int {
 	if a == b {
 		return 0
 	}
 
 	if a {
-		return -1
+		return 1
 	}
 
-	return 1
+	return -1
 }
 
 // LazyOr evaluates the provided functions in order and returns the first non-zero value.
@@ -44,4 +47,18 @@ func LazyOr[T comparable](funcs ...func() T) T {
 		}
 	}
 	return zero
+}
+
+// EarliestTime returns the earlier non-nil time of a and b, or nil if both are nil.
+func EarliestTime(a, b *time.Time) *time.Time {
+	switch {
+	case a == nil:
+		return b
+	case b == nil:
+		return a
+	case b.Before(*a):
+		return b
+	default:
+		return a
+	}
 }

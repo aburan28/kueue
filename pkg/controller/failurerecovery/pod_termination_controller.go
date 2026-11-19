@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -165,7 +166,7 @@ func (r *TerminatingPodReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	totalDeletionGracePeriod := time.Duration(ptr.Deref(pod.DeletionGracePeriodSeconds, 0)) + r.forcefulTerminationGracePeriod
+	totalDeletionGracePeriod := time.Duration(ptr.Deref(pod.DeletionGracePeriodSeconds, 0))*time.Second + r.forcefulTerminationGracePeriod
 	eventMessage := fmt.Sprintf(
 		"Pod forcefully terminated after %s grace period due to unreachable node `%s` (triggered by `%s` annotation)",
 		totalDeletionGracePeriod,
@@ -173,24 +174,32 @@ func (r *TerminatingPodReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		constants.SafeToForcefullyDeleteAnnotationKey,
 	)
 
+	recoveryCondition := corev1.PodCondition{
+		Type:    KueueFailureRecoveryConditionType,
+		Status:  corev1.ConditionTrue,
+		Reason:  KueueForcefulTerminationReason,
+		Message: eventMessage,
+	}
+
+	conditionChanged := false
 	err := utilclient.PatchStatus(ctx, r.client, pod, func() (bool, error) {
+		updated := false
 		if !utilpod.IsTerminated(pod) {
 			pod.Status.Phase = corev1.PodFailed
+			updated = true
 		}
-		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
-			Type:    KueueFailureRecoveryConditionType,
-			Status:  corev1.ConditionTrue,
-			Reason:  KueueForcefulTerminationReason,
-			Message: eventMessage,
-		})
-		return true, nil
+		// Reports false when the condition is already up to date, so the event is not emitted again.
+		conditionChanged = podutil.UpdatePodCondition(&pod.Status, &recoveryCondition)
+		return updated || conditionChanged, nil
 	})
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	r.recorder.Eventf(pod, nil, corev1.EventTypeWarning, KueueForcefulTerminationReason, "ForcefulTermination", "%s", eventMessage)
-	log.V(4).Info(eventMessage)
+	if conditionChanged {
+		r.recorder.Eventf(pod, nil, corev1.EventTypeWarning, KueueForcefulTerminationReason, "ForcefulTermination", "%s", eventMessage)
+	}
+	log.V(4).Info("Forcefully terminating pod", "message", eventMessage)
 
 	// Forcefully delete the pod object
 	if err = r.client.Delete(ctx, pod, &client.DeleteOptions{GracePeriodSeconds: new(int64(0))}); err != nil {
@@ -222,16 +231,14 @@ func (r *TerminatingPodReconciler) mapNodeToPods(ctx context.Context, node *core
 	for _, pod := range pods.Items {
 		if podEligibleForTermination(&pod) {
 			requests = append(requests, ctrl.Request{
-				NamespacedName: types.NamespacedName{
-					Namespace: pod.Namespace,
-					Name:      pod.Name,
-				},
+				Namespace: pod.Namespace,
+				Name:      pod.Name,
 			})
 		}
 	}
 
 	if len(requests) > 0 {
-		log.V(4).Info("Reconciling pods affected by unreachable node", "pod_count", len(requests))
+		log.V(4).Info("Reconciling pods affected by unreachable node", "node", klog.KObj(node), "podCount", len(requests))
 	}
 
 	return requests

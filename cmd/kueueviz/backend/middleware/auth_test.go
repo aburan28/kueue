@@ -18,15 +18,20 @@ package middleware
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/time/rate"
 	authenticationv1 "k8s.io/api/authentication/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilcache "k8s.io/apimachinery/pkg/util/cache"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -48,13 +53,20 @@ func newRouterWithReactor(t *testing.T, reactor k8stesting.ReactionFunc) (*gin.E
 		return reactor(action)
 	})
 
-	auth := NewAuthenticator(cs, AuthConfig{CacheTTL: time.Minute, NegativeCacheTTL: 5 * time.Second})
 	clock := &fakeClock{now: time.Now()}
-	auth.clock = clock
+	auth := &Authenticator{
+		clientset: cs,
+		config:    AuthConfig{CacheTTL: time.Minute, NegativeCacheTTL: 5 * time.Second, CacheSize: 100},
+		cache:     utilcache.NewLRUExpireCacheWithClock(100, clock),
+		clock:     clock,
+	}
 
 	r := gin.New()
 	r.Use(auth.Middleware())
-	r.GET("/test", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"user": c.GetString("username")}) })
+	r.GET("/test", func(c *gin.Context) {
+		identity, _ := IdentityFromContext(c)
+		c.JSON(http.StatusOK, gin.H{"user": identity.Username})
+	})
 	return r, clock, &callCount
 }
 
@@ -178,6 +190,39 @@ func TestAuthMiddlewareFlow(t *testing.T) {
 	}
 }
 
+func TestAuthMiddlewarePropagatesGroups(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cs := k8sfake.NewSimpleClientset()
+	cs.PrependReactor("create", "tokenreviews", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, &authenticationv1.TokenReview{Status: authenticationv1.TokenReviewStatus{
+			Authenticated: true,
+			User:          authenticationv1.UserInfo{Username: "alice", Groups: []string{"dev", "team-a"}},
+		}}, nil
+	})
+
+	auth := NewAuthenticator(cs, AuthConfig{CacheTTL: time.Minute, NegativeCacheTTL: 5 * time.Second})
+	defer auth.Stop()
+
+	r := gin.New()
+	r.Use(auth.Middleware())
+	r.GET("/test", func(c *gin.Context) {
+		identity, _ := IdentityFromContext(c)
+		c.JSON(http.StatusOK, gin.H{"user": identity.Username, "groups": identity.Groups, "uid": identity.UID, "extra": identity.Extra})
+	})
+
+	w := makeRequest(r, "/test", map[string]string{"Authorization": "Bearer good-token"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"user":"alice"`) {
+		t.Errorf("expected username alice in identity, body=%s", body)
+	}
+	if !strings.Contains(body, "dev") || !strings.Contains(body, "team-a") {
+		t.Errorf("expected groups [dev team-a] to propagate to the context, body=%s", body)
+	}
+}
+
 func TestAuthMiddlewareCacheExpiry(t *testing.T) {
 	tests := map[string]struct {
 		authed     bool
@@ -224,6 +269,217 @@ func TestAuthMiddlewareCacheExpiry(t *testing.T) {
 			}
 			if *callCount != 2 {
 				t.Fatalf("after request 3: calls = %d, want 2", *callCount)
+			}
+		})
+	}
+}
+
+// TestRateLimiterMiddleware verifies that requests from the same IP exceeding
+// the burst limit receive 429 Too Many Requests, while requests from other IPs succeed.
+func TestRateLimiterMiddleware(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	// Allow only 1 request per second, burst of 1 for per-IP.
+	// Set a very high global limit so it doesn't interfere.
+	r.Use(RateLimiter(rate.Limit(1), 1, rate.Limit(100), 100))
+	r.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	// First request from IP 1.2.3.4 should succeed (consumes the burst token).
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("first request from 1.2.3.4: status = %d, want 200", w.Code)
+	}
+
+	// Immediate second request from the same IP should be rate-limited.
+	req2 := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req2.Header.Set("X-Forwarded-For", "1.2.3.4")
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request from 1.2.3.4: status = %d, want 429", w2.Code)
+	}
+
+	// A request from a different IP should be unaffected by the first IP's usage.
+	req3 := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req3.Header.Set("X-Forwarded-For", "5.6.7.8")
+	w3 := httptest.NewRecorder()
+	r.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("first request from 5.6.7.8: status = %d, want 200 (per-IP isolation broken)", w3.Code)
+	}
+}
+
+// TestRateLimiterMiddleware_GlobalLimit verifies that even if requests come from
+// different IPs (bypassing the per-IP limit), the global limit is still enforced.
+func TestRateLimiterMiddleware_GlobalLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	// Allow 10 requests per second per-IP (high enough to not trigger).
+	// But restrict the global limit to 2 burst.
+	r.Use(RateLimiter(rate.Limit(10), 10, rate.Limit(2), 2))
+	r.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	// Send 3 requests from 3 completely different IPs simultaneously.
+	// The first 2 should succeed, but the 3rd should hit the global limit.
+	statuses := make([]int, 3)
+	for i := range 3 {
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("10.0.0.%d", i))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		statuses[i] = w.Code
+	}
+
+	if statuses[0] != http.StatusOK {
+		t.Fatalf("req 1 (IP 10.0.0.0): status = %d, want 200", statuses[0])
+	}
+	if statuses[1] != http.StatusOK {
+		t.Fatalf("req 2 (IP 10.0.0.1): status = %d, want 200", statuses[1])
+	}
+	if statuses[2] != http.StatusTooManyRequests {
+		t.Fatalf("req 3 (IP 10.0.0.2): status = %d, want 429 (global limit not enforced)", statuses[2])
+	}
+}
+
+func TestSARAuthorizer(t *testing.T) {
+	tests := map[string]struct {
+		allowed     bool
+		reactErr    error
+		wantAllowed bool
+		wantErr     bool
+	}{
+		"allowed":       {allowed: true, wantAllowed: true},
+		"denied":        {allowed: false, wantAllowed: false},
+		"backend error": {reactErr: errors.New("apiserver unavailable"), wantErr: true},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			var captured *authorizationv1.SubjectAccessReview
+			cs := k8sfake.NewSimpleClientset()
+			cs.PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				if tc.reactErr != nil {
+					return true, nil, tc.reactErr
+				}
+				sar := action.(k8stesting.CreateAction).GetObject().(*authorizationv1.SubjectAccessReview)
+				captured = sar
+				sar.Status.Allowed = tc.allowed
+				return true, sar, nil
+			})
+
+			authorizer := NewSARAuthorizer(cs, AuthConfig{})
+			attrs := authorizationv1.ResourceAttributes{
+				Verb: "get", Group: "kueue.x-k8s.io", Resource: "workloads", Namespace: "tenant-b", Name: "wl",
+			}
+			allowed, err := authorizer.Authorize(t.Context(), Identity{Username: "alice", Groups: []string{"dev", "team-a"}, UID: "alice-uid", Extra: map[string][]string{"foo": {"bar"}}}, attrs)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if allowed != tc.wantAllowed {
+				t.Fatalf("allowed = %v, want %v", allowed, tc.wantAllowed)
+			}
+
+			if captured.Spec.User != "alice" {
+				t.Errorf("SAR user = %q, want %q", captured.Spec.User, "alice")
+			}
+			if len(captured.Spec.Groups) != 2 || captured.Spec.Groups[0] != "dev" || captured.Spec.Groups[1] != "team-a" {
+				t.Errorf("SAR groups = %v, want [dev team-a]", captured.Spec.Groups)
+			}
+			if captured.Spec.ResourceAttributes == nil ||
+				captured.Spec.ResourceAttributes.Verb != "get" ||
+				captured.Spec.ResourceAttributes.Resource != "workloads" ||
+				captured.Spec.ResourceAttributes.Namespace != "tenant-b" {
+				t.Errorf("SAR resourceAttributes = %+v, want get workloads in tenant-b", captured.Spec.ResourceAttributes)
+			}
+		})
+	}
+}
+
+func TestSARAuthorizerCacheIdentity(t *testing.T) {
+	tests := map[string]struct {
+		first       Identity
+		second      Identity
+		wantAllowed bool
+		wantCalls   int
+	}{
+		"group delimiter collision": {
+			first:       Identity{Username: "alice", UID: "alice-uid", Groups: []string{"group-a,group-b"}},
+			second:      Identity{Username: "alice", UID: "alice-uid", Groups: []string{"group-a", "group-b"}},
+			wantAllowed: false,
+			wantCalls:   2,
+		},
+		"extra value delimiter collision": {
+			first:       Identity{Username: "alice", UID: "alice-uid", Extra: map[string][]string{"scope": {"read,write"}}},
+			second:      Identity{Username: "alice", UID: "alice-uid", Extra: map[string][]string{"scope": {"read", "write"}}},
+			wantAllowed: false,
+			wantCalls:   2,
+		},
+		"group order": {
+			first:       Identity{Username: "alice", UID: "alice-uid", Groups: []string{"group-a", "group-b"}},
+			second:      Identity{Username: "alice", UID: "alice-uid", Groups: []string{"group-b", "group-a"}},
+			wantAllowed: true,
+			wantCalls:   1,
+		},
+		"duplicate groups": {
+			first:       Identity{Username: "alice", UID: "alice-uid", Groups: []string{"group-a", "group-a", "group-b"}},
+			second:      Identity{Username: "alice", UID: "alice-uid", Groups: []string{"group-a", "group-b"}},
+			wantAllowed: true,
+			wantCalls:   1,
+		},
+		"extra key and value order": {
+			first: Identity{Username: "alice", UID: "alice-uid", Extra: map[string][]string{
+				"scope":  {"read", "write"},
+				"tenant": {"a", "b"},
+			}},
+			second: Identity{Username: "alice", UID: "alice-uid", Extra: map[string][]string{
+				"tenant": {"b", "a"},
+				"scope":  {"write", "read"},
+			}},
+			wantAllowed: true,
+			wantCalls:   1,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			callCount := 0
+			cs := k8sfake.NewSimpleClientset()
+			cs.PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				callCount++
+				sar := action.(k8stesting.CreateAction).GetObject().(*authorizationv1.SubjectAccessReview)
+				sar.Status.Allowed = callCount == 1
+				return true, sar, nil
+			})
+
+			authorizer := NewSARAuthorizer(cs, AuthConfig{CacheTTL: time.Minute, NegativeCacheTTL: time.Minute})
+			attributes := authorizationv1.ResourceAttributes{Verb: "get", Resource: "workloads"}
+			allowed, err := authorizer.Authorize(t.Context(), tc.first, attributes)
+			if err != nil {
+				t.Fatalf("first Authorize() returned error: %v", err)
+			}
+			if !allowed {
+				t.Fatal("first Authorize() = false, want true")
+			}
+
+			allowed, err = authorizer.Authorize(t.Context(), tc.second, attributes)
+			if err != nil {
+				t.Fatalf("second Authorize() returned error: %v", err)
+			}
+			if allowed != tc.wantAllowed {
+				t.Errorf("second Authorize() = %v, want %v", allowed, tc.wantAllowed)
+			}
+			if callCount != tc.wantCalls {
+				t.Errorf("SubjectAccessReview calls = %d, want %d", callCount, tc.wantCalls)
 			}
 		})
 	}

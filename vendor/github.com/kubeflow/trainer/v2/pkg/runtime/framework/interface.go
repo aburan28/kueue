@@ -21,6 +21,7 @@ import (
 
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
@@ -41,24 +42,56 @@ type WatchExtensionPlugin interface {
 	ReconcilerBuilders() []runtime.ReconcilerBuilder
 }
 
+// EnforcePodGroupPolicyPlugin configures gang-scheduling parameters declared in the
+// runtime `.spec.podGroupPolicy` on the Info object.
 type EnforcePodGroupPolicyPlugin interface {
 	Plugin
 	EnforcePodGroupPolicy(info *runtime.Info, trainJob *trainer.TrainJob) error
 }
 
+// EnforceMLPolicyPlugin configures the ML framework specific parameters declared in
+// the runtime `.spec.mlPolicy` on the Info object.
 type EnforceMLPolicyPlugin interface {
 	Plugin
 	EnforceMLPolicy(info *runtime.Info, trainJob *trainer.TrainJob) error
 }
 
-type PodNetworkPlugin interface {
+// EnforceSchedulingPlugin configures the Workload-Aware Scheduling parameters declared in the
+// runtime `.spec.scheduling` on the Info object.
+type EnforceSchedulingPlugin interface {
 	Plugin
-	IdentifyPodNetwork(info *runtime.Info, trainJob *trainer.TrainJob) error
+	EnforceScheduling(info *runtime.Info, trainJob *trainer.TrainJob) error
 }
 
+// EnforcePodSpecPlugin mutates the PodSpec of a TrainJob's PodSets for
+// concerns that are not driven by MLPolicy or PodGroupPolicy APIs.
+type EnforcePodSpecPlugin interface {
+	Plugin
+	EnforcePodSpec(podSets runtime.PodSets, trainJob *trainer.TrainJob) error
+}
+
+// PreComponentBuilderPlugin consolidates the Info object with the concrete runtime
+// template before any component is materialized. Only the plugin that owns the runtime
+// template (e.g. JobSet) can implement it, since consolidation requires knowledge of the
+// template shape.
+type PreComponentBuilderPlugin interface {
+	Plugin
+	PreBuildSync(info *runtime.Info, trainJob *trainer.TrainJob) error
+}
+
+// ComponentBuilderPlugin materializes the Kubernetes objects for a TrainJob from the
+// consolidated Info object.
 type ComponentBuilderPlugin interface {
 	Plugin
 	Build(ctx context.Context, info *runtime.Info, trainJob *trainer.TrainJob) ([]apiruntime.ApplyConfiguration, error)
+}
+
+// ComponentDeleterPlugin returns previously created objects that should be removed for a TrainJob.
+// It runs on every reconcile regardless of the TrainJob status, so plugins must decide when objects
+// should be removed and must be idempotent. The caller performs the deletion.
+type ComponentDeleterPlugin interface {
+	Plugin
+	Delete(ctx context.Context, trainJob *trainer.TrainJob) ([]client.Object, error)
 }
 
 type TrainJobStatusPlugin interface {

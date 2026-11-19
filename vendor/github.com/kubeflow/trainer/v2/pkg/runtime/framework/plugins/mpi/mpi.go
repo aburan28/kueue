@@ -30,6 +30,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
@@ -76,7 +77,6 @@ func (m *MPI) Name() string {
 	return Name
 }
 
-// TODO (andreyvelich): Add validation to check that TrainJob doesn't have MPI envs.
 // TODO (andreyvelich): We should validate that envs from different plugins don't conflict with each other.
 // Ref: https://github.com/kubeflow/trainer/pull/2308#discussion_r1823229940
 func (m *MPI) Validate(_ context.Context, runtimeInfo *runtime.Info, _, newJobObj *trainer.TrainJob) (admission.Warnings, field.ErrorList) {
@@ -85,11 +85,32 @@ func (m *MPI) Validate(_ context.Context, runtimeInfo *runtime.Info, _, newJobOb
 		return nil, allErrs
 	}
 	specPath := field.NewPath("spec")
+	// The MPI hostfile and the launcher are built for a single Job per replicatedJob.
+	// The trainer ancestor is the launcher, so the node replicatedJob must be validated as well.
+	for _, rJobName := range []string{constants.Launcher, constants.Node} {
+		if replicas := runtime.ReplicatedJobReplicas(runtimeInfo, rJobName); replicas > 1 {
+			allErrs = append(allErrs, field.Invalid(specPath.Child("runtimeRef"), replicas,
+				fmt.Sprintf("%s replicatedJob replicas must be 1 for the MPI runtime", rJobName)))
+		}
+	}
 	// validate PodSet configurations based on NumNodes and RunLauncherAsNode.
 	if trainJobTrainer := newJobObj.Spec.Trainer; trainJobTrainer != nil && ptr.Deref(trainJobTrainer.NumNodes, 1) >= 2 && ptr.Deref(runtimeInfo.RuntimePolicy.MLPolicySource.MPI.RunLauncherAsNode, false) {
 		if runtimeInfo.FindPodSetByName(constants.Launcher) == nil || runtimeInfo.FindPodSetByName(constants.Node) == nil {
 			numNodesPath := specPath.Child("trainer", "numNodes")
 			allErrs = append(allErrs, field.Invalid(numNodesPath, newJobObj.Spec.Trainer.NumNodes, "must have 1 when MPI trainingRuntime with enabled runLauncherAsNode does not have either launcher and node"))
+		}
+	}
+	// Check reserved MPI envs.
+	if trainJobTrainer := newJobObj.Spec.Trainer; trainJobTrainer != nil {
+		mpiEnvs := sets.New[string]()
+		for _, env := range trainJobTrainer.Env {
+			if constants.MPIReservedEnvNames.Has(env.Name) {
+				mpiEnvs.Insert(env.Name)
+			}
+		}
+		if mpiEnvs.Len() > 0 {
+			trainerEnvsPath := specPath.Child("trainer").Child("env")
+			allErrs = append(allErrs, field.Invalid(trainerEnvsPath, trainJobTrainer.Env, fmt.Sprintf("must not have reserved envs, invalid envs configured: %v", sets.List(mpiEnvs))))
 		}
 	}
 	return nil, allErrs
@@ -98,6 +119,12 @@ func (m *MPI) Validate(_ context.Context, runtimeInfo *runtime.Info, _, newJobOb
 func (m *MPI) EnforceMLPolicy(info *runtime.Info, trainJob *trainer.TrainJob) error {
 	if info == nil || info.RuntimePolicy.MLPolicySource == nil || info.RuntimePolicy.MLPolicySource.MPI == nil {
 		return nil
+	}
+
+	// Set the TrainJob image on the launcher and the nodes, since mpirun on the launcher starts
+	// the MPI processes on the nodes, which must ship the same application and MPI versions.
+	for _, psName := range []string{constants.Launcher, constants.Node} {
+		runtime.SetContainerImageFromTrainer(info.FindContainerByPodSetName(psName, constants.Node), trainJob.Spec.Trainer)
 	}
 
 	// TrainJob contains the actual information for the Trainer.
@@ -115,7 +142,7 @@ func (m *MPI) EnforceMLPolicy(info *runtime.Info, trainJob *trainer.TrainJob) er
 	if trainJob.Spec.Trainer != nil && trainJob.Spec.Trainer.NumProcPerNode != nil {
 		info.RuntimePolicy.MLPolicySource.MPI.NumProcPerNode = trainJob.Spec.Trainer.NumProcPerNode
 		// If numProcPerNode is set to 1 in runtime, we make it equal to number of GPUs.
-	} else if *info.RuntimePolicy.MLPolicySource.MPI.NumProcPerNode == 1 {
+	} else if ptr.Deref(info.RuntimePolicy.MLPolicySource.MPI.NumProcPerNode, 1) == 1 {
 		resourcesPerNode := ptr.Deref(runtime.ExtractResourcePerNodeFromRuntime(info), corev1.ResourceRequirements{})
 		if jobTrainer := trainJob.Spec.Trainer; jobTrainer != nil && jobTrainer.ResourcesPerNode != nil {
 			resourcesPerNode = ptr.Deref(jobTrainer.ResourcesPerNode, corev1.ResourceRequirements{})
@@ -137,16 +164,20 @@ func (m *MPI) EnforceMLPolicy(info *runtime.Info, trainJob *trainer.TrainJob) er
 					WithName(constants.MPISSHAuthVolumeName).
 					WithSecret(corev1ac.SecretVolumeSource().
 						WithSecretName(fmt.Sprintf("%s%s", trainJob.Name, constants.MPISSHAuthSecretSuffix)).
+						WithDefaultMode(constants.MPISSHAuthDefaultMode).
 						WithItems(
 							corev1ac.KeyToPath().
 								WithKey(corev1.SSHAuthPrivateKey).
-								WithPath(constants.MPISSHPrivateKeyFile),
+								WithPath(constants.MPISSHPrivateKeyFile).
+								WithMode(constants.MPISSHPrivateKeyFileMode),
 							corev1ac.KeyToPath().
 								WithKey(constants.MPISSHPublicKey).
-								WithPath(constants.MPISSHPublicKeyFile),
+								WithPath(constants.MPISSHPublicKeyFile).
+								WithMode(constants.MPISSHPublicKeyFileMode),
 							corev1ac.KeyToPath().
 								WithKey(constants.MPISSHPublicKey).
-								WithPath(constants.MPISSHAuthorizedKeys),
+								WithPath(constants.MPISSHAuthorizedKeys).
+								WithMode(constants.MPISSHPublicKeyFileMode),
 						),
 					),
 			}...,
@@ -178,7 +209,7 @@ func (m *MPI) EnforceMLPolicy(info *runtime.Info, trainJob *trainer.TrainJob) er
 				[]corev1ac.VolumeMountApplyConfiguration{
 					*corev1ac.VolumeMount().
 						WithName(constants.MPISSHAuthVolumeName).
-						WithMountPath(*info.RuntimePolicy.MLPolicySource.MPI.SSHAuthMountPath),
+						WithMountPath(ptr.Deref(info.RuntimePolicy.MLPolicySource.MPI.SSHAuthMountPath, constants.MPISSHAuthDefaultMountPath)),
 				}...,
 			)
 			if ps.Name == constants.Launcher && (container.Name == constants.Node || container.Name == constants.Launcher) {
@@ -188,7 +219,7 @@ func (m *MPI) EnforceMLPolicy(info *runtime.Info, trainJob *trainer.TrainJob) er
 						WithName(constants.MPIHostfileVolumeName).
 						WithMountPath(constants.MPIHostfileDir),
 				)
-				switch *info.RuntimePolicy.MLPolicySource.MPI.MPIImplementation {
+				switch ptr.Deref(info.RuntimePolicy.MLPolicySource.MPI.MPIImplementation, trainer.MPIImplementationOpenMPI) {
 				case trainer.MPIImplementationOpenMPI:
 					apply.UpsertEnvVars(
 						&info.TemplateSpec.PodSets[psIdx].Containers[cIdx].Env,
@@ -200,9 +231,33 @@ func (m *MPI) EnforceMLPolicy(info *runtime.Info, trainJob *trainer.TrainJob) er
 							WithValue("true"),
 						*corev1ac.EnvVar().
 							WithName(constants.OpenMPIEnvDefaultSlots).
-							WithValue(strconv.Itoa(int(*info.RuntimePolicy.MLPolicySource.MPI.NumProcPerNode))),
+							WithValue(strconv.Itoa(int(ptr.Deref(info.RuntimePolicy.MLPolicySource.MPI.NumProcPerNode, 1)))),
 						*corev1ac.EnvVar().
 							WithName(constants.OpenMPIEnvKeyRSHArgs).
+							WithValue(constants.OpenMPIEnvDefaultValueRSHArgs),
+						// Open MPI >= 5.0 replaced ORTE with PRTE and ignores the OMPI_MCA_orte_*
+						// keys above without warning, which silently collapses a multi-node job
+						// onto the launcher. Emit the PRTE equivalents as well so the same
+						// TrainingRuntime works on both Open MPI 4 and 5.
+						//
+						// Unlike ORTE, PRTE does not gracefully match a hostfile entry against
+						// the local node when "keep FQDN hostnames" is enabled: the hostfile
+						// records JobSet's short-form Pod DNS name (<pod>.<service>), which
+						// never equals what PRTE resolves for itself, so with runLauncherAsNode
+						// PRTE decides the launcher's own entry is a remote host and tries (and
+						// fails) to SSH to itself. Leave it disabled for PRTE so local rank
+						// launch stays local. Reproduced and verified on Open MPI 5.0.7.
+						*corev1ac.EnvVar().
+							WithName(constants.PRTEEnvHostFileLocation).
+							WithValue(fmt.Sprintf("%s/%s", constants.MPIHostfileDir, constants.MPIHostfileName)),
+						*corev1ac.EnvVar().
+							WithName(constants.PRTEEnvKeepFQDNHostNames).
+							WithValue("false"),
+						*corev1ac.EnvVar().
+							WithName(constants.PRTEEnvDefaultSlots).
+							WithValue(strconv.Itoa(int(ptr.Deref(info.RuntimePolicy.MLPolicySource.MPI.NumProcPerNode, 1)))),
+						*corev1ac.EnvVar().
+							WithName(constants.PRTEEnvKeySSHArgs).
 							WithValue(constants.OpenMPIEnvDefaultValueRSHArgs),
 					)
 				default:
@@ -302,10 +357,10 @@ func (m *MPI) buildHostFileConfigMap(info *runtime.Info, trainJob *trainer.Train
 		if !isNode(runLauncherAsNode, ps) {
 			continue
 		}
-		switch *info.RuntimePolicy.MLPolicySource.MPI.MPIImplementation {
+		switch ptr.Deref(info.RuntimePolicy.MLPolicySource.MPI.MPIImplementation, trainer.MPIImplementationOpenMPI) {
 		case trainer.MPIImplementationOpenMPI:
 			for e := range ps.Endpoints {
-				hostFile.WriteString(fmt.Sprintf("%s slots=%d\n", e, slots))
+				fmt.Fprintf(&hostFile, "%s slots=%d\n", e, slots)
 			}
 		}
 	}

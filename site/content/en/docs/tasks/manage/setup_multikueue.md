@@ -84,14 +84,14 @@ For the next example, having the `worker1` cluster Kubeconfig stored in a file c
 
 Check the [worker](#multikueue-specific-kubeconfig) section for details on Kubeconfig generation.
 
-### (Optional) Enable `locationType=Path` for kubeconfig files
+### `locationType=Path` for kubeconfig files
 
 {{% alert title="Security Notice" color="warning" %}}
-`locationType=Path` path validation is an **alpha feature** (disabled by default).
+`locationType=Path` is intended for development use.
 In production, use `locationType=Secret` or `ClusterProfile` instead.
 {{% /alert %}}
 
-The `MultiKueueKubeConfigPathValidation` feature gate (alpha, disabled by default)
+The `MultiKueueKubeConfigPathValidation` feature gate (beta, enabled by default)
 restricts kubeconfig file paths to the hardcoded prefix
 `/etc/multikueue/kubeconfigs/`. When enabled, the controller will:
 
@@ -99,11 +99,14 @@ restricts kubeconfig file paths to the hardcoded prefix
 - Reject paths containing `..` segments after cleaning.
 - Resolve symlinks and reject any path that resolves outside the prefix.
 
-To enable this validation, set the feature gate:
+To disable this validation, set the feature gate:
 
+```bash
+--feature-gates=MultiKueueKubeConfigPathValidation=false
 ```
---feature-gates=MultiKueueKubeConfigPathValidation=true
-```
+
+Disabling this restores the legacy behavior of allowing any file path, which can
+expose sensitive files on the controller's filesystem to be read as a kubeconfig.
 
 To use a path-based kubeconfig, mount the file into the controller pod under
 `/etc/multikueue/kubeconfigs/` and reference it in the `MultiKueueCluster`:
@@ -182,10 +185,27 @@ Kueue itself does not manage the `ClusterProfile` resources, which is the respon
 
 {{% /alert %}}
 
-### Enable the `MultiKueueClusterProfile` feature gate
+### The `MultiKueueClusterProfile` feature gate
 
-The `MultiKueueClusterProfile` feature gate has to be enabled for Kueue to consider `ClusterProfile` objects when connecting to clusters.
+Kueue considers `ClusterProfile` objects when connecting to clusters only if the `MultiKueueClusterProfile` feature gate is enabled.
+The feature gate is enabled by default since Kueue v0.21. In earlier versions, enable it explicitly.
 Refer to the [Installation guide](/docs/installation/#change-the-feature-gates-configuration) for instructions on configuring feature gates.
+
+Kueue detects the `clusterprofiles.multicluster.x-k8s.io` CRD only at startup.
+If you install the CRD while Kueue is running, restart kueue-controller-manager:
+```bash
+kubectl -n kueue-system rollout restart deployment kueue-controller-manager
+```
+
+{{% alert title="Note" color="primary" %}}
+
+Kueue reads `ClusterProfile` objects as `multicluster.x-k8s.io/v1alpha2`.
+The `clusterprofiles.multicluster.x-k8s.io` CRD must serve `v1alpha2`, which requires cluster-inventory-api v0.2.0 or later.
+If your cluster has an older CRD, upgrade it before you upgrade Kueue.
+To list the served versions, run:
+`kubectl get crd clusterprofiles.multicluster.x-k8s.io -o jsonpath='{.spec.versions[?(@.served==true)].name}'`
+
+{{% /alert %}}
 
 ### Provision the `ClusterProfile` objects for your clusters
 
@@ -204,7 +224,7 @@ one per cluster (including the manager itself).
 
 For example:
 ```yaml
-apiVersion: multicluster.x-k8s.io/v1alpha1
+apiVersion: multicluster.x-k8s.io/v1alpha2
 kind: ClusterProfile
 metadata:
   labels:
@@ -253,7 +273,7 @@ kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/cluster-inven
 
 Next, the `ClusterProfile` objects can be created:
 ```yaml
-apiVersion: multicluster.x-k8s.io/v1alpha1
+apiVersion: multicluster.x-k8s.io/v1alpha2
 kind: ClusterProfile
 metadata:
   name: worker1-cluster
@@ -282,7 +302,7 @@ The access provider defined in `ClusterProfile` depends upon an executable plugi
 Kueue controller manager pods running within the MultiKueue manager cluster.
 It's the responsibility of the Kueue administrator to make sure that the required command is available.
 
-An example plugin can be found [here](https://github.com/kubernetes-sigs/cluster-inventory-api/tree/v0.1.3/plugins/secretreader) (secret reader) or [here](https://cloud.google.com/blog/products/containers-kubernetes/kubectl-auth-changes-in-gke) (Google Cloud Platform).
+Example plugins include the [`secretreader` plugin](https://github.com/kubernetes-sigs/cluster-inventory-api/tree/v0.2.0/plugins/secretreader) and the [GKE authentication plugin](https://cloud.google.com/blog/products/containers-kubernetes/kubectl-auth-changes-in-gke).
 
 #### Mount the executable with `initContainers`
 

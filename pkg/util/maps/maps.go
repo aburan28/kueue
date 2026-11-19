@@ -49,6 +49,26 @@ func HaveConflict[K comparable, V comparable, S ~map[K]V](a, b S) error {
 	return nil
 }
 
+// MergeKeepExisting copies src into *dst, keeping the existing values on conflict.
+// onConflict (optional) is invoked for every key whose values differ.
+func MergeKeepExisting[K comparable, V comparable, S ~map[K]V](dst *S, src S, onConflict func(k K, kept, ignored V)) {
+	if dst == nil {
+		return
+	}
+	if *dst == nil && src != nil {
+		*dst = make(S, len(src))
+	}
+	for k, v := range src {
+		if kept, found := (*dst)[k]; found {
+			if kept != v && onConflict != nil {
+				onConflict(k, kept, v)
+			}
+			continue
+		}
+		(*dst)[k] = v
+	}
+}
+
 // Contains returns true if a contains all the keys in b with the same value
 func Contains[K, V comparable, A ~map[K]V, B ~map[K]V](a A, b B) bool {
 	for k, bv := range b {
@@ -100,6 +120,17 @@ func (dwc *SyncMap[K, V]) Add(k K, v V) {
 	dwc.m[k] = v
 }
 
+func (dwc *SyncMap[K, V]) UpdateOrDelete(k K, f func(existing V) (V, bool)) {
+	dwc.lock.Lock()
+	defer dwc.lock.Unlock()
+	newVal, canClear := f(dwc.m[k])
+	if canClear {
+		delete(dwc.m, k)
+	} else {
+		dwc.m[k] = newVal
+	}
+}
+
 func (dwc *SyncMap[K, V]) Get(k K) (V, bool) {
 	dwc.lock.RLock()
 	defer dwc.lock.RUnlock()
@@ -125,6 +156,12 @@ func (dwc *SyncMap[K, V]) Keys() []K {
 	return slices.Collect(maps.Keys(dwc.m))
 }
 
+func (dwc *SyncMap[K, V]) Values() []V {
+	dwc.lock.RLock()
+	defer dwc.lock.RUnlock()
+	return slices.Collect(maps.Values(dwc.m))
+}
+
 func (dwc *SyncMap[K, V]) Swap(k K, v V) (V, bool) {
 	dwc.lock.Lock()
 	defer dwc.lock.Unlock()
@@ -144,4 +181,20 @@ func (dwc *SyncMap[K, V]) Update(k K, fn func(v V, found bool) V) V {
 	updated := fn(old, found)
 	dwc.m[k] = updated
 	return updated
+}
+
+// UpdateIfPresent atomically replaces the value for k with the result of fn,
+// or does nothing when k is absent — unlike Update, it never creates an entry.
+// It returns the stored value and whether k was present. fn runs under the
+// map's write lock, so it must not acquire other locks or block.
+func (dwc *SyncMap[K, V]) UpdateIfPresent(k K, fn func(v V) V) (V, bool) {
+	dwc.lock.Lock()
+	defer dwc.lock.Unlock()
+	old, found := dwc.m[k]
+	if !found {
+		return old, false
+	}
+	updated := fn(old)
+	dwc.m[k] = updated
+	return updated, true
 }

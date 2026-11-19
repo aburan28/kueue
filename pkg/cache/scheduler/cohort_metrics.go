@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
+	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/cache/hierarchy"
 	"sigs.k8s.io/kueue/pkg/features"
@@ -35,8 +36,8 @@ import (
 type cohortMetricPoint struct {
 	cohortName      kueue.CohortReference
 	flavorResource  resources.FlavorResource
-	quotaQty        int64
-	reservationsQty int64
+	quotaQty        resources.Amount
+	reservationsQty resources.Amount
 }
 
 func (c *Cache) RecordCohortMetrics(log logr.Logger, cohortName kueue.CohortReference) {
@@ -105,8 +106,8 @@ func (c *Cache) collectCohortMetricPoints(cohortName kueue.CohortReference, simu
 			points = append(points, cohortMetricPoint{
 				cohortName:      ancestor.Name,
 				flavorResource:  fr,
-				quotaQty:        ancestorSubtreeQuota[fr].Int64(),
-				reservationsQty: ancestorSubtreeReservations[fr].Int64(),
+				quotaQty:        ancestorSubtreeQuota[fr],
+				reservationsQty: ancestorSubtreeReservations[fr],
 			})
 		}
 	}
@@ -128,16 +129,20 @@ func (c *Cache) applyCohortMetricPoint(p cohortMetricPoint) {
 	flavor := p.flavorResource.Flavor
 	resource := p.flavorResource.Resource
 
-	if p.quotaQty <= 0 {
+	if p.quotaQty.CmpInt64(0) <= 0 {
 		metrics.ClearCohortSubtreeQuota(p.cohortName, flavor, resource)
 	} else {
-		metrics.ReportCohortSubtreeQuota(p.cohortName, flavor, resource, resourceFloat(resource, p.quotaQty), c.customLabels.CohortGet(p.cohortName), c.roleTracker)
+		metrics.ReportCohortSubtreeQuota(p.cohortName, flavor, resource, p.quotaQty.AsApproximateFloat64(resource), c.customLabels.CohortGet(p.cohortName), c.roleTracker)
 	}
 
-	if p.reservationsQty <= 0 {
+	if p.reservationsQty.CmpInt64(0) <= 0 {
 		metrics.ClearCohortSubtreeResourceReservations(p.cohortName, flavor, resource)
 	} else {
-		metrics.ReportCohortSubtreeResourceReservations(p.cohortName, flavor, resource, resourceFloat(resource, p.reservationsQty), c.customLabels.CohortGet(p.cohortName), c.roleTracker)
+		metrics.ReportCohortSubtreeResourceReservations(
+			p.cohortName, flavor, resource,
+			p.reservationsQty.AsApproximateFloat64(resource),
+			c.customLabels.CohortGet(p.cohortName), c.roleTracker,
+		)
 	}
 }
 
@@ -187,11 +192,15 @@ func (c *Cache) ReportCohortSubtreeAdmittedWorkload(log logr.Logger, wl *kueue.W
 		return
 	}
 
+	wlLabelVals := c.customLabels.MakeValsSet(configapi.SourceKindWorkload, wl.Labels, wl.Annotations)
 	for _, ancestor := range ancestors {
 		metrics.ReportCohortSubtreeAdmittedWorkload(
 			ancestor,
 			workloadpatching.PriorityClassName(wl),
-			c.customLabels.CohortGet(ancestor),
+			c.customLabels.CombineLabelValues(map[configapi.SourceKind][]string{
+				configapi.SourceKindCohort:   c.customLabels.CohortGet(ancestor),
+				configapi.SourceKindWorkload: wlLabelVals.OrderedList(),
+			}),
 			c.roleTracker,
 		)
 	}
@@ -208,7 +217,7 @@ func (c *Cache) recordCohortInfo(cohort *cohort, rootCohort *cohort) {
 	}
 	newRoot := rootCohort.GetName()
 	metrics.ClearCohortInfo(cohort.Name)
-	metrics.ReportCohortInfo(cohort.Name, newParent, newRoot, c.customLabels.CohortGet(cohort.Name), c.roleTracker)
+	metrics.ReportCohortInfo(cohort.Name, newParent, newRoot, cohort.DynamicQuotaOrchestrator, c.customLabels.CohortGet(cohort.Name), c.roleTracker)
 }
 
 // recordCQInfo records CQ info metrics.
@@ -218,7 +227,7 @@ func (c *Cache) recordCQInfo(cq *clusterQueue, parentCohort kueue.CohortReferenc
 	}
 	customLabels := c.customLabels.CQGet(cq.Name)
 	metrics.ClearClusterQueueInfo(cq.Name)
-	metrics.ReportClusterQueueInfo(cq.Name, parentCohort, rootCohort, customLabels, c.roleTracker)
+	metrics.ReportClusterQueueInfo(cq.Name, parentCohort, rootCohort, cq.DynamicQuotaOrchestrator, customLabels, c.roleTracker)
 }
 
 // updateCohortResourceAndInfoMetrics updates subtree resources then records info metrics.
@@ -248,5 +257,106 @@ func (c *Cache) updateCohortTreeAndInfoMetricsIfNoCycle(cohort *cohort) {
 	if !hierarchy.HasCycle(cohort) {
 		root := cohort.getRootUnsafe()
 		c.updateCohortResourceAndInfoMetrics(root, root)
+		c.reportTreeAdmittedActiveWorkloads(root)
 	}
+}
+
+// Moving a node to another parent takes its admitted Workloads from the old
+// tree to the new one without the workload event that normally reports the
+// subtree gauge.
+func (c *Cache) reportMovedAdmittedActiveWorkloads(oldParent, newParent *cohort) {
+	if oldParent != nil {
+		// An implicit old parent is deleted, or recreated, when its last child detaches.
+		oldParent = c.hm.Cohort(oldParent.Name)
+	}
+	if oldParent == newParent {
+		return
+	}
+	c.reportTreeAdmittedActiveWorkloadsIfNoCycle(oldParent)
+	c.reportTreeAdmittedActiveWorkloadsIfNoCycle(newParent)
+}
+
+// reportClusterQueueAdmittedActiveWorkloads updates cohort gauges after a
+// ClusterQueue parent or custom-label change. A same-parent relabel moves
+// incremental per-label counts; a parent change or implicit-parent recreation
+// rebuilds the affected trees from children. The current parent is taken from
+// cq after the cache edge update; oldParent is the parent captured before it.
+func (c *Cache) reportClusterQueueAdmittedActiveWorkloads(cq *clusterQueue, oldParent *cohort) {
+	var liveOld *cohort
+	if oldParent != nil {
+		liveOld = c.hm.Cohort(oldParent.Name)
+	}
+	newParent := cq.Parent()
+	newVals := slices.Clone(cq.GetCustomLabelValues())
+	if liveOld == newParent {
+		if oldParent == liveOld {
+			c.reportRelabeledAdmittedActiveWorkloads(cq, newParent, cq.reportedLabelVals, newVals)
+			return
+		}
+		cq.reportedLabelVals = newVals
+		c.reportTreeAdmittedActiveWorkloadsIfNoCycle(newParent)
+		return
+	}
+	cq.reportedLabelVals = newVals
+	c.reportTreeAdmittedActiveWorkloadsIfNoCycle(liveOld)
+	c.reportTreeAdmittedActiveWorkloadsIfNoCycle(newParent)
+}
+
+// reportRelabeledAdmittedActiveWorkloads moves incremental per-label counts
+// when a ClusterQueue's custom labels change under the same parent. An old
+// series is deleted only when no ClusterQueue in the subtree still uses those
+// labels.
+func (c *Cache) reportRelabeledAdmittedActiveWorkloads(cq *clusterQueue, parent *cohort, oldVals, newVals []string) {
+	if parent == nil || hierarchy.HasCycle(parent) {
+		cq.reportedLabelVals = slices.Clone(newVals)
+		return
+	}
+	if !slices.Equal(oldVals, newVals) {
+		parent.moveAdmittedLabelCounts(oldVals, newVals, cq.admittedWorkloadsCount)
+		for ancestor := range parent.PathSelfToRoot() {
+			oldCount := ancestor.admittedCountForLabels(oldVals)
+			if oldCount == 0 && !ancestor.subtreeHasClusterQueueWithLabels(oldVals) {
+				metrics.DeleteCohortSubtreeAdmittedActiveWorkloads(ancestor.Name, oldVals, c.roleTracker)
+			} else {
+				metrics.ReportCohortSubtreeAdmittedActiveWorkloads(ancestor.Name, oldCount, oldVals, c.roleTracker)
+			}
+			metrics.ReportCohortSubtreeAdmittedActiveWorkloads(ancestor.Name, ancestor.admittedCountForLabels(newVals), newVals, c.roleTracker)
+		}
+	}
+	cq.reportedLabelVals = slices.Clone(newVals)
+}
+
+// reportTreeAdmittedActiveWorkloadsIfNoCycle rebuilds subtree admitted gauges
+// from the root when the cohort is present and has no cycle.
+func (c *Cache) reportTreeAdmittedActiveWorkloadsIfNoCycle(cohort *cohort) {
+	if cohort != nil && !hierarchy.HasCycle(cohort) {
+		c.reportTreeAdmittedActiveWorkloads(cohort.getRootUnsafe())
+	}
+}
+
+// The gauge carries each ClusterQueue's custom labels, so a Cohort has a
+// series per ClusterQueue below it. Clearing from the root down before
+// reporting drops the series of ClusterQueues that have moved away.
+//
+// Per-label totals are accumulated in one bottom-up pass so a rebuild does
+// not walk the subtree once per ClusterQueue. The rebuilt tracker replaces
+// incremental counts so later Workload events and relabels stay consistent
+// after an implicit Cohort is removed and recreated.
+func (c *Cache) reportTreeAdmittedActiveWorkloads(cohort *cohort) *metrics.LabelValsTracker {
+	metrics.ClearCohortSubtreeAdmittedActiveWorkloads(cohort.Name)
+	totals := metrics.NewLabelValsTracker()
+	for _, child := range cohort.ChildCohorts() {
+		totals.Merge(c.reportTreeAdmittedActiveWorkloads(child))
+	}
+	for _, cq := range cohort.ChildCQs() {
+		vals := cq.appliedCustomLabelValues()
+		totals.Add(metrics.ValsSetFrom(vals), cq.admittedWorkloadsCount)
+	}
+	// updateCohortResourceNode rebuilds admittedWorkloadsCount on its own.
+	// Every caller must also run this rebuild, or the per-label counts drift from the total.
+	cohort.admittedLabelCounts = metrics.Copy(totals)
+	for ls, count := range totals.Iter() {
+		metrics.ReportCohortSubtreeAdmittedActiveWorkloads(cohort.Name, count, ls.OrderedList(), c.roleTracker)
+	}
+	return totals
 }

@@ -32,6 +32,9 @@ build_logs
 # Local Netlify folder
 .netlify
 
+# Tool installation logs
+.cache
+
 # Directory with CRDs for dependencies
 dep-crds
 
@@ -41,4 +44,9 @@ node_modules
 test/e2e/kueueviz/cypress/screenshots
 test/e2e/kueueviz/cypress/videos
 
+# Python bytecode caches
+__pycache__/
+*.pyc
 
+# Used by GitHub workflows
+.automation

@@ -30,11 +30,13 @@ import (
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	jobcontrollers "sigs.k8s.io/kueue/pkg/controller/jobs"
 	"sigs.k8s.io/kueue/pkg/controller/jobs/job"
 	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
 	"sigs.k8s.io/kueue/pkg/util/kubeversion"
 	"sigs.k8s.io/kueue/test/integration/framework"
-	"sigs.k8s.io/kueue/test/util"
+	"sigs.k8s.io/kueue/test/util/behavioral"
+	"sigs.k8s.io/kueue/test/util/behavioral/integration"
 )
 
 var (
@@ -46,20 +48,22 @@ var (
 )
 
 func TestAPIs(t *testing.T) {
-	util.RunSuite(t, "Jobs Webhook Suite")
+	behavioral.RunSuite(t, "Jobs Webhook Suite")
 }
 
 var _ = ginkgo.BeforeSuite(func() {
 	fwk = &framework.Framework{
 		DepCRDPaths: []string{
-			util.MpiOperatorCrds,
-			util.JobsetCrds,
-			util.RayOperatorCrds,
-			util.TrainingOperatorCrds,
-			util.AppWrapperCrds,
-			util.KfTrainerCrds,
+			behavioral.MpiOperatorCrds,
+			behavioral.JobsetCrds,
+			behavioral.LeaderWorkerSetCrds,
+			behavioral.RayOperatorCrds,
+			behavioral.TrainingOperatorCrds,
+			behavioral.AppWrapperCrds,
+			behavioral.KfTrainerCrds,
+			behavioral.SparkOperatorCrds,
 		},
-		WebhookPath: util.WebhookPath,
+		WebhookPath: behavioral.WebhookPath,
 	}
 	cfg = fwk.Init()
 	ctx, k8sClient = fwk.SetupClient(cfg)
@@ -70,15 +74,17 @@ var _ = ginkgo.AfterSuite(func() {
 })
 
 func managerSetup(setup func(ctrl.Manager, ...jobframework.Option) error, opts ...jobframework.Option) framework.ManagerSetup {
+	ginkgo.GinkgoHelper()
 	return func(ctx context.Context, mgr manager.Manager) {
+		integrationManager := jobcontrollers.NewIntegrationManager()
 		cCache := schdcache.New(mgr.GetClient())
 		preemptExpectations := preemptexpectations.New()
 		queueOptions := []qcache.Option{qcache.WithPreemptionExpectations(preemptExpectations)}
-		queues := util.NewManagerForIntegrationTests(ctx, mgr.GetClient(), cCache, queueOptions...)
-		opts = append(opts, jobframework.WithCache(cCache), jobframework.WithQueues(queues))
+		queues := integration.NewManager(ctx, mgr.GetClient(), cCache, queueOptions...)
+		opts = append(opts, jobframework.WithIntegrationManager(integrationManager), jobframework.WithCache(cCache), jobframework.WithQueues(queues))
 
 		err := setup(mgr, opts...)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-		jobframework.EnableIntegration(job.FrameworkName)
+		integrationManager.EnableIntegration(job.FrameworkName)
 	}
 }

@@ -16,11 +16,26 @@ limitations under the License.
 
 package tas
 
+import (
+	corev1 "k8s.io/api/core/v1"
+)
+
+// NodeHostname returns the value that identifies the node in a hostname-level
+// topology domain: its kubernetes.io/hostname label, which can differ from the
+// Node name, or the Node name when the label is missing.
+func NodeHostname(node *corev1.Node) string {
+	if hostname := node.Labels[corev1.LabelHostname]; hostname != "" {
+		return hostname
+	}
+	return node.Name
+}
+
 // NodeMatchesFlavor checks if a node's labels match the required labels
 // and contains all required topology levels. Returns true if matches.
+// A required label matches only when the node has it, even if the required value is empty.
 func NodeMatchesFlavor(nodeLabels map[string]string, requiredLabels map[string]string, requiredLevels []string) bool {
 	for k, v := range requiredLabels {
-		if nodeLabels[k] != v {
+		if val, ok := nodeLabels[k]; !ok || val != v {
 			return false
 		}
 	}

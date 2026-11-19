@@ -1,5 +1,5 @@
 ---
-title: "Topology Aware Scheduling"
+title: "Topology-Aware Scheduling"
 date: 2024-04-11
 weight: 6
 description: >
@@ -10,7 +10,11 @@ description: >
 {{% alert title="Note" color="primary" %}}
 `TopologyAwareScheduling` is currently a beta feature and is enabled by default.
 
-You can disable it by editing the `TopologyAwareScheduling` feature gate. Refer to the
+To disable it, set `TopologyAwareScheduling: false` and set every enabled
+feature gate that depends on it to `false`. These are mostly the `TAS*` gates
+(see [Feature gates for alpha and beta features](/docs/installation/#feature-gates-for-alpha-and-beta-features));
+Kueue does not start while any dependent gate is still enabled, and the startup
+error lists each one. Refer to the
 [Installation guide](/docs/installation/#change-the-feature-gates-configuration)
 for instructions on configuring feature gates.
 {{% /alert %}}
@@ -29,7 +33,7 @@ different units. We say that nodes placed in different racks are more distant
 than nodes placed within the same rack. Similarly, nodes placed in different
 blocks are more distant than two nodes within the same block.
 
-In this feature (called Topology Aware Scheduling, or TAS for short) we
+In this feature (called Topology-Aware Scheduling, or TAS for short) we
 introduce a convention to represent the
 [hierarchical node topology information](#node-topology-information), and a set
 of APIs for Kueue administrators and users to utilize the information
@@ -66,7 +70,15 @@ domain (like a given rack) by:
   of only ready (with `Ready=True` condition) and schedulable (with `.spec.unschedulable=false`) Nodes,
 - subtracting the usage coming from all other admitted TAS workloads,
 - subtracting the usage coming from all other non-TAS Pods (owned mainly by
-  DaemonSets, but also including static Pods, Deployments, etc.).
+  DaemonSets, but also including static Pods, Deployments, etc.),
+- subtracting the physical usage of bound, non-terminal TAS Pods whose
+  Workload no longer has an active TAS reservation. Pods covered by an active
+  reservation are accounted for by that reservation instead, not twice.
+
+Residual TAS Pod accounting is controlled by `TASResidualPodAccounting`, a beta
+feature enabled by default in v0.21. Disabling it restores reservation-only TAS
+accounting; non-TAS Pods continue to consume physical capacity. The feature also
+defers admission when waiting for releasing Pods can avoid additional preemption.
 
 ### Admin-facing APIs
 
@@ -77,49 +89,123 @@ As an admin, in order to enable the feature you need to:
 
 #### Example
 
-{{< include "examples/tas/sample-queues.yaml" "yaml" >}}
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: "tas-flavor"
+spec:
+  nodeLabels:
+    cloud.provider.com/node-group: "tas-group"
+  topologyName: "default"
+```
 
-An example for managing GPUs:
-{{< include "examples/tas/sample-gpu-queues.yaml" "yaml" >}}
+For a step-by-step administrator guide on setting up a cluster with TAS, see [Setup Topology-Aware Scheduling](/docs/tasks/manage/setup_topology_aware_scheduling/).
 
 ### User-facing APIs
 
 Once TAS is configured and ready to be used, you can create Jobs with the
 following annotations set at the PodTemplate level:
 - `kueue.x-k8s.io/podset-preferred-topology` - indicates that a PodSet requires
-	Topology Aware Scheduling, but scheduling all pods within pods on nodes
+	Topology-Aware Scheduling, but scheduling all pods on nodes
 	within the same topology domain is a preference rather than requirement.
 	The levels are evaluated one-by-one going up from the level indicated by
 	the annotation. If the PodSet cannot fit within a given topology domain
 	then the next topology level up is considered. If the PodSet cannot fit
 	at the highest topology level, then it gets admitted as distributed
-	among multiple topology domains.
+	among multiple topology domains. Note that the label specified in the
+	annotation must still exist in the flavor's `Topology.spec.levels`; if the
+	requested level is not defined in the `Topology`, the flavor is rejected.
 - `kueue.x-k8s.io/podset-required-topology` - indicates that a PodSet
-  requires Topology Aware Scheduling, and requires scheduling all pods on nodes
+  requires Topology-Aware Scheduling, and requires scheduling all pods on nodes
 	within the same topology domain corresponding to the topology level
 	indicated by the annotation value (e.g. within a rack or within a block).
 - `kueue.x-k8s.io/podset-unconstrained-topology` - indicates that a PodSet requires
-    Topology Aware Scheduling, and requires scheduling all pods on any nodes without
+    Topology-Aware Scheduling, and requires scheduling all pods on any nodes without
     topology considerations. In other words, this considers if all pods could be accommodated 
     within any nodes which helps to minimize fragmentation by filling the small gaps
     on nodes across the cluster.
 - `kueue.x-k8s.io/podset-group-name` - indicates the name of the group of PodSets. PodSet Group
     is a unit of flavor assignment and topology domain fitting. This is useful when you want to
-    ensure that multiple PodSets are scheduled in the same topology domain.
+    ensure that multiple PodSets are scheduled in the same topology domain. This annotation must
+    be used together with `kueue.x-k8s.io/podset-required-topology` or
+    `kueue.x-k8s.io/podset-preferred-topology`.
+- `kueue.x-k8s.io/podset-slice-required-topology` and `kueue.x-k8s.io/podset-slice-size` - split a
+    PodSet into slices of the given size and require each slice to be scheduled within a single
+    topology domain at the level indicated by `podset-slice-required-topology`.
 - `kueue.x-k8s.io/podset-slice-required-topology-constraints` - defines multi-layer slice
     topology constraints as a JSON-encoded array. Each entry specifies a topology level and
     slice size, ordered from the outermost (coarsest) to the innermost (finest) layer. At most
     3 layers are supported. This annotation is mutually exclusive with
     `kueue.x-k8s.io/podset-slice-required-topology` and `kueue.x-k8s.io/podset-slice-size`.
     Requires the `TASMultiLayerTopology` feature gate.
+- `kueue.x-k8s.io/podset-topology-spreading` - defines cross-workload spreading rules
+    as a JSON-encoded object. Each rule caps the share of the admitted Workloads matching
+    a label selector that one topology domain may already hold for the next PodSet group
+    to be placed there, spreading separate workloads across failure domains rather than
+    packing them. This annotation must be used together with
+    `kueue.x-k8s.io/podset-required-topology`. Requires the `TASTopologySpreading`
+    feature gate.
 
 #### Example
 
-Here is an example Job a user might submit to use TAS. It assumes there exists
-a LocalQueue named `tas-user-queue` which refernces the ClusterQueue pointing
-to a TAS ResourceFlavor.
+```yaml
+spec:
+  template:
+    metadata:
+      annotations:
+        kueue.x-k8s.io/podset-preferred-topology: "cloud.provider.com/topology-block"
+```
 
-{{< include "examples/tas/sample-job-preferred.yaml" "yaml" >}}
+For detailed instructions and full examples on running TAS workloads as a batch user, see [Run Workloads with Topology-Aware Scheduling](/docs/tasks/run/topology_aware_scheduling/).
+
+#### Implicit TAS and mixed-flavor ClusterQueues
+
+Whether a PodSet without an explicit TAS annotation can use a TAS
+`ResourceFlavor` depends on how the target `ClusterQueue` is configured.
+
+If **every** `ResourceFlavor` referenced across all `spec.resourceGroups` of the
+`ClusterQueue` has `.spec.topologyName` set (a TAS-only `ClusterQueue`),
+unannotated PodSets implicitly use TAS with unconstrained placement at the
+lowest topology level (using the `LeastFreeCapacity` strategy, as opposed to
+`BestFit` used by `required` and `preferred` annotations).
+
+If any `ResourceFlavor` listed in the `ClusterQueue` (even one with `0`
+`nominalQuota`) does not set `.spec.topologyName`, implicit TAS is disabled:
+unannotated PodSets can only be assigned non-TAS flavors
+(`Flavor "<name>" supports only TopologyAwareScheduling`), and PodSets with an
+explicit TAS annotation can only be assigned TAS flavors
+(`Flavor "<name>" does not support TopologyAwareScheduling`) for the resources
+they request. For example, in a `ClusterQueue` that offers both TAS and non-TAS
+flavors in the same `resourceGroup` (such as `[gpu-tas, gpu-standard]`, or
+`[gpu-tas, cpu-only]` where `cpu-only` has `0` `nvidia.com/gpu` quota),
+workloads that need the TAS flavor **must** set an explicit TAS annotation on
+the PodTemplate (see [User-facing APIs](#user-facing-apis)):
+
+```yaml
+spec:
+  resourceGroups:
+  - coveredResources: ["cpu", "nvidia.com/gpu"]
+    flavors:
+    - name: gpu-tas      # .spec.topologyName set (requires an explicit TAS annotation)
+      resources:
+      - { name: "cpu", nominalQuota: 64 }
+      - { name: "nvidia.com/gpu", nominalQuota: 8 }
+    - name: cpu-only     # .spec.topologyName unset (used by unannotated CPU-only Pods)
+      resources:
+      - { name: "cpu", nominalQuota: 64 }
+      - { name: "nvidia.com/gpu", nominalQuota: 0 }
+```
+
+{{% alert title="Warning" color="warning" %}}
+Because a PodSet cannot mix TAS and non-TAS flavors across the resources it
+requests, do **not** put `cpu` in a non-TAS `resourceGroup` and `nvidia.com/gpu`
+in a separate TAS `resourceGroup`: a Pod requesting both `cpu` and
+`nvidia.com/gpu` cannot be admitted with or without a TAS annotation. A separate
+non-TAS `resourceGroup` only works for quota-only resources not present in the
+Pod's `resources.requests` (such as resources added by
+`ResourceTransformations`).
+{{% /alert %}}
 
 ### ClusterAutoscaler support
 
@@ -205,7 +291,9 @@ You can disable it by editing the `TASFailedNodeReplacementFailFast` feature gat
 for instructions on configuring feature gates.
 {{% /alert %}}
 
-By default, Kueue tries to find a replacement for a failed node until it succeeds or until the workload is evicted (for example, by `waitForPodsReady.recoveryTimeout`). To prevent Kueue from retrying indefinitely, you can enable the `TASFailedNodeReplacementFailFast` feature gate. When enabled, Kueue will only attempt to find a replacement node once. If it fails, it will not try again, and the workload will get evicted and requeued.
+If the `TASFailedNodeReplacementFailFast` feature gate is disabled, Kueue tries to find a replacement for a failed node until it succeeds or until the workload is evicted (for example, by `waitForPodsReady.recoveryTimeout`). To prevent Kueue from retrying indefinitely, keep the `TASFailedNodeReplacementFailFast` feature gate enabled (the default). When enabled, Kueue will only attempt to find a replacement node once. If it fails, it will not try again, and the workload will get evicted and requeued.
+
+When the `TASNodeReplacementDeferFailFastWhenUsefulInflightEvictions` feature gate is enabled, Kueue does not evict the workload if evictions already in progress are expected to free a suitable placement.
 
 #### Replace Node on Node Taints
 {{< feature-state state="beta" for_version="v0.17" >}}
@@ -293,7 +381,10 @@ assignment while its pod is still draining the termination grace period on the
 original node — an assignment no pod can consume, blocking the newly assigned
 node's capacity for the full grace period. With the gate enabled, evicted pod-owned
 Workloads get `Requeued=False` instead: the Workload finishes with its pod, and the
-owning controller's replacement pod arrives as a new Workload.
+owning controller's replacement pod arrives as a new Workload. This applies only once
+the pod's `kueue.x-k8s.io/admission` scheduling gate has been removed. A pod that still
+carries that gate at eviction time, for example because an AdmissionCheck was still
+pending, has not been placed and is not deleted, so its Workload is requeued as usual.
 
 #### Usage Scenarios
 
@@ -325,7 +416,9 @@ Here are a few scenarios that can happen when both `TASReplaceNodeOnPodTerminati
 
 ##### Feature Gate Interaction Matrix
 
-The following table summarizes the behavior based on the combination of the feature gates. If `TASFailedNodeReplacement` is `false`, the other gates have no effect.
+The following table summarizes the behavior based on the combination of the feature gates.
+`TASReplaceNodeOnPodTermination` and `TASFailedNodeReplacementFailFast` depend on `TASFailedNodeReplacement`,
+so when `TASFailedNodeReplacement` is `false` they must be `false` too; otherwise Kueue fails to start.
 
 **Feature Gate Legend:**
 - **FNR**: `TASFailedNodeReplacement`
@@ -334,9 +427,11 @@ The following table summarizes the behavior based on the combination of the feat
 
 | `FNR` | `RNO` | `FNFF` | End Behavior |
 | :---- | :---- | :---- | :----------- |
-| `false` | *any* | *any* | **Hot swap is disabled.**<br>Workloads will not have failed nodes replaced and may get stuck. |
-| `true` | *any* | `false` | **Default Hot Swap**<ul><li>**Trigger**: Node is `NotReady` AND its workload pods are terminating or terminated.</li><li>**Behavior**: Retries replacement until it succeeds or the workload is evicted.</li></ul> |
-| `true` | *any* | `true` | **Fast Hot Swap**<ul><li>**Trigger**: Node is `NotReady` AND its workload pods are terminating or terminated.</li><li>**Behavior**: Attempts replacement **only once**. Evicts the workload if it fails.</li></ul> |
+| `false` | `false` | `false` | **Hot swap is disabled.**<br>Workloads will not have failed nodes replaced and may get stuck. |
+| `true` | `true` | `false` | **Hot Swap**<ul><li>**Trigger**: Node is `NotReady` AND its workload pods are terminating or terminated.</li><li>**Behavior**: Retries replacement until it succeeds or the workload is evicted.</li></ul> |
+| `true` | `false` | `false` | **Hot Swap**<ul><li>**Trigger**: Node is `NotReady` for 30 seconds.</li><li>**Behavior**: Retries replacement until it succeeds or the workload is evicted.</li></ul> |
+| `true` | `true` | `true` | **Fast Hot Swap (default)**<ul><li>**Trigger**: Node is `NotReady` AND its workload pods are terminating or terminated.</li><li>**Behavior**: Attempts replacement **only once**. Evicts the workload if it fails, unless evictions already in progress are expected to free a suitable placement.</li></ul> |
+| `true` | `false` | `true` | **Fast Hot Swap**<ul><li>**Trigger**: Node is `NotReady` for 30 seconds.</li><li>**Behavior**: Attempts replacement **only once**. Evicts the workload if it fails, unless evictions already in progress are expected to free a suitable placement.</li></ul> |
 
 With the deprecated `TASReplaceNodeDueToNotReadyOverFixedTime` gate enabled, the
 not-ready trigger depends on `TASReplaceNodeOnPodTermination` (`RNO`):
@@ -367,7 +462,7 @@ See [Replace Node on Node Taints](#replace-node-on-node-taints) for the per-tain
 
 We recommend keeping all four feature gates enabled to ensure the fastest feedback loop for workloads affected by node failures or tainted nodes.
 
-#### Balanced Placement
+### Balanced placement
 {{< feature-state state="alpha" for_version="v0.15" >}}
 {{% alert title="Note" color="primary" %}}
 `TASBalancedPlacement` is currently an alpha feature and is disabled by default.
@@ -389,13 +484,13 @@ capacities (10,10) will be placed (10,2). However, in some applications, a more 
 be more efficient. Some examples of such cases would be all-to-all communication procedures (e.g. Allgather)
 since more balanced placement leads to more efficient cross-domain traffic.
 
-To use this feature, use the `kueue.x-k8s.io/podset-preferred-topology` annotation on the Job. Kueue TAS makes 
+To use this feature, use the `kueue.x-k8s.io/podset-preferred-topology` annotation on the PodTemplate. Kueue TAS makes
 sure that the minimum number of pods (or slices) placed on any domain **one level below** the indicated level
 will be maximied. Also (as a second criterion) the number of domains used on the indicated level will be
 minimized. However, if the Job would not fit within a single domain **one level above** the indicated level,
 Kueue will not perform the balanced placement and will fallback to the standard TAS algorithm.
 
-#### Multi-Layer Topology
+### Multi-layer topology
 {{< feature-state state="beta" for_version="v0.19" >}}
 {{% alert title="Note" color="primary" %}}
 `TASMultiLayerTopology` is currently an beta feature and is enabled by default.
@@ -419,11 +514,15 @@ For example, if you have 64 pods and want groups of 32 pods within the same bloc
 groups of 16 pods within the same rack, you can express this with a single annotation:
 
 ```yaml
-kueue.x-k8s.io/podset-slice-required-topology-constraints: |
-  [
-    {"topology": "cloud.provider.com/topology-block", "size": 32},
-    {"topology": "cloud.provider.com/topology-rack", "size": 16}
-  ]
+spec:
+  template:
+    metadata:
+      annotations:
+        kueue.x-k8s.io/podset-slice-required-topology-constraints: |
+          [
+            {"topology": "cloud.provider.com/topology-block", "size": 32},
+            {"topology": "cloud.provider.com/topology-rack", "size": 16}
+          ]
 ```
 
 The constraints are specified as a JSON array ordered from the outermost (coarsest) to
@@ -432,6 +531,129 @@ outer slice size.
 
 This annotation is mutually exclusive with `kueue.x-k8s.io/podset-slice-required-topology`
 and `kueue.x-k8s.io/podset-slice-size`.
+
+### Topology Spreading
+{{< feature-state state="alpha" for_version="v0.20" >}}
+{{% alert title="Note" color="primary" %}}
+`TASTopologySpreading` is currently an alpha feature and is disabled by default.
+
+You can enable it by editing the `TASTopologySpreading` feature gate. Refer to the
+[Installation guide](/docs/installation/#change-the-feature-gates-configuration)
+for instructions on configuring feature gates. It requires `TopologyAwareScheduling`
+to be enabled as well.
+{{% /alert %}}
+
+The rest of TAS packs the Pods of one workload as densely as possible. Topology
+Spreading does the opposite across *separate* workloads: it limits how many of
+them may occupy one topology domain, so that losing a single zone or rack does
+not take down an entire service. This targets inference serving, where a replica
+of a large model is itself a group of co-located Pods - a shape Kubernetes
+[Pod Topology Spread Constraints](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/)
+cannot express.
+
+To use this feature, add the `kueue.x-k8s.io/podset-topology-spreading` annotation
+alongside `kueue.x-k8s.io/podset-required-topology` on the PodTemplate, which for a
+Job means `spec.template.metadata.annotations` rather than the Job's own
+`metadata.annotations`:
+
+```yaml
+spec:
+  template:
+    metadata:
+      annotations:
+        kueue.x-k8s.io/podset-required-topology: "topology.kubernetes.io/zone"
+        kueue.x-k8s.io/podset-topology-spreading: |
+          {
+            "workloadLabelSelectors": [{"key": "app", "operator": "In", "values": ["main-inference-service"]}],
+            "rules": [{"topologyKey": "topology.kubernetes.io/zone", "maxShareAllowingPlacement": "0.45", "enforcementMode": "Preferred"}]
+          }
+```
+
+`workloadLabelSelectors` picks the admitted Workloads that count against each
+other; when omitted it defaults to the parent job's `kueue.x-k8s.io/job-uid`,
+which groups the replicas of one LeaderWorkerSet, and the replicas of one
+Deployment while the `DeploymentJobUIDLabel` feature gate is enabled (the
+default). With that gate disabled, each Deployment Pod's Workload carries its
+own UID, so the default groups nothing and a Deployment needs an explicit
+selector. Kueue applies that default when it schedules the Workload and does
+not write it into the annotation, so the annotation always reads back exactly as
+you wrote it. A Workload with no `kueue.x-k8s.io/job-uid` label has no group to
+spread within and is scheduled as if it carried no spreading annotation.
+
+{{% alert title="Warning" color="warning" %}}
+A selector on your own label, such as the `app` label above, only works if that
+label is copied onto the Workload. Kueue copies only the label keys listed in
+`integrations.labelKeysToCopy` in the Kueue `Configuration`, and that list is
+empty by default:
+
+```yaml
+apiVersion: config.kueue.x-k8s.io/v1beta2
+kind: Configuration
+integrations:
+  labelKeysToCopy:
+    - app
+```
+
+Without this, the selector matches no Workloads and spreading has no effect —
+with no error, event or condition to indicate it. The default
+`kueue.x-k8s.io/job-uid` selector needs no such configuration, because the job
+integrations set that label on the Workloads they manage rather than copying it
+from the job.
+{{% /alert %}}
+
+A rule lets a domain take the next PodSet group only while the domain
+holds at most `maxShareAllowingPlacement` of what is already placed, so a value
+of `V` opens `ceil(1 / V)` domains before any is reused. `Required` (the default)
+makes the workload wait rather than crowd a domain; `Preferred` only ranks
+crowded domains last. Multi-Pod replicas must share one
+`kueue.x-k8s.io/podset-group-name` so a replica counts once. Note that
+`ValidatePodSetGroupingTopology` requires exactly two PodSets in a shared group
+and requires at least one PodSet with `Count == 1`. Spreading is evaluated at
+admission time and counts only Workloads in the same namespace that are admitted
+to the same ClusterQueue and ResourceFlavor - admitted workloads are never
+rebalanced.
+
+### Partial slices
+
+When the slice size does not evenly divide the number of pods in the PodSet,
+the trailing pods form one partial slice, which is placed in a single
+topology domain just like a full slice. For example, 10 pods with a slice size
+of 4 are placed as two slices of 4 pods and one slice of 2 pods. This behavior
+is controlled by the `TASPartialSlices` feature gate, which is enabled by
+default.
+
+The partial slice is charged for the pods it actually holds, so a PodSet is
+admitted into a topology that has exactly as many free slots as the PodSet has
+pods. Kueue takes it into account while it chooses the domains, so a domain that
+has room for the full slices but not for the trailing pods is passed over, and
+the trailing pods share a domain with full slices whenever one of them has room
+for them.
+
+The partial slice is always the last one, so that the pod ranks of every
+other slice stay within a single domain.
+
+Partial slices are supported for a single slice layer only. The inner layers
+of `kueue.x-k8s.io/podset-slice-required-topology-constraints` subdivide a slice
+further, and the trailing pods generally do not divide by their sizes, so the
+outermost size still has to evenly divide the PodSet.
+
+### Dynamic Resource Allocation
+{{< feature-state state="alpha" for_version="v0.20" >}}
+{{% alert title="Note" color="primary" %}}
+This feature requires the `KueueDRADeviceFeasibility` feature gate, which is an alpha feature
+and is disabled by default.
+{{% /alert %}}
+
+By default, TAS cannot tell which nodes have the devices a Pod requests through
+[Dynamic Resource Allocation](/docs/concepts/dynamic_resource_allocation/) (DRA):
+devices requested through a `ResourceClaimTemplate` are not in the Pod's resource
+requests, and an extended resource that only a `DeviceClass` provides is not in any
+node's allocatable. With the `KueueDRADeviceFeasibility` feature gate, Kueue checks that
+each node it considers can allocate the DRA devices a Pod requests, and drops the nodes
+that cannot. For an extended resource, this check replaces the lookup in node
+allocatable. See
+[Topology-Aware Scheduling with DRA](/docs/concepts/dynamic_resource_allocation/#topology-aware-scheduling-with-dra)
+for the prerequisites and limitations.
 
 ## Drawbacks
 

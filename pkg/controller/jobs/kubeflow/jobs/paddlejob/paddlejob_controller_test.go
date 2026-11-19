@@ -28,7 +28,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/component-base/featuregate"
-	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -290,17 +289,16 @@ func TestPodSets(t *testing.T) {
 						PodSpec(job.Spec.PaddleReplicaSpecs[kftraining.PaddleJobReplicaTypeMaster].Template.Spec).
 						Annotations(map[string]string{kueue.PodSetRequiredTopologyAnnotation: "cloud.com/rack"}).
 						RequiredTopologyRequest("cloud.com/rack").
-						PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+						PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 						Obj(),
 					*utiltestingapi.MakePodSet(kueue.NewPodSetReference(string(kftraining.PaddleJobReplicaTypeWorker)), 1).
 						PodSpec(job.Spec.PaddleReplicaSpecs[kftraining.PaddleJobReplicaTypeWorker].Template.Spec).
 						Annotations(map[string]string{kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block"}).
 						PreferredTopologyRequest("cloud.com/block").
-						PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+						PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 						Obj(),
 				}
 			},
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
 		},
 		"without required and preferred topology annotation if TAS is disabled": {
 			job: testingpaddlejob.MakePaddleJob("paddlejob", "ns").
@@ -380,7 +378,6 @@ func TestValidate(t *testing.T) {
 					},
 				).
 				Obj(),
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
 		},
 		"invalid TAS request": {
 			job: testingpaddlejob.MakePaddleJob("paddlejob", "ns").
@@ -419,7 +416,29 @@ func TestValidate(t *testing.T) {
 					`must not contain more than one topology annotation: ["kueue.x-k8s.io/podset-required-topology", `+
 						`"kueue.x-k8s.io/podset-preferred-topology", "kueue.x-k8s.io/podset-unconstrained-topology"]`),
 			},
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
+		},
+		"invalid TAS request is accepted if TAS is disabled": {
+			job: testingpaddlejob.MakePaddleJob("paddlejob", "ns").
+				PaddleReplicaSpecs(
+					testingpaddlejob.PaddleReplicaSpecRequirement{
+						ReplicaType:  kftraining.PaddleJobReplicaTypeMaster,
+						ReplicaCount: 1,
+						Annotations: map[string]string{
+							kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/rack",
+							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
+						},
+					},
+					testingpaddlejob.PaddleReplicaSpecRequirement{
+						ReplicaType:  kftraining.PaddleJobReplicaTypeWorker,
+						ReplicaCount: 1,
+						Annotations: map[string]string{
+							kueue.PodSetRequiredTopologyAnnotation:  "cloud.com/rack",
+							kueue.PodSetPreferredTopologyAnnotation: "cloud.com/block",
+						},
+					},
+				).
+				Obj(),
+			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: false},
 		},
 		"invalid slice topology request - slice size larger than number of podsets": {
 			job: testingpaddlejob.MakePaddleJob("paddlejob", "ns").
@@ -460,7 +479,6 @@ func TestValidate(t *testing.T) {
 					"20", "must not be greater than pod set count 10",
 				),
 			},
-			featureGates: map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
 		},
 	}
 	for name, tc := range testCases {
@@ -522,10 +540,10 @@ func TestReconciler(t *testing.T) {
 				*utiltestingapi.MakeWorkload("paddlejob", "ns").
 					PodSets(
 						*utiltestingapi.MakePodSet("master", 1).
-							PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+							PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 							Obj(),
 						*utiltestingapi.MakePodSet("worker", 2).
-							PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+							PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 							Obj(),
 					).
 					Obj(),
@@ -566,14 +584,14 @@ func TestReconciler(t *testing.T) {
 								Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
 									corev1.ResourceCPU: "default",
 								},
-								Count: ptr.To[int32](1),
+								Count: new(int32(1)),
 							},
 							kueue.PodSetAssignment{
 								Name: "worker",
 								Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
 									corev1.ResourceCPU: "default",
 								},
-								Count: ptr.To[int32](10),
+								Count: new(int32(10)),
 							},
 						).
 						Obj(), now).
@@ -609,14 +627,14 @@ func TestReconciler(t *testing.T) {
 								Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
 									corev1.ResourceCPU: "default",
 								},
-								Count: ptr.To[int32](1),
+								Count: new(int32(1)),
 							},
 							kueue.PodSetAssignment{
 								Name: "worker",
 								Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
 									corev1.ResourceCPU: "default",
 								},
-								Count: ptr.To[int32](10),
+								Count: new(int32(10)),
 							},
 						).
 						Obj(), now).
@@ -632,7 +650,9 @@ func TestReconciler(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			ctx, _ := utiltesting.ContextWithLog(t)
-			kcBuilder := utiltesting.NewClientBuilder(kftraining.AddToScheme).WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge})
+			kcBuilder := utiltesting.NewClientBuilder(kftraining.AddToScheme).WithInterceptorFuncs(interceptor.Funcs{
+				SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration,
+			})
 			indexer := utiltesting.AsIndexer(kcBuilder)
 			if err := SetupIndexes(ctx, indexer); err != nil {
 				t.Fatalf("Failed to setup indexes: %v", err)
