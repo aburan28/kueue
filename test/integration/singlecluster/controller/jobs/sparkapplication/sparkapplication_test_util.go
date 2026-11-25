@@ -19,31 +19,52 @@ package sparkapplication
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
 
 	sparkv1beta2 "github.com/kubeflow/spark-operator/v2/api/v1beta2"
+	sparkcommon "github.com/kubeflow/spark-operator/v2/pkg/common"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/component-base/featuregate"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/controller/constants"
 	workloadsparkapplication "sigs.k8s.io/kueue/pkg/controller/jobs/sparkapplication"
+	"sigs.k8s.io/kueue/pkg/features"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
-	"sigs.k8s.io/kueue/test/util"
+	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
+	"sigs.k8s.io/kueue/test/util/behavioral"
+	"sigs.k8s.io/kueue/test/util/behavioral/integration"
 )
 
 const (
 	instanceKey                       = "cloud.provider.com/instance"
 	jobQueueName kueue.LocalQueueName = "test-queue"
+	submissionID                      = "submission-1"
 )
 
+// executorPodPhases maps the executor states the Spark Operator reports to the phases of
+// their pods.
+var executorPodPhases = map[sparkv1beta2.ExecutorState]corev1.PodPhase{
+	sparkv1beta2.ExecutorStatePending:   corev1.PodPending,
+	sparkv1beta2.ExecutorStateRunning:   corev1.PodRunning,
+	sparkv1beta2.ExecutorStateCompleted: corev1.PodSucceeded,
+	sparkv1beta2.ExecutorStateFailed:    corev1.PodFailed,
+}
+
 type PodsReadyTestSpec struct {
+	FeatureGates    map[featuregate.Feature]bool
+	PodsScheduled   *metav1.Condition
 	BeforeAppState  *sparkv1beta2.ApplicationStateType
 	BeforeCondition *metav1.Condition
 	AppState        sparkv1beta2.ApplicationStateType
@@ -52,15 +73,16 @@ type PodsReadyTestSpec struct {
 }
 
 func shouldReconcileSparkApplication(ctx context.Context, k8sClient client.Client, sparkApp *sparkv1beta2.SparkApplication) {
+	ginkgo.GinkgoHelper()
 	ginkgo.By("checking the job gets suspended when created unsuspended")
-	util.MustCreate(ctx, k8sClient, sparkApp)
+	behavioral.MustCreate(ctx, k8sClient, sparkApp)
 	lookupKey := client.ObjectKeyFromObject(sparkApp)
 	createdSparkApplication := &sparkv1beta2.SparkApplication{}
 
 	gomega.Eventually(func(g gomega.Gomega) {
 		g.Expect(k8sClient.Get(ctx, lookupKey, createdSparkApplication)).Should(gomega.Succeed())
 		g.Expect(ptr.Deref(createdSparkApplication.Spec.Suspend, false)).Should(gomega.BeTrue())
-	}, util.Timeout, util.Interval).Should(gomega.Succeed())
+	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 
 	wlLookupKey := types.NamespacedName{
 		Name:      workloadsparkapplication.GetWorkloadNameForSparkApplication(sparkApp.Name, sparkApp.UID),
@@ -68,22 +90,22 @@ func shouldReconcileSparkApplication(ctx context.Context, k8sClient client.Clien
 	}
 
 	ginkgo.By("checking the workload is created without queue assigned")
-	createdWorkload := util.AwaitAndVerifyCreatedWorkload(ctx, k8sClient, wlLookupKey, createdSparkApplication)
+	createdWorkload := behavioral.AwaitAndVerifyCreatedWorkload(ctx, k8sClient, wlLookupKey, createdSparkApplication)
 	gomega.Expect(createdWorkload.Spec.QueueName).Should(gomega.Equal(kueue.LocalQueueName("")), "The Workload shouldn't have .spec.queueName set")
 
 	ginkgo.By("checking the workload is updated with queue name when the job does")
 	createdSparkApplication.Labels = map[string]string{constants.QueueLabel: string(jobQueueName)}
 	gomega.Expect(k8sClient.Update(ctx, createdSparkApplication)).Should(gomega.Succeed())
-	util.AwaitAndVerifyWorkloadQueueName(ctx, k8sClient, createdWorkload, wlLookupKey, jobQueueName)
+	behavioral.AwaitAndVerifyWorkloadQueueName(ctx, k8sClient, createdWorkload, wlLookupKey, jobQueueName)
 
 	ginkgo.By("checking the job is unsuspended when workload is assigned")
 	onDemandFlavor := utiltestingapi.MakeResourceFlavor("on-demand").NodeLabel(instanceKey, "on-demand").Obj()
-	util.MustCreate(ctx, k8sClient, onDemandFlavor)
+	behavioral.MustCreate(ctx, k8sClient, onDemandFlavor)
 	spotFlavor := utiltestingapi.MakeResourceFlavor("spot").NodeLabel(instanceKey, "spot").Obj()
-	util.MustCreate(ctx, k8sClient, spotFlavor)
+	behavioral.MustCreate(ctx, k8sClient, spotFlavor)
 	defer func() {
-		util.ExpectObjectToBeDeleted(ctx, k8sClient, onDemandFlavor, true)
-		util.ExpectObjectToBeDeleted(ctx, k8sClient, spotFlavor, true)
+		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, onDemandFlavor, true)
+		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, spotFlavor, true)
 	}()
 
 	clusterQueue := utiltestingapi.MakeClusterQueue("cluster-queue").
@@ -107,25 +129,26 @@ func shouldReconcileSparkApplication(ctx context.Context, k8sClient client.Clien
 			},
 		).Obj()
 
-	util.SetQuotaReservation(ctx, k8sClient, wlLookupKey, admission)
-	util.SyncAdmittedConditionForWorkloads(ctx, k8sClient, createdWorkload)
+	integration.SetQuotaReservation(ctx, k8sClient, wlLookupKey, admission)
+	integration.SyncAdmittedConditionForWorkloads(ctx, k8sClient, createdWorkload)
 	gomega.Eventually(func(g gomega.Gomega) {
 		g.Expect(k8sClient.Get(ctx, lookupKey, createdSparkApplication)).Should(gomega.Succeed())
 		g.Expect(ptr.Deref(createdSparkApplication.Spec.Suspend, true)).Should(gomega.BeFalse())
-	}, util.Timeout, util.Interval).Should(gomega.Succeed())
+	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 
 	gomega.Eventually(func(g gomega.Gomega) {
 		ok, _ := utiltesting.CheckEventRecordedFor(ctx, k8sClient, "Started", corev1.EventTypeNormal, fmt.Sprintf("Admitted by clusterQueue %v", clusterQueue.Name), lookupKey)
 		g.Expect(ok).Should(gomega.BeTrue())
-	}, util.Timeout, util.Interval).Should(gomega.Succeed())
+	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 
 	gomega.Expect(createdSparkApplication.Spec.Driver.NodeSelector).To(gomega.BeComparableTo(map[string]string{instanceKey: "on-demand"}))
 	gomega.Expect(createdSparkApplication.Spec.Executor.NodeSelector).To(gomega.BeComparableTo(map[string]string{instanceKey: "spot"}))
 }
 
 func shouldNotReconcileUnmanagedSparkApplication(ctx context.Context, k8sClient client.Client, sparkApp *sparkv1beta2.SparkApplication) {
+	ginkgo.GinkgoHelper()
 	ginkgo.By("checking the job remains unsuspended and no workload is created in unmanaged namespace")
-	util.MustCreate(ctx, k8sClient, sparkApp)
+	behavioral.MustCreate(ctx, k8sClient, sparkApp)
 
 	lookupKey := client.ObjectKeyFromObject(sparkApp)
 	wlLookupKey := types.NamespacedName{
@@ -138,15 +161,17 @@ func shouldNotReconcileUnmanagedSparkApplication(ctx context.Context, k8sClient 
 		g.Expect(k8sClient.Get(ctx, lookupKey, createdSparkApplication)).Should(gomega.Succeed())
 		g.Expect(ptr.Deref(createdSparkApplication.Spec.Suspend, false)).Should(gomega.BeFalse())
 		g.Expect(k8sClient.Get(ctx, wlLookupKey, workload)).Should(utiltesting.BeNotFoundError())
-	}, util.ConsistentDuration, util.ShortInterval).Should(gomega.Succeed())
+	}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
 }
 
 func waitForPodsReadyEnabledForSparkApplication(ctx context.Context, k8sClient client.Client, sparkApp, createdSparkApplication *sparkv1beta2.SparkApplication, podsReadyTestSpec PodsReadyTestSpec) {
+	ginkgo.GinkgoHelper()
+	features.SetFeatureGatesDuringTest(ginkgo.GinkgoTB(), podsReadyTestSpec.FeatureGates)
 	ginkgo.By("Create a SparkApplication")
 	sparkApp.Labels = map[string]string{constants.QueueLabel: string(jobQueueName)}
-	util.MustCreate(ctx, k8sClient, sparkApp)
+	behavioral.MustCreate(ctx, k8sClient, sparkApp)
 	lookupKey := client.ObjectKeyFromObject(sparkApp)
-	gomega.ExpectWithOffset(1, k8sClient.Get(ctx, lookupKey, createdSparkApplication)).Should(gomega.Succeed())
+	gomega.Expect(k8sClient.Get(ctx, lookupKey, createdSparkApplication)).Should(gomega.Succeed())
 
 	wlLookupKey := types.NamespacedName{
 		Name:      workloadsparkapplication.GetWorkloadNameForSparkApplication(sparkApp.Name, sparkApp.UID),
@@ -155,9 +180,9 @@ func waitForPodsReadyEnabledForSparkApplication(ctx context.Context, k8sClient c
 
 	ginkgo.By("Fetch the workload created for the SparkApplication")
 	createdWorkload := &kueue.Workload{}
-	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
+	gomega.Eventually(func(g gomega.Gomega) {
 		g.Expect(k8sClient.Get(ctx, wlLookupKey, createdWorkload)).Should(gomega.Succeed())
-	}, util.Timeout, util.Interval).Should(gomega.Succeed())
+	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 
 	ginkgo.By("Admit the workload created for the SparkApplication")
 	admission := utiltestingapi.MakeAdmission("foo").PodSets(
@@ -176,65 +201,81 @@ func waitForPodsReadyEnabledForSparkApplication(ctx context.Context, k8sClient c
 			Count: new(createdWorkload.Spec.PodSets[1].Count),
 		},
 	).Obj()
-	util.SetQuotaReservation(ctx, k8sClient, wlLookupKey, admission)
-	util.SyncAdmittedConditionForWorkloads(ctx, k8sClient, createdWorkload)
+	integration.SetQuotaReservation(ctx, k8sClient, wlLookupKey, admission)
+	integration.SyncAdmittedConditionForWorkloads(ctx, k8sClient, createdWorkload)
 
 	ginkgo.By("Await for the SparkApplication to be unsuspended")
-	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
+	gomega.Eventually(func(g gomega.Gomega) {
 		g.Expect(k8sClient.Get(ctx, lookupKey, createdSparkApplication)).Should(gomega.Succeed())
 		g.Expect(ptr.Deref(createdSparkApplication.Spec.Suspend, true)).Should(gomega.BeFalse())
-	}, util.Timeout, util.Interval).Should(gomega.Succeed())
+	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+
+	if podsReadyTestSpec.PodsScheduled != nil {
+		integration.SetPodsScheduledCondition(ctx, k8sClient, wlLookupKey, *podsReadyTestSpec.PodsScheduled)
+	}
 
 	if podsReadyTestSpec.BeforeAppState != nil {
 		ginkgo.By("Update the SparkApplication status to simulate initial progress")
-		createdSparkApplication.Status.AppState.State = *podsReadyTestSpec.BeforeAppState
-		createdSparkApplication.Status.ExecutorState = executorStatesForAppState(createdSparkApplication, *podsReadyTestSpec.BeforeAppState)
-		gomega.ExpectWithOffset(1, k8sClient.Status().Update(ctx, createdSparkApplication)).Should(gomega.Succeed())
-		gomega.ExpectWithOffset(1, k8sClient.Get(ctx, lookupKey, createdSparkApplication)).Should(gomega.Succeed())
+		simulateProgress(ctx, k8sClient, createdSparkApplication, *podsReadyTestSpec.BeforeAppState)
 	}
 
 	if podsReadyTestSpec.BeforeCondition != nil {
 		ginkgo.By("Verify pre-condition on Workload")
-		gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
+		gomega.Eventually(func(g gomega.Gomega) {
 			g.Expect(k8sClient.Get(ctx, wlLookupKey, createdWorkload)).Should(gomega.Succeed())
 			g.Expect(apimeta.FindStatusCondition(createdWorkload.Status.Conditions, kueue.WorkloadPodsReady)).Should(
 				gomega.BeComparableTo(
 					podsReadyTestSpec.BeforeCondition,
-					util.IgnoreConditionTimestampsAndObservedGeneration,
+					behavioral.IgnoreConditionTimestampsAndObservedGeneration,
 				),
 			)
-		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 	}
 
 	ginkgo.By("Update the SparkApplication status to simulate progress")
-	createdSparkApplication.Status.AppState.State = podsReadyTestSpec.AppState
-	createdSparkApplication.Status.ExecutorState = executorStatesForAppState(createdSparkApplication, podsReadyTestSpec.AppState)
-	gomega.ExpectWithOffset(1, k8sClient.Status().Update(ctx, createdSparkApplication)).Should(gomega.Succeed())
-	gomega.ExpectWithOffset(1, k8sClient.Get(ctx, lookupKey, createdSparkApplication)).Should(gomega.Succeed())
+	simulateProgress(ctx, k8sClient, createdSparkApplication, podsReadyTestSpec.AppState)
 
 	if podsReadyTestSpec.Suspended {
 		ginkgo.By("Unset admission of the workload to suspend the SparkApplication")
-		util.SetQuotaReservation(ctx, k8sClient, wlLookupKey, nil)
-		util.SyncAdmittedConditionForWorkloads(ctx, k8sClient, createdWorkload)
+		integration.SetQuotaReservation(ctx, k8sClient, wlLookupKey, nil)
+		integration.SyncAdmittedConditionForWorkloads(ctx, k8sClient, createdWorkload)
 	}
 
 	ginkgo.By("Verify the PodsReady condition")
-	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
+	gomega.Eventually(func(g gomega.Gomega) {
 		g.Expect(k8sClient.Get(ctx, wlLookupKey, createdWorkload)).Should(gomega.Succeed())
 		g.Expect(apimeta.FindStatusCondition(createdWorkload.Status.Conditions, kueue.WorkloadPodsReady)).Should(
 			gomega.BeComparableTo(
 				podsReadyTestSpec.WantCondition,
-				util.IgnoreConditionTimestampsAndObservedGeneration,
+				behavioral.IgnoreConditionTimestampsAndObservedGeneration,
 			),
 		)
-	}, util.Timeout, util.Interval).Should(gomega.Succeed())
+	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+}
+
+// simulateProgress emulates the Spark Operator and the kubelet: while the driver runs, the
+// executor pods of the current submission are running and ready, and the operator reports
+// the driver state and the executors in the status. PodsReady counts the ready executor pods,
+// as the operator declares no executor counts here.
+func simulateProgress(ctx context.Context, k8sClient client.Client, sparkApp *sparkv1beta2.SparkApplication, state sparkv1beta2.ApplicationStateType) {
+	ginkgo.GinkgoHelper()
+	executorState := executorStatesForAppState(sparkApp, state)
+	for name := range executorState {
+		setExecutorPodReady(ctx, k8sClient, sparkApp, name)
+	}
+	gomega.Eventually(func(g gomega.Gomega) {
+		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(sparkApp), sparkApp)).Should(gomega.Succeed())
+		sparkApp.Status.AppState.State = state
+		sparkApp.Status.SubmissionID = submissionID
+		sparkApp.Status.ExecutorState = executorState
+		g.Expect(k8sClient.Status().Update(ctx, sparkApp)).Should(gomega.Succeed())
+	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 }
 
 // executorStatesForAppState mirrors what Spark Operator would publish in
-// Status.ExecutorState given the SparkApplication's AppState. PodsReady
-// requires len(running/completed executors) >= Spec.Executor.Instances, so
-// tests that simulate AppState=Running must also simulate matching executor
-// states; any other AppState clears the map.
+// Status.ExecutorState given the SparkApplication's AppState: its
+// Spec.Executor.Instances executors running while the driver runs, and none
+// otherwise.
 func executorStatesForAppState(sparkApp *sparkv1beta2.SparkApplication, state sparkv1beta2.ApplicationStateType) map[string]sparkv1beta2.ExecutorState {
 	if state != sparkv1beta2.ApplicationStateRunning {
 		return nil
@@ -248,4 +289,77 @@ func executorStatesForAppState(sparkApp *sparkv1beta2.SparkApplication, state sp
 		states[fmt.Sprintf("%s-exec-%d", sparkApp.Name, i)] = sparkv1beta2.ExecutorStateRunning
 	}
 	return states
+}
+
+// createExecutorPod emulates the Spark driver, which creates the executor pods with the Spark
+// labels and from the executor labels, annotations and pod template. envtest runs no Spark driver.
+// As in Spark, the name ends with the executor ID.
+func createExecutorPod(ctx context.Context, k8sClient client.Client, sparkApp *sparkv1beta2.SparkApplication, name string) *corev1.Pod {
+	ginkgo.GinkgoHelper()
+	gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(sparkApp), sparkApp)).Should(gomega.Succeed())
+	executor := testingpod.MakePod(name, sparkApp.Namespace).
+		Label(sparkcommon.LabelSparkAppName, sparkApp.Name).
+		Label(sparkcommon.LabelSparkRole, sparkcommon.SparkRoleExecutor).
+		Label(sparkcommon.LabelSubmissionID, submissionID).
+		Label(sparkcommon.LabelSparkExecutorID, name[strings.LastIndex(name, "-")+1:]).
+		Obj()
+	maps.Copy(executor.Labels, sparkApp.Spec.Executor.Labels)
+	executor.Annotations = maps.Clone(sparkApp.Spec.Executor.Annotations)
+	if template := sparkApp.Spec.Executor.Template; template != nil {
+		executor.Spec.SchedulingGates = slices.Clone(template.Spec.SchedulingGates)
+	}
+	behavioral.MustCreate(ctx, k8sClient, executor)
+	return executor
+}
+
+// setAppStatus emulates the Spark Operator, which mirrors the driver state and the executor
+// pods into the SparkApplication status in production. envtest runs no Spark Operator. The
+// executor pods are updated first, as the operator reports them only after they change.
+func setAppStatus(ctx context.Context, k8sClient client.Client, sparkApp *sparkv1beta2.SparkApplication, state sparkv1beta2.ApplicationStateType, executors ...sparkv1beta2.ExecutorState) {
+	ginkgo.GinkgoHelper()
+	executorState := make(map[string]sparkv1beta2.ExecutorState, len(executors))
+	for i, st := range executors {
+		name := fmt.Sprintf("%s-exec-%d", sparkApp.Name, i+1)
+		executorState[name] = st
+		setExecutorPodPhase(ctx, k8sClient, sparkApp, name, executorPodPhases[st])
+	}
+	gomega.Eventually(func(g gomega.Gomega) {
+		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(sparkApp), sparkApp)).Should(gomega.Succeed())
+		sparkApp.Status.AppState.State = state
+		sparkApp.Status.SubmissionAttempts = 1
+		sparkApp.Status.SubmissionID = submissionID
+		sparkApp.Status.ExecutorState = executorState
+		g.Expect(k8sClient.Status().Update(ctx, sparkApp)).Should(gomega.Succeed())
+	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+}
+
+// setExecutorPodPhase emulates the kubelet, which moves the executor pod to the given phase.
+// It creates the executor pod first if the driver has not created it yet.
+func setExecutorPodPhase(ctx context.Context, k8sClient client.Client, sparkApp *sparkv1beta2.SparkApplication, name string, phase corev1.PodPhase) {
+	ginkgo.GinkgoHelper()
+	pod := &corev1.Pod{}
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: sparkApp.Namespace, Name: name}, pod); apierrors.IsNotFound(err) {
+		pod = createExecutorPod(ctx, k8sClient, sparkApp, name)
+	}
+	gomega.Eventually(func(g gomega.Gomega) {
+		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod)).Should(gomega.Succeed())
+		pod.Status.Phase = phase
+		g.Expect(k8sClient.Status().Update(ctx, pod)).Should(gomega.Succeed())
+	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+}
+
+// setExecutorPodReady emulates the kubelet, which runs the executor pod and reports it ready.
+// It creates the executor pod first if the driver has not created it yet.
+func setExecutorPodReady(ctx context.Context, k8sClient client.Client, sparkApp *sparkv1beta2.SparkApplication, name string) {
+	ginkgo.GinkgoHelper()
+	pod := &corev1.Pod{}
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: sparkApp.Namespace, Name: name}, pod); apierrors.IsNotFound(err) {
+		pod = createExecutorPod(ctx, k8sClient, sparkApp, name)
+	}
+	gomega.Eventually(func(g gomega.Gomega) {
+		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod)).Should(gomega.Succeed())
+		pod.Status.Phase = corev1.PodRunning
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		g.Expect(k8sClient.Status().Update(ctx, pod)).Should(gomega.Succeed())
+	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 }

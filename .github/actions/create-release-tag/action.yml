@@ -1,0 +1,105 @@
+name: Create Release Tag
+description: Validates the changelog, creates an annotated git tag from the changelog, and pushes it to origin.
+
+inputs:
+  version:
+    description: Release version, formatted as vX.Y.Z (X - major, Y - minor, Z - patch; e.g. v0.10.0)
+    required: true
+  changelog:
+    description: Changelog content used as the tag annotation body
+    required: true
+  repo:
+    description: Target repository in owner/name format
+    required: true
+
+outputs:
+  outcome:
+    description: What happened to the tag — "created" or "updated"
+    value: ${{ steps.tag.outputs.outcome }}
+  message:
+    description: Detail message about the outcome (success or failure)
+    value: ${{ steps.tag.outputs.message }}
+
+runs:
+  using: composite
+  steps:
+    - name: Create and Push Tag
+      id: tag
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        CHANGELOG: ${{ inputs.changelog }}
+        ISSUE_NUMBER: ${{ github.event.issue.number }}
+        TARGET_REPO: ${{ inputs.repo }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # Query published and draft releases together. Only a successful lookup
+        # returning no release permits the missing-release path.
+        # shellcheck disable=SC2016
+        if ! RELEASE_STATE=$(gh api graphql \
+            -f query='query($owner: String!, $name: String!, $tag: String!) {
+              repository(owner: $owner, name: $name) {
+                release(tagName: $tag) { isDraft }
+              }
+            }' \
+            -f owner="${TARGET_REPO%/*}" -f name="${TARGET_REPO#*/}" -f tag="$VERSION" \
+            --jq 'if .data.repository == null then error("Repository lookup failed")
+                  elif .data.repository.release == null then "missing"
+                  elif .data.repository.release.isDraft == true then "draft"
+                  elif .data.repository.release.isDraft == false then "published"
+                  else error("Invalid release response") end'); then
+          echo "message=❌ Failed to look up release \`$VERSION\`. Check workflow logs for details." >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+        
+        if [ "$RELEASE_STATE" = "published" ]; then
+          BODY="❌ Release \`$VERSION\` is already published. Skipping tag creation/update to avoid overwriting a live release."
+          echo "message=$BODY" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+        
+        if [ -z "$CHANGELOG" ]; then
+          BODY="❌ Failed to create release tag \`$VERSION\`: No changelog found in the issue description. Make sure the issue has the Markdown block under \`## Changelog\`."
+          echo "message=$BODY" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        # Prepare tag message
+        NOTES_FILE=$(mktemp)
+        trap 'rm -f "$NOTES_FILE"' EXIT
+        printf "%s\n\n%s\n" "$VERSION" "$CHANGELOG" > "$NOTES_FILE"
+
+        # Configure git identity
+        git config --global user.name "kueue-release-bot"
+        git config --global user.email "kueue-release-bot@kubernetes.io"
+        gh auth setup-git
+
+        # Record the remote tag object, not the peeled commit or a stale local tag.
+        # A failed lookup must not be interpreted as an absent tag.
+        TAG_REF="refs/tags/${VERSION}"
+        if ! REMOTE_TAG=$(git ls-remote --refs origin "$TAG_REF"); then
+          echo "message=❌ Failed to look up remote tag \`$VERSION\`. Check workflow logs for details." >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+        REMOTE_OID="${REMOTE_TAG%%[[:space:]]*}"
+
+        # Prepare the replacement locally without deleting the remote tag.
+        if ! git tag -a -f "$VERSION" -F "$NOTES_FILE"; then
+          echo "message=❌ Failed to create release tag \`$VERSION\`. Check workflow logs for details." >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        # Replace only the value observed above. An empty OID requires the tag
+        # to still be absent, protecting concurrent creation as well as updates.
+        if ! git push --force-with-lease="${TAG_REF}:${REMOTE_OID}" origin "${TAG_REF}:${TAG_REF}"; then
+          echo "message=❌ Failed to push release tag \`$VERSION\`. Check workflow logs for details." >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        OUTCOME="created"
+        if [ -n "$REMOTE_OID" ]; then
+          OUTCOME="updated"
+        fi
+
+        echo "outcome=$OUTCOME" >> "$GITHUB_OUTPUT"
+        echo "message=✅ Release tag \`$VERSION\` has been successfully ${OUTCOME}." >> "$GITHUB_OUTPUT"

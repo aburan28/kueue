@@ -1,0 +1,152 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package resources
+
+import (
+	"math"
+	"strings"
+	"sync"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/sets"
+)
+
+// ResourceFormatter formats resource quantities using manager-specific rules.
+// Register all binary-formatted resources before sharing a formatter with
+// concurrent controller code.
+type ResourceFormatter struct {
+	mu                       sync.RWMutex
+	binaryFormattedResources sets.Set[corev1.ResourceName]
+}
+
+// NewResourceFormatter creates a ResourceFormatter with no custom resource
+// formatting rules.
+func NewResourceFormatter() *ResourceFormatter {
+	return &ResourceFormatter{binaryFormattedResources: sets.New[corev1.ResourceName]()}
+}
+
+// RegisterBinaryFormattedResource marks a resource name as byte-valued for display.
+func (f *ResourceFormatter) RegisterBinaryFormattedResource(name corev1.ResourceName) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.binaryFormattedResources == nil {
+		f.binaryFormattedResources = sets.New[corev1.ResourceName]()
+	}
+	f.binaryFormattedResources.Insert(name)
+}
+
+func (f *ResourceFormatter) usesBinaryFormat(name corev1.ResourceName) bool {
+	if f == nil {
+		return false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.binaryFormattedResources.Has(name)
+}
+
+// ResourceQuantity returns v in the appropriate Kubernetes quantity format for name.
+func (f *ResourceFormatter) ResourceQuantity(name corev1.ResourceName, v int64) resource.Quantity {
+	switch name {
+	case corev1.ResourceCPU:
+		return *resource.NewMilliQuantity(v, resource.DecimalSI)
+	case corev1.ResourceMemory, corev1.ResourceEphemeralStorage:
+		return newCanonicalQuantity(v, resource.BinarySI)
+	default:
+		if strings.HasPrefix(string(name), corev1.ResourceHugePagesPrefix) || f.usesBinaryFormat(name) {
+			return newCanonicalQuantity(v, resource.BinarySI)
+		}
+		return *resource.NewQuantity(v, resource.DecimalSI)
+	}
+}
+
+func newCanonicalQuantity(v int64, preferredFormat resource.Format) resource.Quantity {
+	preferred := *resource.NewQuantity(v, preferredFormat)
+	final, err := resource.ParseQuantity(preferred.String())
+	if err != nil {
+		return preferred
+	}
+	return final
+}
+
+func (f *ResourceFormatter) ResourceQuantityString(name corev1.ResourceName, v int64) string {
+	quantity := f.ResourceQuantity(name, v)
+	return quantity.String()
+}
+
+// AmountQuantity returns a in the format the API reports name in. A Quantity
+// carries at most MaxInt64 in the unit it reports, cores for CPU, so the scale
+// is applied before that bound; a magnitude past it is capped with its sign.
+func (f *ResourceFormatter) AmountQuantity(name corev1.ResourceName, a Amount) resource.Quantity {
+	if name == corev1.ResourceCPU {
+		// Everything held in an int64 of milli keeps the path it is on today.
+		if v, ok := a.asInt64(); ok {
+			return f.ResourceQuantity(name, v)
+		}
+		if dec, ok := a.milliDec(); ok {
+			return *resource.NewDecimalQuantity(*dec, resource.DecimalSI)
+		}
+		// ResourceQuantity reads its argument as milli, so the cap is built
+		// here in the cores a CPU Quantity reports.
+		return *resource.NewQuantity(quantityCap(a.Sign()), resource.DecimalSI)
+	}
+	// Reported in the whole units it is held in, so the two limits coincide.
+	// MinInt64 fits an int64 and is one past the magnitude a Quantity carries.
+	if v, ok := a.asInt64(); ok && v != math.MinInt64 {
+		return f.ResourceQuantity(name, v)
+	}
+	return f.ResourceQuantity(name, quantityCap(a.Sign()))
+}
+
+// HoldsAmount reports whether a Quantity of name can carry a. AmountQuantity
+// caps a magnitude past that, and reading the cap back is a different number.
+func (f *ResourceFormatter) HoldsAmount(name corev1.ResourceName, a Amount) bool {
+	return AmountFromQuantity(name, f.AmountQuantity(name, a)).Equal(a)
+}
+
+// quantityCap returns the largest magnitude a Quantity carries, with sign, in
+// the unit the Quantity reports.
+func quantityCap(sign int) int64 {
+	if sign < 0 {
+		return -math.MaxInt64
+	}
+	return math.MaxInt64
+}
+
+// AmountQuantityString renders a as the API would report it, capped past what
+// a Quantity carries; Amount.String is the exact form.
+func (f *ResourceFormatter) AmountQuantityString(name corev1.ResourceName, a Amount) string {
+	q := f.AmountQuantity(name, a)
+	return q.String()
+}
+
+// ExactAmountString renders a as the API would when that spelling is the same
+// number, and as the exact accounted value when a Quantity would cap it.
+// CPU is accounted in milli, so that fallback keeps the milli suffix.
+func (f *ResourceFormatter) ExactAmountString(name corev1.ResourceName, a Amount) string {
+	q := f.AmountQuantity(name, a)
+	if AmountFromQuantity(name, q).Equal(a) {
+		return q.String()
+	}
+	if name == corev1.ResourceCPU {
+		return a.String() + "m"
+	}
+	return a.String()
+}

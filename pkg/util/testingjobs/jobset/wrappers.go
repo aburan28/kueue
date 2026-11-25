@@ -24,7 +24,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
 	jobsetapi "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 	jobsetutil "sigs.k8s.io/jobset/pkg/util/testing"
 
@@ -47,17 +46,20 @@ var TestPodSpec = corev1.PodSpec{
 }
 
 type ReplicatedJobRequirements struct {
-	Name           string
-	Replicas       int32
-	Parallelism    int32
-	Completions    int32
-	BackoffLimit   *int32
-	Labels         map[string]string
-	Annotations    map[string]string
-	PodAnnotations map[string]string
-	Image          string
-	Args           []string
-	SuccessPolicy  *batchv1.SuccessPolicy
+	Name            string
+	Replicas        int32
+	Parallelism     int32
+	Completions     int32
+	BackoffLimit    *int32
+	Labels          map[string]string
+	Annotations     map[string]string
+	PodAnnotations  map[string]string
+	PodLabels       map[string]string
+	NodeSelector    map[string]string
+	SchedulingGates []corev1.PodSchedulingGate
+	Image           string
+	Args            []string
+	SuccessPolicy   *batchv1.SuccessPolicy
 }
 
 // MakeJobSet creates a wrapper for a suspended JobSet
@@ -86,6 +88,9 @@ func (j *JobSetWrapper) ReplicatedJobs(replicatedJobs ...ReplicatedJobRequiremen
 		jt.Spec.Parallelism = new(req.Parallelism)
 		jt.Spec.Completions = new(req.Completions)
 		jt.Spec.Template.Annotations = req.PodAnnotations
+		jt.Spec.Template.Labels = req.PodLabels
+		jt.Spec.Template.Spec.NodeSelector = req.NodeSelector
+		jt.Spec.Template.Spec.SchedulingGates = req.SchedulingGates
 		jt.Spec.SuccessPolicy = req.SuccessPolicy
 		if jt.Spec.SuccessPolicy != nil {
 			jt.Spec.CompletionMode = new(batchv1.IndexedCompletion)
@@ -93,12 +98,12 @@ func (j *JobSetWrapper) ReplicatedJobs(replicatedJobs ...ReplicatedJobRequiremen
 		if req.BackoffLimit != nil {
 			jt.Spec.BackoffLimit = req.BackoffLimit
 		} else if len(req.Image) > 0 {
-			jt.Spec.BackoffLimit = ptr.To[int32](0)
+			jt.Spec.BackoffLimit = new(int32(0))
 		}
 		if len(req.Image) > 0 {
 			spec := &jt.Spec.Template.Spec
 			spec.RestartPolicy = corev1.RestartPolicyNever
-			spec.TerminationGracePeriodSeconds = ptr.To[int64](0)
+			spec.TerminationGracePeriodSeconds = new(int64(0))
 			spec.Containers = []corev1.Container{
 				{
 					Name:  "c",

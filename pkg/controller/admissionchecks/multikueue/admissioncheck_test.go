@@ -17,12 +17,17 @@ limitations under the License.
 package multikueue
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
@@ -32,11 +37,17 @@ import (
 )
 
 func TestReconcile(t *testing.T) {
+	admissionChecksResource := schema.GroupResource{Group: kueue.SchemeGroupVersion.Group, Resource: "admissionchecks"}
+	errStatusUpdateNotFound := apierrors.NewNotFound(admissionChecksResource, "ac1")
+	errStatusUpdateConflict := apierrors.NewConflict(admissionChecksResource, "ac1", errors.New("the object has been modified"))
+
 	cases := map[string]struct {
 		checks       []kueue.AdmissionCheck
 		clusters     []kueue.MultiKueueCluster
 		reconcileFor string
 		configs      []kueue.MultiKueueConfig
+		// statusUpdateErr is returned by every AdmissionCheck status update.
+		statusUpdateErr error
 
 		wantChecks []kueue.AdmissionCheck
 		wantError  error
@@ -236,12 +247,93 @@ func TestReconcile(t *testing.T) {
 					Obj(),
 			},
 		},
+		"updates observed generation after changing to an equally active config": {
+			reconcileFor: "ac1",
+			checks: []kueue.AdmissionCheck{
+				*utiltestingapi.MakeAdmissionCheck("ac1").
+					ControllerName(kueue.MultiKueueControllerName).
+					Parameters(kueue.SchemeGroupVersion.Group, "MultiKueueConfig", "config2").
+					Generation(2).
+					Condition(metav1.Condition{
+						Type:               kueue.AdmissionCheckActive,
+						Status:             metav1.ConditionTrue,
+						Reason:             "Active",
+						Message:            "The admission check is active",
+						ObservedGeneration: 1,
+					}).
+					Obj(),
+			},
+			configs: []kueue.MultiKueueConfig{
+				*utiltestingapi.MakeMultiKueueConfig("config2").Clusters("worker1").Obj(),
+			},
+			clusters: []kueue.MultiKueueCluster{
+				*utiltestingapi.MakeMultiKueueCluster("worker1").
+					Active(metav1.ConditionTrue, "ByTest", "by test", 1).
+					Obj(),
+			},
+			wantChecks: []kueue.AdmissionCheck{
+				*utiltestingapi.MakeAdmissionCheck("ac1").
+					ControllerName(kueue.MultiKueueControllerName).
+					Parameters(kueue.SchemeGroupVersion.Group, "MultiKueueConfig", "config2").
+					Generation(2).
+					Condition(metav1.Condition{
+						Type:               kueue.AdmissionCheckActive,
+						Status:             metav1.ConditionTrue,
+						Reason:             "Active",
+						Message:            "The admission check is active",
+						ObservedGeneration: 2,
+					}).
+					Obj(),
+			},
+		},
+		"status update that fails with NotFound is ignored": {
+			reconcileFor: "ac1",
+			checks: []kueue.AdmissionCheck{
+				*utiltestingapi.MakeAdmissionCheck("ac1").
+					ControllerName(kueue.MultiKueueControllerName).
+					Parameters(kueue.SchemeGroupVersion.Group, "MultiKueueConfig", "config1").
+					Generation(1).
+					Obj(),
+			},
+			statusUpdateErr: errStatusUpdateNotFound,
+			wantChecks: []kueue.AdmissionCheck{
+				*utiltestingapi.MakeAdmissionCheck("ac1").
+					ControllerName(kueue.MultiKueueControllerName).
+					Parameters(kueue.SchemeGroupVersion.Group, "MultiKueueConfig", "config1").
+					Obj(),
+			},
+		},
+		"status update that fails with Conflict is returned": {
+			reconcileFor: "ac1",
+			checks: []kueue.AdmissionCheck{
+				*utiltestingapi.MakeAdmissionCheck("ac1").
+					ControllerName(kueue.MultiKueueControllerName).
+					Parameters(kueue.SchemeGroupVersion.Group, "MultiKueueConfig", "config1").
+					Generation(1).
+					Obj(),
+			},
+			statusUpdateErr: errStatusUpdateConflict,
+			wantChecks: []kueue.AdmissionCheck{
+				*utiltestingapi.MakeAdmissionCheck("ac1").
+					ControllerName(kueue.MultiKueueControllerName).
+					Parameters(kueue.SchemeGroupVersion.Group, "MultiKueueConfig", "config1").
+					Obj(),
+			},
+			wantError: errStatusUpdateConflict,
+		},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			ctx, _ := utiltesting.ContextWithLog(t)
 			builder := getClientBuilder(ctx)
+			if tc.statusUpdateErr != nil {
+				builder = builder.WithInterceptorFuncs(interceptor.Funcs{
+					SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+						return tc.statusUpdateErr
+					},
+				})
+			}
 
 			builder = builder.WithLists(
 				&kueue.AdmissionCheckList{Items: tc.checks},
@@ -258,8 +350,8 @@ func TestReconcile(t *testing.T) {
 			helper, _ := admissioncheck.NewMultiKueueStoreHelper(c)
 			reconciler := newACReconciler(c, helper, nil)
 
-			_, gotErr := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: tc.reconcileFor}})
-			if diff := cmp.Diff(tc.wantError, gotErr); diff != "" {
+			_, gotErr := reconciler.Reconcile(ctx, reconcile.Request{Name: tc.reconcileFor})
+			if diff := cmp.Diff(tc.wantError, gotErr, cmpopts.EquateErrors()); diff != "" {
 				t.Errorf("unexpected error (-want/+got):\n%s", diff)
 			}
 

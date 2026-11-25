@@ -31,11 +31,13 @@ type WorkloadSpecApplyConfiguration struct {
 	// and a count.
 	// There must be at least one element and at most 18.
 	// podSets cannot be changed.
+	//
 	PodSets []PodSetApplyConfiguration `json:"podSets,omitempty"`
 	// queueName is the name of the LocalQueue the Workload is associated with.
 	// queueName cannot be changed while .status.admission is not null.
 	QueueName *kueuev1beta2.LocalQueueName `json:"queueName,omitempty"`
 	// priorityClassRef references a PriorityClass object that defines the workload's priority.
+	//
 	PriorityClassRef *PriorityClassRefApplyConfiguration `json:"priorityClassRef,omitempty"`
 	// priority determines the order of access to the resources managed by the
 	// ClusterQueue where the workload is queued.
@@ -56,11 +58,18 @@ type WorkloadSpecApplyConfiguration struct {
 	// the workload can be admitted before it's automatically deactivated.
 	//
 	// If unspecified, no execution time limit is enforced on the Workload.
+	//
 	MaximumExecutionTimeSeconds *int32 `json:"maximumExecutionTimeSeconds,omitempty"`
 	// preemptionGates is a list of gates governing whether the workload
 	// can trigger preemptions.
 	// The gates are closed by default.
 	PreemptionGates []PreemptionGateApplyConfiguration `json:"preemptionGates,omitempty"`
+	// waitForPodsReady defines the per-workload pods-ready timeouts.
+	//
+	// This is an alpha field and requires enabling WorkloadLevelWaitForPodsReady feature gate.
+	//
+	// If unspecified, the cluster-wide WaitForPodsReady is used.
+	WaitForPodsReady *WaitForPodsReadyApplyConfiguration `json:"waitForPodsReady,omitempty"`
 }
 
 // WorkloadSpecApplyConfiguration constructs a declarative configuration of the WorkloadSpec type for use with
@@ -132,5 +141,13 @@ func (b *WorkloadSpecApplyConfiguration) WithPreemptionGates(values ...*Preempti
 		}
 		b.PreemptionGates = append(b.PreemptionGates, *values[i])
 	}
+	return b
+}
+
+// WithWaitForPodsReady sets the WaitForPodsReady field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the WaitForPodsReady field is set to the value of the last call.
+func (b *WorkloadSpecApplyConfiguration) WithWaitForPodsReady(value *WaitForPodsReadyApplyConfiguration) *WorkloadSpecApplyConfiguration {
+	b.WaitForPodsReady = value
 	return b
 }

@@ -88,6 +88,61 @@ func TestMultiKueueAdapter(t *testing.T) {
 					Obj(),
 			},
 		},
+		"sync does not propagate ttl seconds after finished to remote job when clearing is enabled": {
+			featureGates: map[featuregate.Feature]bool{
+				features.MultiKueueBatchJobClearingTTLSecondsAfterFinishedOnWorkerCluster: true,
+				features.WorkloadIdentifierAnnotations:                                    false,
+			},
+			managersJobs: []batchv1.Job{
+				*baseJobManagedByKueueBuilder.Clone().
+					TTLSecondsAfterFinished(0).
+					Obj(),
+			},
+			operation: func(ctx context.Context, adapter *multiKueueAdapter, managerClient, workerClient client.Client) error {
+				_, err := adapter.SyncJob(ctx, managerClient, workerClient, types.NamespacedName{Name: "job1", Namespace: TestNamespace}, "wl1", "origin1")
+				return err
+			},
+
+			wantManagersJobs: []batchv1.Job{
+				*baseJobManagedByKueueBuilder.Clone().
+					TTLSecondsAfterFinished(0).
+					Obj(),
+			},
+			wantWorkerJobs: []batchv1.Job{
+				*baseJobBuilder.Clone().
+					PrebuiltWorkloadLabel("wl1").
+					Label(kueue.MultiKueueOriginLabel, "origin1").
+					Obj(),
+			},
+		},
+		"sync propagates ttl seconds after finished to remote job when clearing is disabled": {
+			featureGates: map[featuregate.Feature]bool{
+				features.MultiKueueBatchJobClearingTTLSecondsAfterFinishedOnWorkerCluster: false,
+				features.WorkloadIdentifierAnnotations:                                    false,
+			},
+			managersJobs: []batchv1.Job{
+				*baseJobManagedByKueueBuilder.Clone().
+					TTLSecondsAfterFinished(0).
+					Obj(),
+			},
+			operation: func(ctx context.Context, adapter *multiKueueAdapter, managerClient, workerClient client.Client) error {
+				_, err := adapter.SyncJob(ctx, managerClient, workerClient, types.NamespacedName{Name: "job1", Namespace: TestNamespace}, "wl1", "origin1")
+				return err
+			},
+
+			wantManagersJobs: []batchv1.Job{
+				*baseJobManagedByKueueBuilder.Clone().
+					TTLSecondsAfterFinished(0).
+					Obj(),
+			},
+			wantWorkerJobs: []batchv1.Job{
+				*baseJobBuilder.Clone().
+					TTLSecondsAfterFinished(0).
+					PrebuiltWorkloadLabel("wl1").
+					Label(kueue.MultiKueueOriginLabel, "origin1").
+					Obj(),
+			},
+		},
 		"sync intermediate status from remote job": {
 			featureGates: map[featuregate.Feature]bool{features.WorkloadIdentifierAnnotations: false},
 			managersJobs: []batchv1.Job{
@@ -255,12 +310,16 @@ func TestMultiKueueAdapter(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			features.SetFeatureGatesDuringTest(t, tc.featureGates)
-			managerBuilder := utiltesting.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge})
+			managerBuilder := utiltesting.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
+				SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration,
+			})
 			managerBuilder = managerBuilder.WithLists(&batchv1.JobList{Items: tc.managersJobs})
 			managerBuilder = managerBuilder.WithStatusSubresource(slices.Map(tc.managersJobs, func(w *batchv1.Job) client.Object { return w })...)
 			managerClient := managerBuilder.Build()
 
-			workerBuilder := utiltesting.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge})
+			workerBuilder := utiltesting.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
+				SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration,
+			})
 			workerBuilder = workerBuilder.WithLists(&batchv1.JobList{Items: tc.workerJobs})
 			workerClient := workerBuilder.Build()
 
@@ -454,9 +513,6 @@ func Test_multiKueueAdapter_SyncJob(t *testing.T) {
 			},
 		},
 		"ElasticJob_RemoteInSync": {
-			fields: fields{
-				featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: true},
-			},
 			args: args{
 				localClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().
 					SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
@@ -483,9 +539,6 @@ func Test_multiKueueAdapter_SyncJob(t *testing.T) {
 			},
 		},
 		"ElasticJob_LocalIsStale": {
-			fields: fields{
-				featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: true},
-			},
 			args: args{
 				localClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().
 					SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
@@ -514,9 +567,6 @@ func Test_multiKueueAdapter_SyncJob(t *testing.T) {
 			},
 		},
 		"ElasticJob_WorkloadNameOnlyChange_EdgeCase": {
-			fields: fields{
-				featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: true},
-			},
 			args: args{
 				localClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().
 					SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
@@ -543,9 +593,6 @@ func Test_multiKueueAdapter_SyncJob(t *testing.T) {
 			},
 		},
 		"ElasticJob_RemoteOutOfSync": {
-			fields: fields{
-				featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: true},
-			},
 			args: args{
 				localClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().
 					SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
@@ -577,9 +624,6 @@ func Test_multiKueueAdapter_SyncJob(t *testing.T) {
 			},
 		},
 		"ElasticJob_RemoteOutOfSync_PatchFailure": {
-			fields: fields{
-				featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: true},
-			},
 			args: args{
 				localClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().
 					SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
@@ -613,14 +657,81 @@ func Test_multiKueueAdapter_SyncJob(t *testing.T) {
 					Obj(),
 			},
 		},
+		// Workaround for Kubernetes 1.36.0/1.36.1 (kubernetes/kubernetes#139281):
+		// when local is suspended and remote is unsuspended+not-finished,
+		// the adapter must patch JobSuspended=True on the local Job so that
+		// further spec updates (e.g. nodeSelector injection) are not blocked.
+		"WorkaroundEnabled_PatchesJobSuspendedCondition": {
+			fields: fields{
+				featureGates: map[featuregate.Feature]bool{features.MultiKueueJobSuspendedWorkaroundDisabled: false},
+			},
+			args: args{
+				// local: suspended (default), no JobSuspended condition yet.
+				localClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().Obj()).Build(),
+				// remote: unsuspended and not finished.
+				remoteClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().Suspend(false).Active(1).Obj()).Build(),
+				key:          client.ObjectKeyFromObject(newJob().Obj()),
+			},
+			want: want{
+				deferred: true,
+				localJob: newJob().
+					ResourceVersion("2").
+					Condition(batchv1.JobCondition{
+						Type:    batchv1.JobSuspended,
+						Status:  corev1.ConditionTrue,
+						Reason:  "MultiKueueAdapter",
+						Message: "Set by MultiKueue adapter",
+					}).
+					Obj(),
+			},
+		},
+		// When JobSuspended=True is already set, no additional patch should occur.
+		"WorkaroundEnabled_AlreadyHasJobSuspendedCondition": {
+			fields: fields{
+				featureGates: map[featuregate.Feature]bool{features.MultiKueueJobSuspendedWorkaroundDisabled: false},
+			},
+			args: args{
+				localClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().
+					Condition(batchv1.JobCondition{
+						Type:   batchv1.JobSuspended,
+						Status: corev1.ConditionTrue,
+					}).
+					Obj()).Build(),
+				remoteClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().Suspend(false).Active(1).Obj()).Build(),
+				key:          client.ObjectKeyFromObject(newJob().Obj()),
+			},
+			want: want{
+				deferred: true,
+				localJob: newJob().
+					Condition(batchv1.JobCondition{
+						Type:   batchv1.JobSuspended,
+						Status: corev1.ConditionTrue,
+					}).
+					Obj(),
+			},
+		},
+		// When MultiKueueJobSuspendedWorkaroundDisabled is enabled (Kubernetes 1.36.2+),
+		// the adapter must NOT patch JobSuspended=True.
+		"WorkaroundDisabled_SkipsJobSuspendedPatch": {
+			fields: fields{
+				featureGates: map[featuregate.Feature]bool{features.MultiKueueJobSuspendedWorkaroundDisabled: true},
+			},
+			args: args{
+				localClient:  fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().Obj()).Build(),
+				remoteClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().Suspend(false).Active(1).Obj()).Build(),
+				key:          client.ObjectKeyFromObject(newJob().Obj()),
+			},
+			want: want{
+				deferred: true,
+				localJob: newJob().Obj(), // no conditions patched
+			},
+		},
+
 		// Regression test for #11115: when an elastic sync is needed AND the local
 		// Job is still suspended (remote unsuspended and not finished), SyncJob must
 		// still report deferred=true — the deferred flag must not be dropped on the
 		// elastic-sync return path.
 		"ElasticJob_DeferredWhenLocalSuspended": {
-			fields: fields{
-				featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: true},
-			},
 			args: args{
 				// local: suspended (default), elastic, parallelism 22.
 				localClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().
@@ -639,11 +750,66 @@ func Test_multiKueueAdapter_SyncJob(t *testing.T) {
 				key:          client.ObjectKeyFromObject(newJob().Obj()),
 				workloadName: jobframework.GetWorkloadNameForOwnerWithGVKAndGeneration("test", "", gvk, 0),
 			},
-			// localJob/remoteJob left nil: the deferred path patches the local
-			// JobSuspended condition with a wall-clock timestamp not worth asserting
-			// here. This case guards the deferred flag, not the patched objects.
+			// localJob/remoteJob left nil: only the deferred flag is asserted here.
 			want: want{
 				deferred: true,
+			},
+		},
+		// Regression tests for re-dispatch scenario where the worker Job restarts
+		// with failed=0 but the manager already has non-zero failed counter.
+		// The old wholesale status copy was rejected by the K8s 1.35+ API server
+		// (RejectDecreasingFailedCounter). mergeJobStatus clamps it to max(local, remote).
+		"RedispatchWithDecreasingFailed_LocalUnsuspended": {
+			args: args{
+				// Local (manager) Job is unsuspended, failed=1 from previous dispatch.
+				localClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().
+					Suspend(false).
+					Failed(1).
+					Obj()).Build(),
+				// Remote (worker) Job is the NEW dispatch: failed=0, active=2.
+				remoteClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().
+					Suspend(false).
+					Active(2).
+					Obj()).Build(),
+				key: client.ObjectKeyFromObject(newJob().Obj()),
+			},
+			want: want{
+				// Manager Job must keep failed=1 (not decrease to 0), and pick up active=2.
+				localJob: newJob().
+					Suspend(false).
+					Failed(1).
+					Active(2).
+					Obj(),
+				remoteJob: newJob().
+					Suspend(false).
+					Active(2).
+					Obj(),
+			},
+		},
+		"RedispatchWithDecreasingFailed_LocalSuspendedRemoteFinished": {
+			args: args{
+				// Local (manager) Job is suspended, failed=2.
+				localClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().
+					Failed(2).
+					Obj()).Build(),
+				// Remote Job finished successfully with failed=0.
+				remoteClient: fake.NewClientBuilder().WithScheme(schema).WithObjects(newJob().
+					Condition(batchv1.JobCondition{
+						Type:   batchv1.JobComplete,
+						Status: corev1.ConditionTrue,
+					}).
+					Obj()).Build(),
+				key: client.ObjectKeyFromObject(newJob().Obj()),
+			},
+			want: want{
+				// Manager keeps failed=2 (monotonic) but picks up the Complete condition.
+				localJob: newJob().
+					Failed(2).
+					Condition(batchv1.JobCondition{
+						Type:   batchv1.JobComplete,
+						Status: corev1.ConditionTrue,
+					}).
+					Obj(),
 			},
 		},
 	}
@@ -702,7 +868,10 @@ func Test_multiKueueAdapter_SyncJob(t *testing.T) {
 				if err := tt.args.localClient.Get(ctx, client.ObjectKeyFromObject(tt.want.localJob), got); err != nil {
 					t.Errorf("SyncJob() unexpected assertion error retrieving local job: %v", err)
 				}
-				if diff := cmp.Diff(tt.want.localJob, got, cmpopts.EquateEmpty(), cmpopts.IgnoreFields(metav1.ObjectMeta{}, "ResourceVersion")); diff != "" {
+				if diff := cmp.Diff(tt.want.localJob, got,
+					cmpopts.EquateEmpty(),
+					cmpopts.IgnoreFields(metav1.ObjectMeta{}, "ResourceVersion"),
+					cmpopts.IgnoreFields(batchv1.JobCondition{}, "LastTransitionTime", "LastProbeTime")); diff != "" {
 					t.Errorf("SyncJob() localJob (-want,+got):\n%s", diff)
 				}
 			}

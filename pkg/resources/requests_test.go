@@ -18,8 +18,8 @@ package resources
 
 import (
 	"encoding/json"
+	"maps"
 	"math"
-	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -29,89 +29,89 @@ import (
 
 func TestCountIn(t *testing.T) {
 	cases := map[string]struct {
-		requests   Requests
-		capacity   Requests
+		requests   MapRequests
+		capacity   MapRequests
 		wantResult int32
 	}{
 		"requests equal capacity": {
-			requests: Requests{
-				corev1.ResourceCPU:    1,
-				corev1.ResourceMemory: 1,
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(1),
+				corev1.ResourceMemory: NewAmount(1),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU:    1,
-				corev1.ResourceMemory: 1,
+			capacity: MapRequests{
+				corev1.ResourceCPU:    NewAmount(1),
+				corev1.ResourceMemory: NewAmount(1),
 			},
 			wantResult: 1,
 		},
 		"requests with extra resource": {
-			requests: Requests{
-				corev1.ResourceCPU:    1,
-				corev1.ResourceMemory: 1,
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(1),
+				corev1.ResourceMemory: NewAmount(1),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU: 1,
+			capacity: MapRequests{
+				corev1.ResourceCPU: NewAmount(1),
 			},
 			wantResult: 0,
 		},
 		"first resource is bottleneck": {
-			requests: Requests{
-				corev1.ResourceCPU:    5,
-				corev1.ResourceMemory: 1,
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(5),
+				corev1.ResourceMemory: NewAmount(1),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU:    12,
-				corev1.ResourceMemory: 8,
+			capacity: MapRequests{
+				corev1.ResourceCPU:    NewAmount(12),
+				corev1.ResourceMemory: NewAmount(8),
 			},
 			wantResult: 2,
 		},
 		"second resource is bottleneck": {
-			requests: Requests{
-				corev1.ResourceCPU:    1,
-				corev1.ResourceMemory: 5,
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(1),
+				corev1.ResourceMemory: NewAmount(5),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU:    8,
-				corev1.ResourceMemory: 12,
+			capacity: MapRequests{
+				corev1.ResourceCPU:    NewAmount(8),
+				corev1.ResourceMemory: NewAmount(12),
 			},
 			wantResult: 2,
 		},
 		"capacity non divisible cleanly by requests": {
-			requests: Requests{
-				corev1.ResourceCPU: 2,
+			requests: MapRequests{
+				corev1.ResourceCPU: NewAmount(2),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU: 5,
+			capacity: MapRequests{
+				corev1.ResourceCPU: NewAmount(5),
 			},
 			wantResult: 2,
 		},
 		"requests amount of zero": {
-			requests: Requests{
-				corev1.ResourceCPU: 0,
+			requests: MapRequests{
+				corev1.ResourceCPU: NewAmount(0),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU: 5,
+			capacity: MapRequests{
+				corev1.ResourceCPU: NewAmount(5),
 			},
 			wantResult: int32(math.MaxInt32),
 		},
 		"has one resource with request amount of zero": {
-			requests: Requests{
-				corev1.ResourceCPU:    0,
-				corev1.ResourceMemory: 1,
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(0),
+				corev1.ResourceMemory: NewAmount(1),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU:    5,
-				corev1.ResourceMemory: 5,
+			capacity: MapRequests{
+				corev1.ResourceCPU:    NewAmount(5),
+				corev1.ResourceMemory: NewAmount(5),
 			},
 			wantResult: 5,
 		},
 		"requests amount of zero for extra resource": {
-			requests: Requests{
-				corev1.ResourceCPU:    1,
-				corev1.ResourceMemory: 0,
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(1),
+				corev1.ResourceMemory: NewAmount(0),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU: 5,
+			capacity: MapRequests{
+				corev1.ResourceCPU: NewAmount(5),
 			},
 			wantResult: 5,
 		},
@@ -128,91 +128,91 @@ func TestCountIn(t *testing.T) {
 
 func TestCountInWithLimitingResource(t *testing.T) {
 	cases := map[string]struct {
-		requests             Requests
-		capacity             Requests
+		requests             MapRequests
+		capacity             MapRequests
 		wantCount            int32
 		wantLimitingResource corev1.ResourceName
 	}{
 		"CPU is limiting": {
-			requests: Requests{
-				corev1.ResourceCPU:    1000,
-				corev1.ResourceMemory: 8 * 1024 * 1024 * 1024,
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(1000),
+				corev1.ResourceMemory: NewAmount(8 * 1024 * 1024 * 1024),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU:    500,
-				corev1.ResourceMemory: 32 * 1024 * 1024 * 1024,
+			capacity: MapRequests{
+				corev1.ResourceCPU:    NewAmount(500),
+				corev1.ResourceMemory: NewAmount(32 * 1024 * 1024 * 1024),
 			},
 			wantCount:            0,
 			wantLimitingResource: corev1.ResourceCPU,
 		},
 		"memory is limiting": {
-			requests: Requests{
-				corev1.ResourceCPU:    1000,
-				corev1.ResourceMemory: 16 * 1024 * 1024 * 1024,
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(1000),
+				corev1.ResourceMemory: NewAmount(16 * 1024 * 1024 * 1024),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU:    8000,
-				corev1.ResourceMemory: 8 * 1024 * 1024 * 1024,
+			capacity: MapRequests{
+				corev1.ResourceCPU:    NewAmount(8000),
+				corev1.ResourceMemory: NewAmount(8 * 1024 * 1024 * 1024),
 			},
 			wantCount:            0,
 			wantLimitingResource: corev1.ResourceMemory,
 		},
 		"tie-breaker by resource name": {
-			requests: Requests{
-				corev1.ResourceCPU:    1000,
-				corev1.ResourceMemory: 8 * 1024 * 1024 * 1024,
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(1000),
+				corev1.ResourceMemory: NewAmount(8 * 1024 * 1024 * 1024),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU:    500,
-				corev1.ResourceMemory: 4 * 1024 * 1024 * 1024,
+			capacity: MapRequests{
+				corev1.ResourceCPU:    NewAmount(500),
+				corev1.ResourceMemory: NewAmount(4 * 1024 * 1024 * 1024),
 			},
 			wantCount:            0,
 			wantLimitingResource: corev1.ResourceCPU, // "cpu" < "memory"
 		},
 		"resource not in capacity": {
-			requests: Requests{
-				corev1.ResourceCPU: 1000,
-				"nvidia.com/gpu":   2,
+			requests: MapRequests{
+				corev1.ResourceCPU: NewAmount(1000),
+				"nvidia.com/gpu":   NewAmount(2),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU: 8000,
+			capacity: MapRequests{
+				corev1.ResourceCPU: NewAmount(8000),
 				// GPU not in capacity
 			},
 			wantCount:            0,
 			wantLimitingResource: "nvidia.com/gpu",
 		},
 		"capacity exhausted": {
-			requests: Requests{
-				corev1.ResourceCPU: 1000,
+			requests: MapRequests{
+				corev1.ResourceCPU: NewAmount(1000),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU: 0,
+			capacity: MapRequests{
+				corev1.ResourceCPU: NewAmount(0),
 			},
 			wantCount:            0,
 			wantLimitingResource: corev1.ResourceCPU,
 		},
 		"request zero is skipped": {
-			requests: Requests{
-				corev1.ResourceCPU:    0,
-				corev1.ResourceMemory: 8 * 1024 * 1024 * 1024,
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(0),
+				corev1.ResourceMemory: NewAmount(8 * 1024 * 1024 * 1024),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU:    8000,
-				corev1.ResourceMemory: 16 * 1024 * 1024 * 1024,
+			capacity: MapRequests{
+				corev1.ResourceCPU:    NewAmount(8000),
+				corev1.ResourceMemory: NewAmount(16 * 1024 * 1024 * 1024),
 			},
 			wantCount:            2,
 			wantLimitingResource: corev1.ResourceMemory, // CPU skipped because request is 0
 		},
 		"GPU exhausted on GPU node": {
-			requests: Requests{
-				corev1.ResourceCPU:    2000,
-				corev1.ResourceMemory: 8 * 1024 * 1024 * 1024,
-				"nvidia.com/gpu":      2,
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(2000),
+				corev1.ResourceMemory: NewAmount(8 * 1024 * 1024 * 1024),
+				"nvidia.com/gpu":      NewAmount(2),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU:    8000,
-				corev1.ResourceMemory: 32 * 1024 * 1024 * 1024,
-				"nvidia.com/gpu":      0,
+			capacity: MapRequests{
+				corev1.ResourceCPU:    NewAmount(8000),
+				corev1.ResourceMemory: NewAmount(32 * 1024 * 1024 * 1024),
+				"nvidia.com/gpu":      NewAmount(0),
 			},
 			wantCount:            0,
 			wantLimitingResource: "nvidia.com/gpu",
@@ -223,14 +223,24 @@ func TestCountInWithLimitingResource(t *testing.T) {
 			// CountInWithLimitingResource must report this as "fits 0 times",
 			// not a negative count, so downstream consumers don't propagate
 			// invalid values into apiserver-validated structures.
-			requests: Requests{
-				corev1.ResourceCPU: 1000,
+			requests: MapRequests{
+				corev1.ResourceCPU: NewAmount(1000),
 			},
-			capacity: Requests{
-				corev1.ResourceCPU: -3000,
+			capacity: MapRequests{
+				corev1.ResourceCPU: NewAmount(-3000),
 			},
 			wantCount:            0,
 			wantLimitingResource: corev1.ResourceCPU,
+		},
+		"count above int32 is clamped to MaxInt32": {
+			requests: MapRequests{
+				corev1.ResourceMemory: NewAmount(1),
+			},
+			capacity: MapRequests{
+				corev1.ResourceMemory: NewAmount(math.MaxInt32 + 1),
+			},
+			wantCount:            math.MaxInt32,
+			wantLimitingResource: corev1.ResourceMemory,
 		},
 	}
 	for name, tc := range cases {
@@ -248,48 +258,59 @@ func TestCountInWithLimitingResource(t *testing.T) {
 
 func TestGreaterKeys(t *testing.T) {
 	cases := map[string]struct {
-		a, b Requests
+		a, b MapRequests
 		want []corev1.ResourceName
 	}{
 		"empty_a": {
-			b:    Requests{corev1.ResourceCPU: 1},
+			b:    MapRequests{corev1.ResourceCPU: NewAmount(1)},
 			want: nil,
 		},
 		"empty_b": {
-			a:    Requests{corev1.ResourceCPU: 1},
+			a:    MapRequests{corev1.ResourceCPU: NewAmount(1)},
 			want: nil,
 		},
 		"less_one": {
-			a:    Requests{corev1.ResourceCPU: 500},
-			b:    Requests{corev1.ResourceCPU: 1000},
+			a:    MapRequests{corev1.ResourceCPU: NewAmount(500)},
+			b:    MapRequests{corev1.ResourceCPU: NewAmount(1000)},
 			want: nil,
 		},
 		"greater_one": {
-			a:    Requests{corev1.ResourceCPU: 1000},
-			b:    Requests{corev1.ResourceCPU: 500},
+			a:    MapRequests{corev1.ResourceCPU: NewAmount(1000)},
+			b:    MapRequests{corev1.ResourceCPU: NewAmount(500)},
 			want: []corev1.ResourceName{corev1.ResourceCPU},
 		},
 		"multiple": {
-			a: Requests{
-				"r1": 2,
-				"r2": 1,
+			a: MapRequests{
+				"r1": NewAmount(2),
+				"r2": NewAmount(1),
 			},
-			b: Requests{
-				"r1": 1,
-				"r2": 2,
+			b: MapRequests{
+				"r1": NewAmount(1),
+				"r2": NewAmount(2),
 			},
 			want: []corev1.ResourceName{"r1"},
 		},
 		"multiple_unrelated": {
-			a: Requests{
-				"r1": 2,
-				"r2": 2,
+			a: MapRequests{
+				"r1": NewAmount(2),
+				"r2": NewAmount(2),
 			},
-			b: Requests{
-				"r3": 1,
-				"r4": 1,
+			b: MapRequests{
+				"r3": NewAmount(1),
+				"r4": NewAmount(1),
 			},
 			want: nil,
+		},
+		"multiple_greater_sorted": {
+			a: MapRequests{
+				"r2": NewAmount(2),
+				"r1": NewAmount(2),
+			},
+			b: MapRequests{
+				"r2": NewAmount(1),
+				"r1": NewAmount(1),
+			},
+			want: []corev1.ResourceName{"r1", "r2"},
 		},
 	}
 	for name, tc := range cases {
@@ -303,9 +324,9 @@ func TestGreaterKeys(t *testing.T) {
 }
 
 func TestGreaterKeysRL(t *testing.T) {
-	reqs := Requests{
-		corev1.ResourceCPU:    1000,
-		corev1.ResourceMemory: 1024,
+	reqs := MapRequests{
+		corev1.ResourceCPU:    NewAmount(1000),
+		corev1.ResourceMemory: NewAmount(1024),
 	}
 	rl := corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("500m"),
@@ -318,8 +339,25 @@ func TestGreaterKeysRL(t *testing.T) {
 	}
 }
 
-func resetBinaryFormattedResources() {
-	binaryFormattedResources = sync.Map{}
+func TestMapRequestsAddStaysExactPastInt64(t *testing.T) {
+	reqs := MapRequests{corev1.ResourceMemory: NewAmount(math.MaxInt64)}
+	sum := maps.Clone(reqs)
+	sum.Add(reqs)
+	got := sum.ResourceValue(corev1.ResourceMemory)
+	want := NewAmount(math.MaxInt64).MulInt64(2)
+	if !got.Equal(want) {
+		t.Errorf("Add() = %s, want %s", got, want)
+	}
+
+	cpu := resource.MustParse("9223372036854775807")
+	one := NewMapRequests(corev1.ResourceList{corev1.ResourceCPU: cpu})
+	total := maps.Clone(one)
+	total.Add(one)
+	gotCPU := total.ResourceValue(corev1.ResourceCPU)
+	wantCPU := AmountFromQuantity(corev1.ResourceCPU, cpu).MulInt64(2)
+	if !gotCPU.Equal(wantCPU) {
+		t.Errorf("CPU Add() = %s, want %s", gotCPU, wantCPU)
+	}
 }
 
 func TestResourceQuantityRoundTrips(t *testing.T) {
@@ -391,11 +429,11 @@ func TestResourceQuantityRoundTrips(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			t.Cleanup(resetBinaryFormattedResources)
+			formatter := NewResourceFormatter()
 			if tc.resource == corev1.ResourceName("gpu.memory") {
-				RegisterBinaryFormattedResource(tc.resource)
+				formatter.RegisterBinaryFormattedResource(tc.resource)
 			}
-			quantity := ResourceQuantity(tc.resource, tc.value)
+			quantity := formatter.ResourceQuantity(tc.resource, tc.value)
 			initial := quantity.String()
 
 			if initial != tc.expected {
@@ -409,6 +447,429 @@ func TestResourceQuantityRoundTrips(t *testing.T) {
 
 			if roundtrip != tc.expected {
 				t.Errorf("unexpected result after roundtrip, want=%s, got=%s", tc.expected, roundtrip)
+			}
+		})
+	}
+}
+
+func TestLazyRequests(t *testing.T) {
+	cases := map[string]struct {
+		base              MapRequests
+		op                func(*LazyRequests)
+		wantResult        MapRequests
+		wantCachedCreated bool
+		wantEmpty         bool
+	}{
+		"no operation preserves base": {
+			base:              MapRequests{corev1.ResourceCPU: NewAmount(10), corev1.ResourceMemory: NewAmount(100)},
+			op:                nil,
+			wantResult:        MapRequests{corev1.ResourceCPU: NewAmount(10), corev1.ResourceMemory: NewAmount(100)},
+			wantCachedCreated: false,
+			wantEmpty:         false,
+		},
+		"subtraction creates clone and updates result": {
+			base: MapRequests{corev1.ResourceCPU: NewAmount(10), corev1.ResourceMemory: NewAmount(100)},
+			op: func(l *LazyRequests) {
+				l.Sub(MapRequests{corev1.ResourceCPU: NewAmount(3)})
+			},
+			wantResult:        MapRequests{corev1.ResourceCPU: NewAmount(7), corev1.ResourceMemory: NewAmount(100)},
+			wantCachedCreated: true,
+			wantEmpty:         false,
+		},
+		"addition creates clone and updates result": {
+			base: MapRequests{corev1.ResourceCPU: NewAmount(10), corev1.ResourceMemory: NewAmount(100)},
+			op: func(l *LazyRequests) {
+				l.Add(MapRequests{corev1.ResourceCPU: NewAmount(5)})
+			},
+			wantResult:        MapRequests{corev1.ResourceCPU: NewAmount(15), corev1.ResourceMemory: NewAmount(100)},
+			wantCachedCreated: true,
+			wantEmpty:         false,
+		},
+		"subtraction with empty map short circuits": {
+			base: MapRequests{corev1.ResourceCPU: NewAmount(10), corev1.ResourceMemory: NewAmount(100)},
+			op: func(l *LazyRequests) {
+				l.Sub(MapRequests{})
+			},
+			wantResult:        MapRequests{corev1.ResourceCPU: NewAmount(10), corev1.ResourceMemory: NewAmount(100)},
+			wantCachedCreated: false,
+			wantEmpty:         false,
+		},
+		"addition with empty map short circuits": {
+			base: MapRequests{corev1.ResourceCPU: NewAmount(10), corev1.ResourceMemory: NewAmount(100)},
+			op: func(l *LazyRequests) {
+				l.Add(MapRequests{})
+			},
+			wantResult:        MapRequests{corev1.ResourceCPU: NewAmount(10), corev1.ResourceMemory: NewAmount(100)},
+			wantCachedCreated: false,
+			wantEmpty:         false,
+		},
+		"nil base input with non-empty addition": {
+			base: nil,
+			op: func(l *LazyRequests) {
+				l.Add(MapRequests{corev1.ResourceCPU: NewAmount(5)})
+			},
+			wantResult:        MapRequests{corev1.ResourceCPU: NewAmount(5)},
+			wantCachedCreated: true,
+			wantEmpty:         false,
+		},
+		"nil base input with empty addition short circuits": {
+			base: nil,
+			op: func(l *LazyRequests) {
+				l.Add(MapRequests{})
+			},
+			wantResult:        nil,
+			wantCachedCreated: false,
+			wantEmpty:         true,
+		},
+		"nil base input with non-empty subtraction": {
+			base: nil,
+			op: func(l *LazyRequests) {
+				l.Sub(MapRequests{corev1.ResourceCPU: NewAmount(5)})
+			},
+			wantResult:        MapRequests{corev1.ResourceCPU: NewAmount(-5)},
+			wantCachedCreated: true,
+			wantEmpty:         false,
+		},
+		"zero-value LazyRequests is empty": {
+			base:              nil,
+			op:                nil,
+			wantResult:        nil,
+			wantCachedCreated: false,
+			wantEmpty:         true,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var base Requests
+			if tc.base != nil {
+				base = tc.base
+			}
+			var originalBase Requests
+			if base != nil {
+				originalBase = base.Clone()
+			}
+
+			lazy := NewLazyRequests(base)
+
+			if tc.op != nil {
+				tc.op(&lazy)
+			}
+
+			if gotEmpty := lazy.IsEmpty(); gotEmpty != tc.wantEmpty {
+				t.Errorf("unexpected IsEmpty() result, want=%t, got=%t", tc.wantEmpty, gotEmpty)
+			}
+
+			if (lazy.cached != nil) != tc.wantCachedCreated {
+				t.Errorf("expected cachedCreated=%t, got cached=%v", tc.wantCachedCreated, lazy.cached)
+			}
+
+			gotResult := MapRequests(ToMap(lazy.Get()))
+			wantResult := tc.wantResult
+			if diff := cmp.Diff(wantResult, gotResult); diff != "" {
+				t.Errorf("unexpected Get() result, diff (-want +got):\n%s", diff)
+			}
+
+			if base != nil {
+				if diff := cmp.Diff(MapRequests(ToMap(originalBase)), MapRequests(ToMap(base))); diff != "" {
+					t.Errorf("base map was mutated! diff (-want +got):\n%s", diff)
+				}
+			}
+		})
+	}
+}
+
+func TestFloorToZero(t *testing.T) {
+	cases := map[string]struct {
+		requests MapRequests
+		want     MapRequests
+	}{
+		"empty": {
+			requests: MapRequests{},
+			want:     MapRequests{},
+		},
+		"negative floored to zero": {
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(-100),
+				corev1.ResourceMemory: NewAmount(1024),
+			},
+			want: MapRequests{
+				corev1.ResourceCPU:    NewAmount(0),
+				corev1.ResourceMemory: NewAmount(1024),
+			},
+		},
+		"zero and positive unchanged": {
+			requests: MapRequests{
+				corev1.ResourceCPU:    NewAmount(0),
+				corev1.ResourceMemory: NewAmount(1024),
+			},
+			want: MapRequests{
+				corev1.ResourceCPU:    NewAmount(0),
+				corev1.ResourceMemory: NewAmount(1024),
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run("MapRequests/"+name, func(t *testing.T) {
+			requests := maps.Clone(tc.requests)
+			var r Requests = requests
+			r.FloorToZero()
+			if diff := cmp.Diff(tc.want, requests); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+			}
+		})
+		t.Run("SliceRequests/"+name, func(t *testing.T) {
+			r := NewSliceRequests(tc.requests)
+			if r == nil {
+				// NewSliceRequests returns nil for empty/all-zero maps.
+				r = &SliceRequests{}
+			}
+			r.FloorToZero()
+			got := MapRequests(ToMap(r))
+			want := tc.want
+			if len(want) == 0 {
+				want = nil
+			}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+			}
+			r.ForEach(func(_ corev1.ResourceName, val Amount) {
+				if val.Sign() < 0 {
+					t.Errorf("negative value %s remains after FloorToZero", val)
+				}
+			})
+		})
+	}
+}
+
+func TestMapRequestsLen(t *testing.T) {
+	cases := map[string]struct {
+		req  MapRequests
+		want int
+	}{
+		"nil map": {
+			req:  nil,
+			want: 0,
+		},
+		"empty map": {
+			req:  MapRequests{},
+			want: 0,
+		},
+		"single resource": {
+			req:  MapRequests{corev1.ResourceCPU: NewAmount(1000)},
+			want: 1,
+		},
+		"multiple resources": {
+			req:  MapRequests{corev1.ResourceCPU: NewAmount(1000), corev1.ResourceMemory: NewAmount(1024), corev1.ResourcePods: NewAmount(1)},
+			want: 3,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.req.Len(); got != tc.want {
+				t.Errorf("unexpected Len(), want=%d, got=%d", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestMapRequestsIsEmpty(t *testing.T) {
+	cases := map[string]struct {
+		req  MapRequests
+		want bool
+	}{
+		"nil map": {
+			req:  nil,
+			want: true,
+		},
+		"empty map": {
+			req:  MapRequests{},
+			want: true,
+		},
+		"non-empty map": {
+			req:  MapRequests{corev1.ResourceCPU: NewAmount(1000)},
+			want: false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.req.IsEmpty(); got != tc.want {
+				t.Errorf("unexpected IsEmpty(), want=%t, got=%t", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestMapRequestsGetValue(t *testing.T) {
+	cases := map[string]struct {
+		req      MapRequests
+		resource corev1.ResourceName
+		want     Amount
+	}{
+		"nil map": {
+			req:      nil,
+			resource: corev1.ResourceCPU,
+			want:     Amount{},
+		},
+		"empty map": {
+			req:      MapRequests{},
+			resource: corev1.ResourceCPU,
+			want:     Amount{},
+		},
+		"missing resource": {
+			req:      MapRequests{corev1.ResourceMemory: NewAmount(1024)},
+			resource: corev1.ResourceCPU,
+			want:     Amount{},
+		},
+		"existing resource": {
+			req:      MapRequests{corev1.ResourceCPU: NewAmount(1000)},
+			resource: corev1.ResourceCPU,
+			want:     NewAmount(1000),
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.req.ResourceValue(tc.resource); !got.Equal(tc.want) {
+				t.Errorf("unexpected GetValue(), want=%s, got=%s", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestMapRequestsSet(t *testing.T) {
+	cases := map[string]struct {
+		initial  MapRequests
+		setKey   corev1.ResourceName
+		setValue Amount
+		want     MapRequests
+	}{
+		"update existing resource": {
+			initial:  MapRequests{corev1.ResourceCPU: NewAmount(1000)},
+			setKey:   corev1.ResourceCPU,
+			setValue: NewAmount(2000),
+			want:     MapRequests{corev1.ResourceCPU: NewAmount(2000)},
+		},
+		"insert new resource": {
+			initial:  MapRequests{corev1.ResourceCPU: NewAmount(1000)},
+			setKey:   corev1.ResourceMemory,
+			setValue: NewAmount(1024),
+			want:     MapRequests{corev1.ResourceCPU: NewAmount(1000), corev1.ResourceMemory: NewAmount(1024)},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := maps.Clone(tc.initial)
+			m.Set(tc.setKey, tc.setValue)
+			if diff := cmp.Diff(tc.want, m); diff != "" {
+				t.Errorf("Set mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMapRequestsClone(t *testing.T) {
+	t.Run("nil map clone", func(t *testing.T) {
+		var m MapRequests
+		cloned := m.Clone()
+		if cloned != nil && !cloned.IsEmpty() {
+			t.Errorf("expected empty clone for nil map, got %v", cloned)
+		}
+	})
+
+	t.Run("empty map clone", func(t *testing.T) {
+		m := MapRequests{}
+		cloned := m.Clone()
+		if cloned != nil && !cloned.IsEmpty() {
+			t.Errorf("expected empty clone, got %v", cloned)
+		}
+	})
+
+	t.Run("non-empty map clone", func(t *testing.T) {
+		m := MapRequests{corev1.ResourceCPU: NewAmount(1000)}
+		cloned := m.Clone()
+		if !cmp.Equal(m, cloned) {
+			t.Errorf("cloned map mismatch (-want +got):\n%s", cmp.Diff(m, cloned))
+		}
+		cloned.Add(MapRequests{corev1.ResourceMemory: NewAmount(1024)})
+		if m.ResourceValue(corev1.ResourceMemory).Sign() != 0 {
+			t.Errorf("original map was mutated after modifying clone")
+		}
+	})
+}
+
+func TestToMap(t *testing.T) {
+	cases := map[string]struct {
+		req  Requests
+		want MapRequests
+	}{
+		"nil requests": {
+			req:  nil,
+			want: nil,
+		},
+		"empty MapRequests": {
+			req:  MapRequests{},
+			want: nil,
+		},
+		"non-empty MapRequests": {
+			req:  MapRequests{corev1.ResourceCPU: NewAmount(1000)},
+			want: MapRequests{corev1.ResourceCPU: NewAmount(1000)},
+		},
+		"SliceRequests with non-zero values": {
+			req:  NewSliceRequests(MapRequests{corev1.ResourceCPU: NewAmount(1000), corev1.ResourceMemory: NewAmount(2048)}),
+			want: MapRequests{corev1.ResourceCPU: NewAmount(1000), corev1.ResourceMemory: NewAmount(2048)},
+		},
+		"MapRequests with zero values": {
+			req:  MapRequests{corev1.ResourceCPU: NewAmount(0)},
+			want: MapRequests{corev1.ResourceCPU: NewAmount(0)},
+		},
+		"SliceRequests with zero values": {
+			req:  NewSliceRequests(MapRequests{corev1.ResourceCPU: NewAmount(0)}),
+			want: MapRequests{corev1.ResourceCPU: NewAmount(0)},
+		},
+		"SliceRequests with mixed zero and non-zero values": {
+			req:  NewSliceRequests(MapRequests{corev1.ResourceCPU: NewAmount(1000), corev1.ResourceMemory: NewAmount(0)}),
+			want: MapRequests{corev1.ResourceCPU: NewAmount(1000), corev1.ResourceMemory: NewAmount(0)},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := MapRequests(ToMap(tc.req))
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("ToMap mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestRequestsEqual(t *testing.T) {
+	m1 := MapRequests{corev1.ResourceCPU: NewAmount(1000), corev1.ResourceMemory: NewAmount(2048)}
+	m2 := MapRequests{corev1.ResourceCPU: NewAmount(1000), corev1.ResourceMemory: NewAmount(2048)}
+	m3 := MapRequests{corev1.ResourceCPU: NewAmount(1000)}
+
+	s1 := NewSliceRequests(m1)
+	s2 := NewSliceRequests(m2)
+	s3 := NewSliceRequests(m3)
+
+	tests := map[string]struct {
+		a, b Requests
+		want bool
+	}{
+		"both nil":                {a: nil, b: nil, want: true},
+		"nil and empty Map":       {a: nil, b: MapRequests{}, want: false},
+		"nil and empty Slice":     {a: nil, b: NewSliceRequests(MapRequests{}), want: false},
+		"equal MapRequests":       {a: m1, b: m2, want: true},
+		"equal SliceRequests":     {a: s1, b: s2, want: true},
+		"equal Map and Slice":     {a: m1, b: s2, want: true},
+		"equal Slice and Map":     {a: s1, b: m2, want: true},
+		"different MapRequests":   {a: m1, b: m3, want: false},
+		"different SliceRequests": {a: s1, b: s3, want: false},
+		"different Map and Slice": {a: m1, b: s3, want: false},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := Equal(tc.a, tc.b); got != tc.want {
+				t.Errorf("Equal() = %v, want %v", got, tc.want)
 			}
 		})
 	}

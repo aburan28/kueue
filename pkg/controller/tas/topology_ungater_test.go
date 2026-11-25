@@ -17,6 +17,9 @@ limitations under the License.
 package tas
 
 import (
+	"cmp"
+	"context"
+	"errors"
 	"maps"
 	"slices"
 	"strconv"
@@ -27,29 +30,37 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	jsoniter "github.com/json-iterator/go"
 	kftraining "github.com/kubeflow/training-operator/pkg/apis/kubeflow.org/v1"
+	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/component-base/featuregate"
 	"k8s.io/component-base/metrics/testutil"
 	testingclock "k8s.io/utils/clock/testing"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
+	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/constants"
 	coreindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/controller/tas/indexer"
+	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
+	"sigs.k8s.io/kueue/pkg/util/expectations"
 	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
+	"sigs.k8s.io/kueue/pkg/util/roletracker"
 	"sigs.k8s.io/kueue/pkg/util/tas"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
+	testingnode "sigs.k8s.io/kueue/pkg/util/testingjobs/node"
 	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
+	"sigs.k8s.io/kueue/pkg/workloadslicing"
 
 	_ "sigs.k8s.io/kueue/pkg/controller/jobs/job"
 	_ "sigs.k8s.io/kueue/pkg/controller/jobs/raycluster"
@@ -116,7 +127,93 @@ func TestReconcile(t *testing.T) {
 		return result
 	}
 
+	// rankedWorkload and rankedWorkloadR1 have a PodSet of 2 ranked by the completion index,
+	// admitted to the racks r1 and r2, or to r1 only.
+	// rankedPod is a Pod of that PodSet.
+	// The fake client lists Pods by name, so the cases name the Pods in an order
+	// different from their completion indexes, or greedy assignment would give the
+	// same result.
+	domainR1 := utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r1"}, 1).Obj()
+	domainR2 := utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r2"}, 1).Obj()
+	rankedWorkload := utiltestingapi.MakeWorkload("unit-test", "ns").
+		Finalizers(kueue.ResourceInUseFinalizerName).
+		PodSets(
+			*utiltestingapi.MakePodSet("worker", 2).
+				Request(corev1.ResourceCPU, "1").
+				PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
+				Obj(),
+		).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("cq").
+				PodSets(
+					utiltestingapi.MakePodSetAssignment("worker").
+						Assignment(corev1.ResourceCPU, "unit-test-flavor", "2").
+						Count(2).
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(defaultTestLevels).
+							Domains(domainR1, domainR2).
+							Obj()).
+						Obj(),
+				).
+				Obj(), now,
+		).
+		AdmittedAt(true, now)
+	rankedWorkloadR1 := utiltestingapi.MakeWorkload("unit-test", "ns").
+		Finalizers(kueue.ResourceInUseFinalizerName).
+		PodSets(
+			*utiltestingapi.MakePodSet("worker", 2).
+				Request(corev1.ResourceCPU, "1").
+				PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
+				Obj(),
+		).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("cq").
+				PodSets(
+					utiltestingapi.MakePodSetAssignment("worker").
+						Assignment(corev1.ResourceCPU, "unit-test-flavor", "2").
+						Count(2).
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(defaultTestLevels).
+							Domains(domainR1).
+							Obj()).
+						Obj(),
+				).
+				Obj(), now,
+		).
+		AdmittedAt(true, now)
+	rankedPod := testingpod.MakePod("", "ns").
+		Annotation(kueue.WorkloadAnnotation, "unit-test").
+		Label(constants.PodSetLabel, "worker")
+	elasticJobsWithTAS := map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlicesWithTAS: true}
+	countsR1 := counts{NodeSelector: map[string]string{tasBlockLabel: "b1", tasRackLabel: "r1"}, Count: 1}
+	countsR2 := counts{NodeSelector: map[string]string{tasBlockLabel: "b1", tasRackLabel: "r2"}, Count: 1}
+	// rankedWorkloadR1R2R3 has a PodSet of 3 ranked by the completion index,
+	// admitted to the racks r1, r2 and r3.
+	domainR3 := utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r3"}, 1).Obj()
+	rankedWorkloadR1R2R3 := utiltestingapi.MakeWorkload("unit-test", "ns").
+		Finalizers(kueue.ResourceInUseFinalizerName).
+		PodSets(
+			*utiltestingapi.MakePodSet("worker", 3).
+				Request(corev1.ResourceCPU, "1").
+				PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
+				Obj(),
+		).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("cq").
+				PodSets(
+					utiltestingapi.MakePodSetAssignment("worker").
+						Assignment(corev1.ResourceCPU, "unit-test-flavor", "3").
+						Count(3).
+						TopologyAssignment(utiltestingapi.MakeTopologyAssignment(defaultTestLevels).
+							Domains(domainR1, domainR2, domainR3).
+							Obj()).
+						Obj(),
+				).
+				Obj(), now,
+		).
+		AdmittedAt(true, now)
+	countsR3 := counts{NodeSelector: map[string]string{tasBlockLabel: "b1", tasRackLabel: "r3"}, Count: 1}
+
 	testCases := map[string]struct {
+		featureGates           map[featuregate.Feature]bool
 		expectUIDs             []types.UID
 		workloads              []kueue.Workload
 		pods                   []corev1.Pod
@@ -165,6 +262,109 @@ func TestReconcile(t *testing.T) {
 					Count: 1,
 				},
 			},
+		},
+		"does not ungate a replacement pod onto the unhealthy domain of a two-pod group": {
+			// Closer to production than the single-pod case below: one pod of the
+			// group survives on a healthy domain and holds its slot, so the only
+			// slot the replacement could take is the one on the unhealthy node.
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 2).Request(corev1.ResourceCPU, "1").Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("cq").
+							PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+								Assignment(corev1.ResourceCPU, "unit-test-flavor", "2").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+									Domains(
+										utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj(),
+										utiltestingapi.MakeTopologyDomainAssignment([]string{"x2"}, 1).Obj(),
+									).
+									Obj()).
+								Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					UnhealthyNodes("x1").
+					Obj(),
+			},
+			pods: []corev1.Pod{
+				// Survivor: already ungated on the healthy domain, holding x2's slot.
+				*testingpod.MakePod("pod-survivor", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					NodeSelector(corev1.LabelHostname, "x2").
+					Obj(),
+				// Replacement for the pod that was on the unhealthy node.
+				*testingpod.MakePod("pod-replacement", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertCountsOnly,
+			// Listed name-sorted, which is the order the comparison uses.
+			wantPods: []corev1.Pod{
+				*testingpod.MakePod("pod-replacement", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					Obj(),
+				*testingpod.MakePod("pod-survivor", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					NodeSelector(corev1.LabelHostname, "x2").
+					Obj(),
+			},
+			wantCounts: []counts{
+				{
+					NodeSelector: map[string]string{corev1.LabelHostname: "x2"},
+					Count:        1,
+				},
+			},
+		},
+		"does not ungate a pod onto a node marked unhealthy": {
+			// The workload keeps its admission and its TopologyAssignment while it
+			// waits for a replacement node (see the "should update workload
+			// TopologyAssignment after a node becomes available" integration
+			// test, which asserts the assignment is retained). A replacement pod
+			// created during that window must NOT be ungated onto the domain of
+			// the node already recorded in Status.UnhealthyNodes: it can never
+			// schedule there, and the node controller then terminates it with
+			// UnschedulableOnAssignedNode, so every recreation burns a retry.
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).Request(corev1.ResourceCPU, "1").Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("cq").
+							PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+								Assignment(corev1.ResourceCPU, "unit-test-flavor", "1").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+									Domains(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					UnhealthyNodes("x1").
+					Obj(),
+			},
+			pods: []corev1.Pod{
+				*testingpod.MakePod("pod", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertCountsOnly,
+			// The pod must stay gated: no node selector applied, nothing ungated.
+			wantPods: []corev1.Pod{
+				*testingpod.MakePod("pod", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					Obj(),
+			},
+			wantCounts: []counts{},
 		},
 		"ungate single pod with sub group index label but no sub group count": {
 			// Regression test: a PodSet with SubGroupIndexLabel set but SubGroupCount
@@ -856,9 +1056,9 @@ func TestReconcile(t *testing.T) {
 				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 2).
 						Request(corev1.ResourceCPU, "1").
-						PodIndexLabel(ptr.To(batchv1.JobCompletionIndexAnnotation)).
-						SubGroupIndexLabel(ptr.To(jobset.JobIndexKey)).
-						SubGroupCount(ptr.To[int32](1)).
+						PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
+						SubGroupIndexLabel(new(jobset.JobIndexKey)).
+						SubGroupCount(new(int32(1))).
 						Obj()).
 					ReserveQuotaAt(
 						utiltestingapi.MakeAdmission("cq").
@@ -919,6 +1119,108 @@ func TestReconcile(t *testing.T) {
 					Obj(),
 			},
 			wantCounts: []counts{
+				{
+					NodeSelector: map[string]string{
+						tasBlockLabel: "b1",
+						tasRackLabel:  "r1",
+					},
+					Count: 1,
+				},
+				{
+					NodeSelector: map[string]string{
+						tasBlockLabel: "b1",
+						tasRackLabel:  "r2",
+					},
+					Count: 1,
+				},
+			},
+		},
+		"ranks: ignore ungated pod outside TopologyAssignment and preserve rank-based ordering": {
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 2).
+						Request(corev1.ResourceCPU, "1").
+						PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("cq").
+							PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+								Assignment(corev1.ResourceCPU, "unit-test-flavor", "2").
+								Count(2).
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(defaultTestLevels).
+									// Rank 0 -> b1/r1, Rank 1 -> b1/r2
+									Domains(
+										utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r1"}, 1).Obj(),
+										utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r2"}, 1).Obj(),
+									).
+									Obj()).
+								Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			pods: []corev1.Pod{
+				// Rank 1 is named first so greedy fallback would assign it to b1/r1 instead of b1/r2.
+				*testingpod.MakePod("a-p1-new", "ns").UID("p1-new").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(batchv1.JobCompletionIndexAnnotation, "1").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					Obj(),
+				*testingpod.MakePod("b-p0-new", "ns").UID("p0-new").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(batchv1.JobCompletionIndexAnnotation, "0").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					Obj(),
+				// Stuck terminating pod from a previous assignment on a domain outside the current TopologyAssignment.
+				*testingpod.MakePod("c-p0-stuck", "ns").UID("p0-stuck").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(batchv1.JobCompletionIndexAnnotation, "0").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					DeletionTimestamp(now).
+					KueueFinalizer().
+					StatusPhase(corev1.PodRunning).
+					NodeSelector(tasBlockLabel, "b0").
+					NodeSelector(tasRackLabel, "r0").
+					Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*testingpod.MakePod("a-p1-new", "ns").UID("p1-new").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(batchv1.JobCompletionIndexAnnotation, "1").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r2").
+					Obj(),
+				*testingpod.MakePod("b-p0-new", "ns").UID("p0-new").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(batchv1.JobCompletionIndexAnnotation, "0").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r1").
+					Obj(),
+				*testingpod.MakePod("c-p0-stuck", "ns").UID("p0-stuck").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(batchv1.JobCompletionIndexAnnotation, "0").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					DeletionTimestamp(now).
+					KueueFinalizer().
+					StatusPhase(corev1.PodRunning).
+					NodeSelector(tasBlockLabel, "b0").
+					NodeSelector(tasRackLabel, "r0").
+					Obj(),
+			},
+			wantCounts: []counts{
+				{
+					NodeSelector: map[string]string{
+						tasBlockLabel: "b0",
+						tasRackLabel:  "r0",
+					},
+					Count: 1,
+				},
 				{
 					NodeSelector: map[string]string{
 						tasBlockLabel: "b1",
@@ -997,7 +1299,7 @@ func TestReconcile(t *testing.T) {
 				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 5).
 						Request(corev1.ResourceCPU, "1").
-						PodIndexLabel(ptr.To(batchv1.JobCompletionIndexAnnotation)).
+						PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
 						Obj()).
 					ReserveQuotaAt(
 						utiltestingapi.MakeAdmission("cq").
@@ -1119,12 +1421,12 @@ func TestReconcile(t *testing.T) {
 					PodSets(
 						*utiltestingapi.MakePodSet("workers", 4).
 							Request(corev1.ResourceCPU, "1").
-							PodIndexLabel(ptr.To(leaderworkersetv1.WorkerIndexLabelKey)).
+							PodIndexLabel(new(leaderworkersetv1.WorkerIndexLabelKey)).
 							PodSetGroup("lws-group").
 							Obj(),
 						*utiltestingapi.MakePodSet("leader", 1).
 							Request(corev1.ResourceCPU, "1").
-							PodIndexLabel(ptr.To(leaderworkersetv1.WorkerIndexLabelKey)).
+							PodIndexLabel(new(leaderworkersetv1.WorkerIndexLabelKey)).
 							PodSetGroup("lws-group").
 							Obj(),
 					).
@@ -1253,7 +1555,7 @@ func TestReconcile(t *testing.T) {
 				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 5).
 						Request(corev1.ResourceCPU, "1").
-						PodIndexLabel(ptr.To(batchv1.JobCompletionIndexAnnotation)).
+						PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
 						Obj()).
 					ReserveQuotaAt(
 						utiltestingapi.MakeAdmission("cq").
@@ -1376,12 +1678,12 @@ func TestReconcile(t *testing.T) {
 					PodSets(
 						*utiltestingapi.MakePodSet("workers", 4).
 							Request(corev1.ResourceCPU, "1").
-							PodIndexLabel(ptr.To(leaderworkersetv1.WorkerIndexLabelKey)).
+							PodIndexLabel(new(leaderworkersetv1.WorkerIndexLabelKey)).
 							PodSetGroup("lws-group").
 							Obj(),
 						*utiltestingapi.MakePodSet("leader", 1).
 							Request(corev1.ResourceCPU, "1").
-							PodIndexLabel(ptr.To(leaderworkersetv1.WorkerIndexLabelKey)).
+							PodIndexLabel(new(leaderworkersetv1.WorkerIndexLabelKey)).
 							PodSetGroup("lws-group").
 							Obj(),
 					).
@@ -1476,6 +1778,169 @@ func TestReconcile(t *testing.T) {
 				*testingpod.MakePod("p4", "ns").
 					Annotation(kueue.WorkloadAnnotation, "unit-test").
 					Label(leaderworkersetv1.WorkerIndexLabelKey, "3").
+					Label(constants.PodSetLabel, "workers").
+					NodeSelector(tasBlockLabel, "b2").
+					NodeSelector(tasRackLabel, "r1").
+					Obj(),
+			},
+			wantCounts: []counts{
+				{
+					NodeSelector: map[string]string{
+						tasBlockLabel: "b1",
+						tasRackLabel:  "r1",
+					},
+					Count: 2,
+				},
+				{
+					NodeSelector: map[string]string{
+						tasBlockLabel: "b1",
+						tasRackLabel:  "r2",
+					},
+					Count: 1,
+				},
+				{
+					NodeSelector: map[string]string{
+						tasBlockLabel: "b2",
+						tasRackLabel:  "r1",
+					},
+					Count: 2,
+				},
+			},
+		},
+		"ranks: ungate pods according to their ranks for a PodSet group whose Pod indexes start from 0 and the offset is 0": {
+			// JobSet coordinator and workers are separate Jobs, so the worker
+			// indexes start from 0 instead of continuing after the coordinator.
+			// The JobSet webhook sets the offset to 0, which replaces the
+			// PodSet group offset.
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(
+						*utiltestingapi.MakePodSet("coordinator", 1).
+							Request(corev1.ResourceCPU, "1").
+							PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
+							SubGroupIndexLabel(new(jobset.JobIndexKey)).
+							SubGroupCount(new(int32(1))).
+							PodSetGroup("jobset-group").
+							Obj(),
+						*utiltestingapi.MakePodSet("workers", 4).
+							Request(corev1.ResourceCPU, "1").
+							PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
+							SubGroupIndexLabel(new(jobset.JobIndexKey)).
+							SubGroupCount(new(int32(1))).
+							PodSetGroup("jobset-group").
+							Obj(),
+					).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("cq").
+							PodSets(
+								utiltestingapi.MakePodSetAssignment("coordinator").
+									Assignment(corev1.ResourceCPU, "unit-test-flavor", "1").
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(defaultTestLevels).
+										Domains(utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r1"}, 1).Obj()).
+										Obj()).
+									Obj(),
+								utiltestingapi.MakePodSetAssignment("workers").
+									Assignment(corev1.ResourceCPU, "unit-test-flavor", "4").
+									Count(4).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(defaultTestLevels).
+										Domains(
+											utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r1"}, 1).Obj(),
+											utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r2"}, 1).Obj(),
+											utiltestingapi.MakeTopologyDomainAssignment([]string{"b2", "r1"}, 2).Obj(),
+										).
+										Obj()).
+									Obj(),
+							).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			pods: []corev1.Pod{
+				*testingpod.MakePod("p0", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "0").
+					Label(batchv1.JobCompletionIndexAnnotation, "0").
+					Label(jobset.JobIndexKey, "0").
+					Label(constants.PodSetLabel, "coordinator").
+					TopologySchedulingGate().
+					Obj(),
+				*testingpod.MakePod("p1", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "0").
+					Label(batchv1.JobCompletionIndexAnnotation, "1").
+					Label(jobset.JobIndexKey, "0").
+					Label(constants.PodSetLabel, "workers").
+					TopologySchedulingGate().
+					Obj(),
+				*testingpod.MakePod("p2", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "0").
+					Label(batchv1.JobCompletionIndexAnnotation, "0").
+					Label(jobset.JobIndexKey, "0").
+					Label(constants.PodSetLabel, "workers").
+					TopologySchedulingGate().
+					Obj(),
+				*testingpod.MakePod("p3", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "0").
+					Label(batchv1.JobCompletionIndexAnnotation, "3").
+					Label(jobset.JobIndexKey, "0").
+					Label(constants.PodSetLabel, "workers").
+					TopologySchedulingGate().
+					Obj(),
+				*testingpod.MakePod("p4", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "0").
+					Label(batchv1.JobCompletionIndexAnnotation, "2").
+					Label(jobset.JobIndexKey, "0").
+					Label(constants.PodSetLabel, "workers").
+					TopologySchedulingGate().
+					Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*testingpod.MakePod("p0", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "0").
+					Label(batchv1.JobCompletionIndexAnnotation, "0").
+					Label(jobset.JobIndexKey, "0").
+					Label(constants.PodSetLabel, "coordinator").
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r1").
+					Obj(),
+				*testingpod.MakePod("p1", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "0").
+					Label(batchv1.JobCompletionIndexAnnotation, "1").
+					Label(jobset.JobIndexKey, "0").
+					Label(constants.PodSetLabel, "workers").
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r2").
+					Obj(),
+				*testingpod.MakePod("p2", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "0").
+					Label(batchv1.JobCompletionIndexAnnotation, "0").
+					Label(jobset.JobIndexKey, "0").
+					Label(constants.PodSetLabel, "workers").
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r1").
+					Obj(),
+				*testingpod.MakePod("p3", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "0").
+					Label(batchv1.JobCompletionIndexAnnotation, "3").
+					Label(jobset.JobIndexKey, "0").
+					Label(constants.PodSetLabel, "workers").
+					NodeSelector(tasBlockLabel, "b2").
+					NodeSelector(tasRackLabel, "r1").
+					Obj(),
+				*testingpod.MakePod("p4", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "0").
+					Label(batchv1.JobCompletionIndexAnnotation, "2").
+					Label(jobset.JobIndexKey, "0").
 					Label(constants.PodSetLabel, "workers").
 					NodeSelector(tasBlockLabel, "b2").
 					NodeSelector(tasRackLabel, "r1").
@@ -1672,9 +2137,9 @@ func TestReconcile(t *testing.T) {
 				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 4).
 						Request(corev1.ResourceCPU, "1").
-						PodIndexLabel(ptr.To(batchv1.JobCompletionIndexAnnotation)).
-						SubGroupIndexLabel(ptr.To(jobset.JobIndexKey)).
-						SubGroupCount(ptr.To[int32](2)).
+						PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
+						SubGroupIndexLabel(new(jobset.JobIndexKey)).
+						SubGroupCount(new(int32(2))).
 						Obj()).
 					ReserveQuotaAt(
 						utiltestingapi.MakeAdmission("cq").
@@ -1791,14 +2256,130 @@ func TestReconcile(t *testing.T) {
 				},
 			},
 		},
+		"ranks: support rank-based ordering for RayCluster - for multi-host and multi-replica": {
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 4).
+						Request(corev1.ResourceCPU, "1").
+						PodIndexLabel(new(rayutils.RayHostIndexKey)).
+						SubGroupIndexLabel(new(rayutils.RayWorkerReplicaIndexKey)).
+						SubGroupCount(new(int32(2))).
+						Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("cq").
+							PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+								Assignment(corev1.ResourceCPU, "unit-test-flavor", "4").
+								Count(4).
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(defaultTestLevels).
+									Domains(
+										utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r1"}, 2).Obj(),
+										utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r2"}, 1).Obj(),
+										utiltestingapi.MakeTopologyDomainAssignment([]string{"b2", "r1"}, 1).Obj(),
+									).
+									Obj()).
+								Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			pods: []corev1.Pod{
+				*testingpod.MakePod("p0", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(rayutils.RayHostIndexKey, "0").
+					Label(rayutils.RayWorkerReplicaIndexKey, "0").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					Obj(),
+				*testingpod.MakePod("p1", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(rayutils.RayHostIndexKey, "1").
+					Label(rayutils.RayWorkerReplicaIndexKey, "0").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					Obj(),
+				*testingpod.MakePod("p2", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(rayutils.RayHostIndexKey, "0").
+					Label(rayutils.RayWorkerReplicaIndexKey, "1").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					Obj(),
+				*testingpod.MakePod("p3", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(rayutils.RayHostIndexKey, "1").
+					Label(rayutils.RayWorkerReplicaIndexKey, "1").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*testingpod.MakePod("p0", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(rayutils.RayHostIndexKey, "0").
+					Label(rayutils.RayWorkerReplicaIndexKey, "0").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r1").
+					Obj(),
+				*testingpod.MakePod("p1", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(rayutils.RayHostIndexKey, "1").
+					Label(rayutils.RayWorkerReplicaIndexKey, "0").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r1").
+					Obj(),
+				*testingpod.MakePod("p2", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(rayutils.RayHostIndexKey, "0").
+					Label(rayutils.RayWorkerReplicaIndexKey, "1").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r2").
+					Obj(),
+				*testingpod.MakePod("p3", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(rayutils.RayHostIndexKey, "1").
+					Label(rayutils.RayWorkerReplicaIndexKey, "1").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					NodeSelector(tasBlockLabel, "b2").
+					NodeSelector(tasRackLabel, "r1").
+					Obj(),
+			},
+			wantCounts: []counts{
+				{
+					NodeSelector: map[string]string{
+						tasBlockLabel: "b1",
+						tasRackLabel:  "r1",
+					},
+					Count: 2,
+				},
+				{
+					NodeSelector: map[string]string{
+						tasBlockLabel: "b1",
+						tasRackLabel:  "r2",
+					},
+					Count: 1,
+				},
+				{
+					NodeSelector: map[string]string{
+						tasBlockLabel: "b2",
+						tasRackLabel:  "r1",
+					},
+					Count: 1,
+				},
+			},
+		},
 		"ranks: support rank-based ordering for JobSet - some Pods already scheduled": {
 			workloads: []kueue.Workload{
 				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 4).
 						Request(corev1.ResourceCPU, "1").
-						PodIndexLabel(ptr.To(batchv1.JobCompletionIndexAnnotation)).
-						SubGroupIndexLabel(ptr.To(jobset.JobIndexKey)).
-						SubGroupCount(ptr.To[int32](2)).
+						PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
+						SubGroupIndexLabel(new(jobset.JobIndexKey)).
+						SubGroupCount(new(int32(2))).
 						Obj()).
 					ReserveQuotaAt(
 						utiltestingapi.MakeAdmission("cq").
@@ -1922,9 +2503,9 @@ func TestReconcile(t *testing.T) {
 				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 4).
 						Request(corev1.ResourceCPU, "1").
-						PodIndexLabel(ptr.To(batchv1.JobCompletionIndexAnnotation)).
-						SubGroupIndexLabel(ptr.To(jobset.JobIndexKey)).
-						SubGroupCount(ptr.To[int32](2)).
+						PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
+						SubGroupIndexLabel(new(jobset.JobIndexKey)).
+						SubGroupCount(new(int32(2))).
 						Obj()).
 					ReserveQuotaAt(
 						utiltestingapi.MakeAdmission("cq").
@@ -2026,12 +2607,12 @@ func TestReconcile(t *testing.T) {
 					PodSets(
 						*utiltestingapi.MakePodSet("launcher", 1).
 							Request(corev1.ResourceCPU, "1").
-							PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+							PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 							PodSetGroup("mpijob-group").
 							Obj(),
 						*utiltestingapi.MakePodSet("worker", 3).
 							Request(corev1.ResourceCPU, "1").
-							PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+							PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 							PodSetGroup("mpijob-group").
 							Obj(),
 					).
@@ -2156,6 +2737,448 @@ func TestReconcile(t *testing.T) {
 				},
 			},
 		},
+		"ranks: out-of-range pod index falls back to greedy assignment": {
+			// A stray Pod whose pod-index label is out of range (completion index 3
+			// with offset 1) cannot be used for rank ordering, so the ungater uses
+			// greedy assignment. The already-placed Pods keep their domains and the
+			// stray Pod stays gated.
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("unit-test", "ns").
+					Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(
+						*utiltestingapi.MakePodSet("worker", 2).
+							Request(corev1.ResourceCPU, "1").
+							PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
+							Obj(),
+					).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("cq").
+							PodSets(
+								utiltestingapi.MakePodSetAssignment("worker").
+									Assignment(corev1.ResourceCPU, "unit-test-flavor", "2").
+									Count(2).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(defaultTestLevels).
+										Domains(
+											utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r1"}, 1).Obj(),
+											utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r2"}, 1).Obj(),
+										).
+										Obj()).
+									Obj(),
+							).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			pods: []corev1.Pod{
+				// correctly placed, already ungated Pods (ranks 0 and 1)
+				*testingpod.MakePod("w1", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "1").
+					Label(constants.PodSetLabel, "worker").
+					Label(batchv1.JobCompletionIndexAnnotation, "1").
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r1").
+					Obj(),
+				*testingpod.MakePod("w2", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "1").
+					Label(constants.PodSetLabel, "worker").
+					Label(batchv1.JobCompletionIndexAnnotation, "2").
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r2").
+					Obj(),
+				// stray Pod with an out-of-range completion index (would be rank 2)
+				*testingpod.MakePod("stray", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "1").
+					Label(constants.PodSetLabel, "worker").
+					Label(batchv1.JobCompletionIndexAnnotation, "3").
+					TopologySchedulingGate().
+					Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				// listed name-sorted to match the fake client's List ordering
+				*testingpod.MakePod("stray", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "1").
+					Label(constants.PodSetLabel, "worker").
+					Label(batchv1.JobCompletionIndexAnnotation, "3").
+					TopologySchedulingGate().
+					Obj(),
+				*testingpod.MakePod("w1", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "1").
+					Label(constants.PodSetLabel, "worker").
+					Label(batchv1.JobCompletionIndexAnnotation, "1").
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r1").
+					Obj(),
+				*testingpod.MakePod("w2", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Annotation(kueue.PodIndexOffsetAnnotation, "1").
+					Label(constants.PodSetLabel, "worker").
+					Label(batchv1.JobCompletionIndexAnnotation, "2").
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r2").
+					Obj(),
+			},
+			wantCounts: []counts{
+				{
+					NodeSelector: map[string]string{
+						tasBlockLabel: "b1",
+						tasRackLabel:  "r1",
+					},
+					Count: 1,
+				},
+				{
+					NodeSelector: map[string]string{
+						tasBlockLabel: "b1",
+						tasRackLabel:  "r2",
+					},
+					Count: 1,
+				},
+			},
+		},
+		"ranks: TopologyAssignment shorter than the PodSet count falls back to greedy assignment": {
+			// When the TopologyAssignment covers fewer pods than the PodSet Count
+			// (here Count 2 with a single-rank assignment), a Pod's rank can exceed
+			// len(rankToDomainID); the ungater uses greedy assignment for those Pods.
+			// The scheduler produces this state for a slice size that does not divide
+			// the count (see the integration test).
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("unit-test", "ns").
+					Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(
+						*utiltestingapi.MakePodSet("worker", 2).
+							Request(corev1.ResourceCPU, "1").
+							PodIndexLabel(new(batchv1.JobCompletionIndexAnnotation)).
+							Obj(),
+					).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("cq").
+							PodSets(
+								utiltestingapi.MakePodSetAssignment("worker").
+									Assignment(corev1.ResourceCPU, "unit-test-flavor", "2").
+									Count(2).
+									TopologyAssignment(utiltestingapi.MakeTopologyAssignment(defaultTestLevels).
+										Domains(
+											utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r1"}, 1).Obj(),
+										).
+										Obj()).
+									Obj(),
+							).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			pods: []corev1.Pod{
+				// gated Pod whose rank (1) exceeds len(rankToDomainID) (1)
+				*testingpod.MakePod("w1", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(constants.PodSetLabel, "worker").
+					Label(batchv1.JobCompletionIndexAnnotation, "1").
+					TopologySchedulingGate().
+					Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertCountsOnly,
+			wantPods: []corev1.Pod{
+				*testingpod.MakePod("w1", "ns").
+					Annotation(kueue.WorkloadAnnotation, "unit-test").
+					Label(constants.PodSetLabel, "worker").
+					Label(batchv1.JobCompletionIndexAnnotation, "1").
+					Obj(),
+			},
+			wantCounts: []counts{
+				{
+					NodeSelector: map[string]string{
+						tasBlockLabel: "b1",
+						tasRackLabel:  "r1",
+					},
+					Count: 1,
+				},
+			},
+		},
+		"ranks: completions > parallelism, Pod at index 2 is ungated into the domain freed by succeeded index 0": {
+			workloads: []kueue.Workload{*rankedWorkload.Clone().Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "2").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "2").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2},
+		},
+		"ranks: elastic Job scale-down falls back to greedy assignment while ElasticJobsViaWorkloadSlicesWithTAS is disabled": {
+			// A scale-down from 4 to 2 truncates the TopologyAssignment to the 2
+			// lowest ranks, while the Pods at completion index 2 and 3 still exist
+			// until the Job controller deletes them.
+			workloads: []kueue.Workload{*rankedWorkload.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "2").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "3").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "0").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "1").TopologySchedulingGate().Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "2").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "3").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "0").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "1").TopologySchedulingGate().Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2},
+		},
+		"ranks: elastic Job scale-down keeps rank-based ordering for the remaining Pods": {
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkload.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "2").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "3").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "0").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "1").TopologySchedulingGate().Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "2").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "3").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "0").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "1").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2},
+		},
+		"ranks: elastic Job scale-down ungates the Pod into its rank's domain and leaves the Pods without a domain gated": {
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkload.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "2").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "3").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "1").TopologySchedulingGate().Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "2").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "3").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "1").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2},
+		},
+		"ranks: elastic Job scale-down leaves the Pod gated while a Pod without a domain still occupies its rank's domain": {
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkload.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "1").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "3").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "1").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "3").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2},
+		},
+		"ranks: elastic Job scale-down keeps rank-based ordering while an ungated Pod without a domain still runs": {
+			// After a scale-down from 3 to 2, index 2 still runs in r2 until it is deleted.
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkload.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "1").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "0").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "2").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "1").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "0").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "2").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2},
+		},
+		"ranks: elastic Job with completions > parallelism, Pod at index 2 is ungated into the domain freed by succeeded index 0": {
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkload.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "2").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "2").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2},
+		},
+		"ranks: elastic Job with completions > parallelism, Pod at index 3 is ungated into the domain freed by succeeded index 1": {
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkload.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "3").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "2").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "3").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "2").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2},
+		},
+		"ranks: elastic Job with completions > parallelism lends the free domains to the Pods without a domain in rank order": {
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkload.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "3").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "2").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "3").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "2").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2},
+		},
+		"ranks: non-elastic Job with completions > parallelism falls back to greedy assignment while ElasticJobsViaWorkloadSlicesWithTAS is enabled": {
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkload.Clone().Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "3").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "2").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "3").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "2").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2},
+		},
+		"ranks: elastic Job with a TopologyAssignment shorter than the PodSet count ungates the Pod with a domain": {
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkloadR1.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "1").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "0").TopologySchedulingGate().Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "1").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "0").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			wantCounts: []counts{countsR1},
+		},
+		"ranks: elastic Job with a TopologyAssignment shorter than the PodSet count lends the free domain to the Pod without a domain": {
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkloadR1.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "1").TopologySchedulingGate().Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "1").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			wantCounts: []counts{countsR1},
+		},
+		"ranks: elastic Job with backoffLimitPerIndex lends the free domain to the recreated Pod whose rank's domain is full": {
+			// Index 0 failed, and index 1 succeeded during index 0's per-index backoff.
+			// The Job controller created index 2 first, which was lent r1, so the
+			// recreated index 0 finds r1 full while r2 is free.
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkload.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "0").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "2").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodFailed).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "0").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "2").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodFailed).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2},
+		},
+		"ranks: elastic Job with backoffLimitPerIndex lends the free domains to the recreated Pod before the Pod without a domain": {
+			// Index 3 was lent r1 during index 0's per-index backoff, so the recreated index 0 finds r1 full.
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkloadR1R2R3.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "4").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "0").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "3").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "2").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r3").Obj(),
+				*rankedPod.Clone().Name("pod-e").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-f").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodFailed).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "4").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r3").Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "0").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "3").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "2").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r3").Obj(),
+				*rankedPod.Clone().Name("pod-e").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-f").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodFailed).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2, countsR3},
+		},
+		"ranks: elastic Job keeps rank-based ordering after a Pod was lent the domain of another rank": {
+			// Index 0 was lent r2 while a Pod without a domain held r1, which has finished since.
+			featureGates: elasticJobsWithTAS,
+			workloads:    []kueue.Workload{*rankedWorkloadR1R2R3.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "2").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "1").TopologySchedulingGate().Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "2").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r3").Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "1").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2, countsR3},
+		},
+		"ranks: elastic Job with backoffLimitPerIndex falls back to greedy assignment while ElasticJobsViaWorkloadSlicesWithTAS is disabled": {
+			workloads: []kueue.Workload{*rankedWorkload.Clone().Annotation(constants.ElasticJobAnnotation, "true").Obj()},
+			pods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "0").TopologySchedulingGate().Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "2").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodFailed).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			nodeSelectorAssertMode: nodeSelectorAssertExact,
+			wantPods: []corev1.Pod{
+				*rankedPod.Clone().Name("pod-a").Label(batchv1.JobCompletionIndexAnnotation, "0").NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-b").Label(batchv1.JobCompletionIndexAnnotation, "2").StatusPhase(corev1.PodRunning).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+				*rankedPod.Clone().Name("pod-c").Label(batchv1.JobCompletionIndexAnnotation, "1").StatusPhase(corev1.PodSucceeded).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r2").Obj(),
+				*rankedPod.Clone().Name("pod-d").Label(batchv1.JobCompletionIndexAnnotation, "0").StatusPhase(corev1.PodFailed).NodeSelector(tasBlockLabel, "b1").NodeSelector(tasRackLabel, "r1").Obj(),
+			},
+			wantCounts: []counts{countsR1, countsR2},
+		},
 		"ranks: support rank-based ordering for kubeflow with invalid offset annotation - for all Pods": {
 			workloads: []kueue.Workload{
 				*utiltestingapi.MakeWorkload("unit-test", "ns").
@@ -2163,12 +3186,12 @@ func TestReconcile(t *testing.T) {
 					PodSets(
 						*utiltestingapi.MakePodSet("launcher", 1).
 							Request(corev1.ResourceCPU, "1").
-							PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+							PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 							PodSetGroup("mpijob-group").
 							Obj(),
 						*utiltestingapi.MakePodSet("worker", 3).
 							Request(corev1.ResourceCPU, "1").
-							PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+							PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 							PodSetGroup("mpijob-group").
 							Obj(),
 					).
@@ -2272,7 +3295,7 @@ func TestReconcile(t *testing.T) {
 				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 4).
 						Request(corev1.ResourceCPU, "1").
-						PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+						PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 						Obj()).
 					ReserveQuotaAt(
 						utiltestingapi.MakeAdmission("cq").
@@ -2384,7 +3407,7 @@ func TestReconcile(t *testing.T) {
 				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 4).
 						Request(corev1.ResourceCPU, "1").
-						PodIndexLabel(ptr.To(kftraining.ReplicaIndexLabel)).
+						PodIndexLabel(new(kftraining.ReplicaIndexLabel)).
 						Obj()).
 					ReserveQuotaAt(
 						utiltestingapi.MakeAdmission("cq").
@@ -2498,7 +3521,7 @@ func TestReconcile(t *testing.T) {
 				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 4).
 						Request(corev1.ResourceCPU, "1").
-						PodIndexLabel(ptr.To(kueue.PodGroupPodIndexLabel)).
+						PodIndexLabel(new(kueue.PodGroupPodIndexLabel)).
 						Obj()).
 					ReserveQuotaAt(
 						utiltestingapi.MakeAdmission("cq").
@@ -2604,7 +3627,7 @@ func TestReconcile(t *testing.T) {
 				*utiltestingapi.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 4).
 						Request(corev1.ResourceCPU, "1").
-						PodIndexLabel(ptr.To(kueue.PodGroupPodIndexLabel)).
+						PodIndexLabel(new(kueue.PodGroupPodIndexLabel)).
 						Obj()).
 					ReserveQuotaAt(
 						utiltestingapi.MakeAdmission("cq").
@@ -2711,14 +3734,21 @@ func TestReconcile(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGatesDuringTest(t, tc.featureGates)
 			ctx, log := utiltesting.ContextWithLog(t)
-			clientBuilder := utiltesting.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge})
+			clientBuilder := utiltesting.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
+				SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration,
+			})
 			if err := indexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder)); err != nil {
 				t.Fatalf("Could not setup indexes: %v", err)
 			}
 			// Register WorkloadSliceNameKey index used by ListPodsForWorkloadSlice.
 			if err := utiltesting.AsIndexer(clientBuilder).IndexField(ctx, &corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName); err != nil {
 				t.Fatalf("Could not setup WorkloadSliceNameKey index: %v", err)
+			}
+			// FindActiveWorkload lists elastic Workloads by the same index name.
+			if err := utiltesting.AsIndexer(clientBuilder).IndexField(ctx, &kueue.Workload{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexWorkloadSliceName); err != nil {
+				t.Fatalf("Could not setup WorkloadSliceNameKey index for Workloads: %v", err)
 			}
 
 			kcBuilder := clientBuilder.WithObjects()
@@ -2736,7 +3766,7 @@ func TestReconcile(t *testing.T) {
 					t.Fatalf("Could not create workload: %v", err)
 				}
 			}
-			topologyUngater := newTopologyUngater(kClient, nil)
+			topologyUngater := newTopologyUngater(kClient, nil, nil)
 			key := client.ObjectKeyFromObject(&tc.workloads[0])
 			request := reconcile.Request{NamespacedName: key}
 			if len(tc.expectUIDs) > 0 {
@@ -2794,15 +3824,21 @@ func TestRecordPodSchedulingGateRemovalSeconds(t *testing.T) {
 	)
 
 	now := time.Now().Truncate(time.Second)
+	errPod1 := errors.New("pod1 patch error")
+	errPod3 := errors.New("pod3 patch error")
 
 	testCases := map[string]struct {
-		isGroup            bool
+		isGroup bool
+		// cqTeam is the ClusterQueue team label the recorded series should carry.
+		cqTeam             string
 		pods               []corev1.Pod
 		workloads          []kueue.Workload
+		patchErrs          map[string]error
 		wantPods           []corev1.Pod
 		wantMetricsCount   uint64
 		wantMetricsSeconds float64
 		wantErr            error
+		wantErrs           []error
 	}{
 		"one workload for pod group with two pods; they remove the scheduling gates with different delays": {
 			isGroup: true,
@@ -2954,6 +3990,123 @@ func TestRecordPodSchedulingGateRemovalSeconds(t *testing.T) {
 			wantMetricsSeconds: 2,
 			wantErr:            nil,
 		},
+		"one workload with one pod; the series carries the admitting ClusterQueue's custom label": {
+			isGroup: false,
+			cqTeam:  "red",
+			pods: []corev1.Pod{
+				*testingpod.MakePod("pod", corev1.NamespaceDefault).
+					Annotation(kueue.WorkloadAnnotation, "wl").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("wl", corev1.NamespaceDefault).Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).Request(corev1.ResourceCPU, "1").Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission(cqName).
+							PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+								Assignment(corev1.ResourceCPU, rfName, "1").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(defaultTestLevels).
+									Domains(utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r1"}, 1).Obj()).
+									Obj()).
+								Obj()).
+							Obj(), now.Add(-2*time.Second),
+					).
+					AdmittedAt(true, now.Add(-2*time.Second)).
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*testingpod.MakePod("pod", corev1.NamespaceDefault).
+					Annotation(kueue.WorkloadAnnotation, "wl").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r1").
+					Obj(),
+			},
+			wantMetricsCount:   1,
+			wantMetricsSeconds: 2,
+			wantErr:            nil,
+		},
+		"mixed batch patch failures join all errors and only record metric for ungated pods": {
+			isGroup: true,
+			pods: []corev1.Pod{
+				*testingpod.MakePod("pod1", corev1.NamespaceDefault).
+					UID("uid1").
+					Annotation(kueue.WorkloadAnnotation, "group").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					GroupNameLabel("group").
+					GroupTotalCount("3").
+					Obj(),
+				*testingpod.MakePod("pod2", corev1.NamespaceDefault).
+					UID("uid2").
+					Annotation(kueue.WorkloadAnnotation, "group").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					GroupNameLabel("group").
+					GroupTotalCount("3").
+					Obj(),
+				*testingpod.MakePod("pod3", corev1.NamespaceDefault).
+					UID("uid3").
+					Annotation(kueue.WorkloadAnnotation, "group").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					GroupNameLabel("group").
+					GroupTotalCount("3").
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("group", corev1.NamespaceDefault).Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 3).Request(corev1.ResourceCPU, "1").Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission(cqName).
+							PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+								Assignment(corev1.ResourceCPU, rfName, "1").
+								TopologyAssignment(utiltestingapi.MakeTopologyAssignment(defaultTestLevels).
+									Domains(utiltestingapi.MakeTopologyDomainAssignment([]string{"b1", "r1"}, 3).Obj()).
+									Obj()).
+								Obj()).
+							Obj(), now.Add(-3*time.Second),
+					).
+					AdmittedAt(true, now.Add(-3*time.Second)).
+					Obj(),
+			},
+			patchErrs: map[string]error{
+				"pod1": errPod1,
+				"pod3": errPod3,
+			},
+			wantPods: []corev1.Pod{
+				*testingpod.MakePod("pod1", corev1.NamespaceDefault).
+					UID("uid1").
+					Annotation(kueue.WorkloadAnnotation, "group").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					GroupNameLabel("group").
+					GroupTotalCount("3").
+					Obj(),
+				*testingpod.MakePod("pod2", corev1.NamespaceDefault).
+					UID("uid2").
+					Annotation(kueue.WorkloadAnnotation, "group").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					GroupNameLabel("group").
+					GroupTotalCount("3").
+					NodeSelector(tasBlockLabel, "b1").
+					NodeSelector(tasRackLabel, "r1").
+					Obj(),
+				*testingpod.MakePod("pod3", corev1.NamespaceDefault).
+					UID("uid3").
+					Annotation(kueue.WorkloadAnnotation, "group").
+					Label(constants.PodSetLabel, string(kueue.DefaultPodSetName)).
+					TopologySchedulingGate().
+					GroupNameLabel("group").
+					GroupTotalCount("3").
+					Obj(),
+			},
+			wantMetricsCount:   1,
+			wantMetricsSeconds: 3,
+			wantErrs:           []error{errPod1, errPod3},
+		},
 	}
 
 	for name, tc := range testCases {
@@ -2962,12 +4115,24 @@ func TestRecordPodSchedulingGateRemovalSeconds(t *testing.T) {
 
 			ctx, _ := utiltesting.ContextWithLog(t)
 
+			interceptorFuncs := interceptor.Funcs{
+				SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration,
+			}
+			if len(tc.patchErrs) > 0 {
+				interceptorFuncs.Patch = func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if err, ok := tc.patchErrs[obj.GetName()]; ok {
+						return err
+					}
+					return c.Patch(ctx, obj, patch, opts...)
+				}
+			}
+
 			clientBuilder := utiltesting.
 				NewClientBuilder().
 				WithLists(&corev1.PodList{Items: tc.pods}).
 				WithLists(&kueue.WorkloadList{Items: tc.workloads}).
 				WithStatusSubresource(&kueue.Workload{}).
-				WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge})
+				WithInterceptorFuncs(interceptorFuncs)
 
 			if err := indexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder)); err != nil {
 				t.Fatalf("Could not setup indexes: %v", err)
@@ -2978,14 +4143,27 @@ func TestRecordPodSchedulingGateRemovalSeconds(t *testing.T) {
 
 			kClient := clientBuilder.Build()
 
-			topologyUngater := newTopologyUngater(kClient, nil, WithClock(testingclock.NewFakeClock(now)))
+			var customLabels *metrics.CustomLabels
+			if tc.cqTeam != "" {
+				customLabels = metrics.NewCustomLabels([]configapi.ControllerMetricsCustomLabel{{Name: "team"}})
+				t.Cleanup(func() { metrics.InitMetricVectors(nil) })
+				customLabels.CQStore(cqName, map[string]string{"team": tc.cqTeam}, nil)
+			}
+
+			topologyUngater := newTopologyUngater(kClient, nil, customLabels, WithClock(testingclock.NewFakeClock(now)))
 
 			key := client.ObjectKeyFromObject(&tc.workloads[0])
 			request := reconcile.Request{NamespacedName: key}
 
 			_, err := topologyUngater.Reconcile(ctx, request)
 
-			if diff := gocmp.Diff(tc.wantErr, err, cmpopts.EquateErrors()); diff != "" {
+			if len(tc.wantErrs) > 0 {
+				for _, want := range tc.wantErrs {
+					if !errors.Is(err, want) {
+						t.Errorf("Reconcile returned error %v, expected it to contain %v", err, want)
+					}
+				}
+			} else if diff := gocmp.Diff(tc.wantErr, err, cmpopts.EquateErrors()); diff != "" {
 				t.Errorf("Reconcile returned error (-want,+got):\n%s", diff)
 			}
 
@@ -3000,8 +4178,13 @@ func TestRecordPodSchedulingGateRemovalSeconds(t *testing.T) {
 				t.Errorf("Pods after reconcile (-want,+got):\n%s", diff)
 			}
 
+			labelValues := []string{kueue.TopologySchedulingGate, cqName, strconv.FormatBool(tc.isGroup), roletracker.RoleStandalone}
+			if tc.cqTeam != "" {
+				labelValues = append(labelValues, tc.cqTeam)
+			}
+
 			count, err := testutil.GetHistogramMetricCount(
-				metrics.PodSchedulingGateRemovalSeconds.WithLabelValues(kueue.TopologySchedulingGate, cqName, strconv.FormatBool(tc.isGroup)),
+				metrics.PodSchedulingGateRemovalSeconds.WithLabelValues(labelValues...),
 			)
 			if err != nil {
 				t.Fatalf("Error getting PodSchedulingGateRemovalSeconds metric count: %v", err)
@@ -3011,7 +4194,7 @@ func TestRecordPodSchedulingGateRemovalSeconds(t *testing.T) {
 			}
 
 			seconds, err := testutil.GetHistogramMetricValue(
-				metrics.PodSchedulingGateRemovalSeconds.WithLabelValues(kueue.TopologySchedulingGate, cqName, strconv.FormatBool(tc.isGroup)),
+				metrics.PodSchedulingGateRemovalSeconds.WithLabelValues(labelValues...),
 			)
 			if err != nil {
 				t.Fatalf("Error getting PodSchedulingGateRemovalSeconds metric seconds: %v", err)
@@ -3074,6 +4257,697 @@ func TestIsTAS(t *testing.T) {
 			got := tas.IsTAS(tc.pod)
 			if got != tc.want {
 				t.Errorf("IsTAS() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTopologyUngater_ElasticJobs_Reconciler(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	// Workload and Pod events are both keyed by the slice chain name.
+	sliceKey := types.NamespacedName{Namespace: "ns", Name: "origin"}
+
+	baseWorkload := utiltestingapi.MakeWorkload("", "ns").
+		Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+		Annotation(kueue.WorkloadSliceNameAnnotation, sliceKey.Name)
+	origin := baseWorkload.Clone().Name("origin").
+		PodSets(*utiltestingapi.MakePodSet("workers", 1).Obj()).
+		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
+			utiltestingapi.MakePodSetAssignment("workers").Count(1).
+				TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+					Domains(utiltestingapi.MakeTopologyDomainAssignment([]string{"node"}, 1).Obj()).Obj()).Obj(),
+		).Obj(), now).
+		AdmittedAt(true, now).
+		Finished()
+	replacement := baseWorkload.Clone().Name("replacement").
+		Creation(now.Add(time.Second)).
+		PodSets(*utiltestingapi.MakePodSet("workers", 2).Obj()).
+		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
+			utiltestingapi.MakePodSetAssignment("workers").Count(2).
+				TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+					Domains(utiltestingapi.MakeTopologyDomainAssignment([]string{"node"}, 2).Obj()).Obj()).Obj(),
+		).Obj(), now).
+		AdmittedAt(true, now)
+	// The slice chain shrinks back to one Pod and then regrows to three Pods.
+	scaledDown := baseWorkload.Clone().Name("scaled-down").
+		Creation(now.Add(2*time.Second)).
+		PodSets(*utiltestingapi.MakePodSet("workers", 1).Obj()).
+		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
+			utiltestingapi.MakePodSetAssignment("workers").Count(1).
+				TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+					Domains(utiltestingapi.MakeTopologyDomainAssignment([]string{"node"}, 1).Obj()).Obj()).Obj(),
+		).Obj(), now).
+		AdmittedAt(true, now).
+		Finished()
+	regrown := baseWorkload.Clone().Name("regrown").
+		Creation(now.Add(3*time.Second)).
+		PodSets(*utiltestingapi.MakePodSet("workers", 3).Obj()).
+		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
+			utiltestingapi.MakePodSetAssignment("workers").Count(3).
+				TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+					Domains(utiltestingapi.MakeTopologyDomainAssignment([]string{"node"}, 3).Obj()).Obj()).Obj(),
+		).Obj(), now).
+		AdmittedAt(true, now)
+
+	basePod := testingpod.MakePod("", "ns").
+		Annotation(kueue.WorkloadSliceNameAnnotation, sliceKey.Name).
+		Label(constants.PodSetLabel, "workers")
+	runningPod := basePod.Clone().Name("running").UID("running-uid").
+		Annotation(kueue.WorkloadAnnotation, "origin").
+		NodeSelector(corev1.LabelHostname, "node")
+	// The late Pod is created after the replacement slice is admitted.
+	latePod := basePod.Clone().Name("late").UID("late-uid").
+		Annotation(kueue.PodSetUnconstrainedTopologyAnnotation, "true")
+	secondLatePod := latePod.Clone().Name("second-late").UID("second-late-uid")
+
+	originalAssignment := utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+		Domains(utiltestingapi.MakeTopologyDomainAssignment([]string{"n1"}, 2).Obj(),
+			utiltestingapi.MakeTopologyDomainAssignment([]string{"n2"}, 2).Obj()).Obj()
+	survivorAssignment := utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+		Domains(utiltestingapi.MakeTopologyDomainAssignment([]string{"n2"}, 2).Obj()).Obj()
+	shrinking := replacement.Clone().ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
+		utiltestingapi.MakePodSetAssignment("workers").Count(4).TopologyAssignment(originalAssignment).Obj(),
+	).Obj(), now).AdmittedAt(true, now)
+	shrinkNodes := []corev1.Node{
+		*testingnode.MakeNode("n1").Label(corev1.LabelHostname, "n1").Obj(),
+		*testingnode.MakeNode("n2").Label(corev1.LabelHostname, "n2").Obj(),
+		*testingnode.MakeNode("n3").Label(corev1.LabelHostname, "n3").Obj(),
+		*testingnode.MakeNode("unlabeled").Obj(),
+	}
+	survivor := basePod.Clone().Name("a").UID("a").NodeName("n2").
+		NodeSelector(corev1.LabelHostname, "n2").StatusPhase(corev1.PodRunning)
+	secondSurvivor := survivor.Clone().Name("b").UID("b")
+	extraPod := survivor.Clone().Name("c").UID("c").NodeName("n1").NodeSelector(corev1.LabelHostname, "n1")
+	twoPodSetAdmission := utiltestingapi.MakeAdmission("cq").PodSets(
+		utiltestingapi.MakePodSetAssignment("workers").Count(4).TopologyAssignment(originalAssignment).Obj(),
+		utiltestingapi.MakePodSetAssignment("other").Count(1).
+			TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domains(utiltestingapi.MakeTopologyDomainAssignment([]string{"n1"}, 1).Obj()).Obj()).Obj(),
+	).Obj()
+
+	testCases := map[string]struct {
+		workloads               []kueue.Workload
+		pods                    []corev1.Pod
+		nodes                   []corev1.Node
+		elasticTAS              bool
+		disableReclaimable      bool
+		wantTopologyAssignments map[string]*kueue.TopologyAssignment
+		wantAdmissions          map[string]*kueue.Admission
+		wantErr                 error
+		nodesOnRetry            []corev1.Node
+		wantAssignmentsOnRetry  map[string]*kueue.TopologyAssignment
+		// requestName is the Workload name the reconcile request is keyed by.
+		// Defaults to the slice chain name.
+		requestName      string
+		wantPods         []corev1.Pod
+		wantExpectedUIDs []types.UID
+	}{
+		"shrink releases the empty domain after a finished origin": {
+			workloads:               []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": survivorAssignment},
+		},
+		"shrink waits for unhealthy node recovery": {
+			workloads:               []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().UnhealthyNodes("n1").Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": originalAssignment},
+		},
+		"shrink releases capacity after a survivor is reclaimed": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().
+				ReclaimablePods(kueue.ReclaimablePod{Name: "workers", Count: 1}).Obj()},
+			pods:       []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().StatusPhase(corev1.PodSucceeded).Obj()},
+			wantPods:   []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().StatusPhase(corev1.PodSucceeded).Obj()},
+			nodes:      shrinkNodes,
+			elasticTAS: true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domains(utiltestingapi.MakeTopologyDomainAssignment([]string{"n2"}, 1).Obj()).Obj()},
+		},
+		"shrink retains slice topology capacity after a survivor is reclaimed": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().
+				PodSets(*utiltestingapi.MakePodSet("workers", 2).
+					SliceRequiredTopologyRequest(corev1.LabelHostname).SliceSizeTopologyRequest(2).Obj()).
+				ReclaimablePods(kueue.ReclaimablePod{Name: "workers", Count: 1}).Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().StatusPhase(corev1.PodSucceeded).Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().StatusPhase(corev1.PodSucceeded).Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": originalAssignment},
+		},
+		"shrink retains capacity for unified slice topology constraints": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().
+				PodSets(*utiltestingapi.MakePodSet("workers", 2).
+					SliceRequiredTopologyConstraints(kueue.PodsetSliceRequiredTopologyConstraint{Topology: corev1.LabelHostname, Size: 2}).Obj()).Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": originalAssignment},
+		},
+		"shrink releases capacity for single-Pod topology slices": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().
+				PodSets(*utiltestingapi.MakePodSet("workers", 2).
+					SliceRequiredTopologyRequest(corev1.LabelHostname).SliceSizeTopologyRequest(1).Obj()).Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": survivorAssignment},
+		},
+		"shrink retains capacity when reclaiming is disabled": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().
+				ReclaimablePods(kueue.ReclaimablePod{Name: "workers", Count: 1}).Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().StatusPhase(corev1.PodSucceeded).Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().StatusPhase(corev1.PodSucceeded).Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			disableReclaimable:      true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": originalAssignment},
+		},
+		"shrink clamps reclaimable count above the current size": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().
+				ReclaimablePods(kueue.ReclaimablePod{Name: "workers", Count: 4}).Obj()},
+			pods:                    []corev1.Pod{},
+			wantPods:                []corev1.Pod{},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": nil},
+		},
+		"shrink retains capacity while excess Pods are terminating": {
+			workloads:               []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj(), *extraPod.Clone().Finalizer("test").DeletionTimestamp(now).Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj(), *extraPod.Clone().Finalizer("test").DeletionTimestamp(now).Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": originalAssignment},
+		},
+		"shrink waits for an incomplete Pod observation": {
+			workloads:               []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": originalAssignment},
+		},
+		"shrink waits for an unbound survivor": {
+			workloads:               []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().NodeName("").Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().NodeName("").Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": originalAssignment},
+		},
+		"missing survivor Node defers shrink and ungates another PodSet": {
+			workloads: []kueue.Workload{*shrinking.Clone().Name("origin").
+				PodSets(*utiltestingapi.MakePodSet("workers", 2).Obj(), *utiltestingapi.MakePodSet("other", 1).Obj()).
+				ReserveQuotaAt(twoPodSetAdmission, now).AdmittedAt(true, now).Obj()},
+			pods: []corev1.Pod{
+				*survivor.Clone().NodeName("missing").Obj(),
+				*secondSurvivor.Clone().Obj(),
+				*latePod.Clone().Label(constants.PodSetLabel, "other").TopologySchedulingGate().Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*survivor.Clone().NodeName("missing").Obj(),
+				*secondSurvivor.Clone().Obj(),
+				*latePod.Clone().Label(constants.PodSetLabel, "other").NodeSelector(corev1.LabelHostname, "n1").Obj(),
+			},
+			nodes:            shrinkNodes,
+			elasticTAS:       true,
+			wantAdmissions:   map[string]*kueue.Admission{"origin": twoPodSetAdmission},
+			wantErr:          errShrinkNodeNotFound,
+			wantExpectedUIDs: []types.UID{"late-uid"},
+		},
+		"shrink retries after the survivor Node becomes available": {
+			workloads:              []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().Obj()},
+			pods:                   []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj()},
+			wantPods:               []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj()},
+			elasticTAS:             true,
+			wantAdmissions:         map[string]*kueue.Admission{"replacement": shrinking.Status.Admission},
+			wantErr:                errShrinkNodeNotFound,
+			nodesOnRetry:           []corev1.Node{*testingnode.MakeNode("n2").Label(corev1.LabelHostname, "n2").Obj()},
+			wantAssignmentsOnRetry: map[string]*kueue.TopologyAssignment{"replacement": survivorAssignment},
+		},
+		"shrink retains capacity for a survivor outside the reservation": {
+			workloads:               []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().NodeName("n3").NodeSelector(corev1.LabelHostname, "n3").Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().NodeName("n3").NodeSelector(corev1.LabelHostname, "n3").Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": originalAssignment},
+		},
+		"shrink counts excess Pods outside the reservation": {
+			workloads:               []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj(), *extraPod.Clone().NodeName("n3").NodeSelector(corev1.LabelHostname, "n3").Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj(), *extraPod.Clone().NodeName("n3").NodeSelector(corev1.LabelHostname, "n3").Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": originalAssignment},
+		},
+		"shrink waits for topology labels on the bound node": {
+			workloads:               []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().NodeName("unlabeled").Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().NodeName("unlabeled").Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": originalAssignment},
+		},
+		"terminal Pods no longer hold shrink capacity": {
+			workloads:               []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj(), *extraPod.Clone().StatusPhase(corev1.PodSucceeded).Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj(), *extraPod.Clone().StatusPhase(corev1.PodSucceeded).Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": survivorAssignment},
+		},
+		"shrink is disabled with the elastic TAS feature gate": {
+			workloads:               []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().Obj(), *secondSurvivor.Clone().Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              false,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": originalAssignment},
+		},
+		"shrink to zero clears the topology assignment": {
+			workloads:               []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().PodSets(*utiltestingapi.MakePodSet("workers", 0).Obj()).Obj()},
+			pods:                    []corev1.Pod{},
+			wantPods:                []corev1.Pod{},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": nil},
+		},
+		"shrink to zero clears grouped topology capacity": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().
+				PodSets(*utiltestingapi.MakePodSet("workers", 0).
+					SliceRequiredTopologyRequest(corev1.LabelHostname).SliceSizeTopologyRequest(2).Obj()).Obj()},
+			pods:                    []corev1.Pod{},
+			wantPods:                []corev1.Pod{},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": nil},
+		},
+		"reclaiming all Pods clears unified slice topology capacity": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *shrinking.Clone().
+				PodSets(*utiltestingapi.MakePodSet("workers", 2).
+					SliceRequiredTopologyConstraints(kueue.PodsetSliceRequiredTopologyConstraint{Topology: corev1.LabelHostname, Size: 2}).Obj()).
+				ReclaimablePods(kueue.ReclaimablePod{Name: "workers", Count: 2}).Obj()},
+			pods:                    []corev1.Pod{*survivor.Clone().StatusPhase(corev1.PodSucceeded).Obj(), *secondSurvivor.Clone().StatusPhase(corev1.PodSucceeded).Obj()},
+			wantPods:                []corev1.Pod{*survivor.Clone().StatusPhase(corev1.PodSucceeded).Obj(), *secondSurvivor.Clone().StatusPhase(corev1.PodSucceeded).Obj()},
+			nodes:                   shrinkNodes,
+			elasticTAS:              true,
+			wantTopologyAssignments: map[string]*kueue.TopologyAssignment{"replacement": nil},
+		},
+		"late Pod referencing the origin slice is ungated": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *replacement.Clone().Obj()},
+			pods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").TopologySchedulingGate().Obj(),
+				*runningPod.Clone().Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").NodeSelector(corev1.LabelHostname, "node").Obj(),
+				*runningPod.Clone().Obj(),
+			},
+			wantExpectedUIDs: []types.UID{"late-uid"},
+		},
+		"late Pod referencing the origin slice is ungated when the origin slice has been deleted": {
+			workloads: []kueue.Workload{*replacement.Clone().Obj()},
+			pods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").TopologySchedulingGate().Obj(),
+				*runningPod.Clone().Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").NodeSelector(corev1.LabelHostname, "node").Obj(),
+				*runningPod.Clone().Obj(),
+			},
+			wantExpectedUIDs: []types.UID{"late-uid"},
+		},
+		"late Pod referencing the replacement slice is ungated": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *replacement.Clone().Obj()},
+			pods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "replacement").TopologySchedulingGate().Obj(),
+				*runningPod.Clone().Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "replacement").NodeSelector(corev1.LabelHostname, "node").Obj(),
+				*runningPod.Clone().Obj(),
+			},
+			wantExpectedUIDs: []types.UID{"late-uid"},
+		},
+		"late Pod referencing the origin slice is ungated when reconciling by the replacement slice name": {
+			workloads:   []kueue.Workload{*origin.Clone().Obj(), *replacement.Clone().Obj()},
+			requestName: "replacement",
+			pods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").TopologySchedulingGate().Obj(),
+				*runningPod.Clone().Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").NodeSelector(corev1.LabelHostname, "node").Obj(),
+				*runningPod.Clone().Obj(),
+			},
+			wantExpectedUIDs: []types.UID{"late-uid"},
+		},
+		"late Pods are ungated after the slice chain shrinks and regrows": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *replacement.Clone().Finished().Obj(), *scaledDown.Clone().Obj(), *regrown.Clone().Obj()},
+			pods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "regrown").TopologySchedulingGate().Obj(),
+				*runningPod.Clone().Obj(),
+				*secondLatePod.Clone().Annotation(kueue.WorkloadAnnotation, "regrown").TopologySchedulingGate().Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "regrown").NodeSelector(corev1.LabelHostname, "node").Obj(),
+				*runningPod.Clone().Obj(),
+				*secondLatePod.Clone().Annotation(kueue.WorkloadAnnotation, "regrown").NodeSelector(corev1.LabelHostname, "node").Obj(),
+			},
+			wantExpectedUIDs: []types.UID{"late-uid", "second-late-uid"},
+		},
+		"late Pods are ungated after the slice chain shrinks and regrows when reconciling by the regrown slice name": {
+			workloads:   []kueue.Workload{*origin.Clone().Obj(), *replacement.Clone().Finished().Obj(), *scaledDown.Clone().Obj(), *regrown.Clone().Obj()},
+			requestName: "regrown",
+			pods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "regrown").TopologySchedulingGate().Obj(),
+				*runningPod.Clone().Obj(),
+				*secondLatePod.Clone().Annotation(kueue.WorkloadAnnotation, "regrown").TopologySchedulingGate().Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "regrown").NodeSelector(corev1.LabelHostname, "node").Obj(),
+				*runningPod.Clone().Obj(),
+				*secondLatePod.Clone().Annotation(kueue.WorkloadAnnotation, "regrown").NodeSelector(corev1.LabelHostname, "node").Obj(),
+			},
+			wantExpectedUIDs: []types.UID{"late-uid", "second-late-uid"},
+		},
+		"late Pod that is already ungated leaves no pending expectations": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *replacement.Clone().Obj()},
+			pods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").NodeSelector(corev1.LabelHostname, "node").Obj(),
+				*runningPod.Clone().Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").NodeSelector(corev1.LabelHostname, "node").Obj(),
+				*runningPod.Clone().Obj(),
+			},
+		},
+		"late Pod stays gated when the replacement slice is finished": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *replacement.Clone().Finished().Obj()},
+			pods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").TopologySchedulingGate().Obj(),
+				*runningPod.Clone().Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").TopologySchedulingGate().Obj(),
+				*runningPod.Clone().Obj(),
+			},
+		},
+		"late Pod stays gated when the replacement slice is evicted": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *replacement.Clone().EvictedAt(now).Obj()},
+			pods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").TopologySchedulingGate().Obj(),
+				*runningPod.Clone().Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").TopologySchedulingGate().Obj(),
+				*runningPod.Clone().Obj(),
+			},
+		},
+		"late Pod stays gated when the replacement slice has quota reserved but is not admitted": {
+			workloads: []kueue.Workload{*origin.Clone().Obj(), *replacement.Clone().AdmittedAt(false, now).Obj()},
+			pods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").TopologySchedulingGate().Obj(),
+				*runningPod.Clone().Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*latePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").TopologySchedulingGate().Obj(),
+				*runningPod.Clone().Obj(),
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesWithTAS, tc.elasticTAS)
+			features.SetFeatureGateDuringTest(t, features.ReclaimablePods, !tc.disableReclaimable)
+			ctx, log := utiltesting.ContextWithLog(t)
+
+			clientBuilder := utiltesting.NewClientBuilder().WithStatusSubresource(&kueue.Workload{}).
+				WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName).
+				WithIndex(&kueue.Workload{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexWorkloadSliceName)
+			if err := indexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder)); err != nil {
+				t.Fatalf("Could not setup indexes: %v", err)
+			}
+			for i := range tc.workloads {
+				clientBuilder = clientBuilder.WithObjects(&tc.workloads[i])
+			}
+			for i := range tc.pods {
+				clientBuilder = clientBuilder.WithObjects(&tc.pods[i])
+			}
+			for i := range tc.nodes {
+				clientBuilder = clientBuilder.WithObjects(&tc.nodes[i])
+			}
+			kClient := clientBuilder.Build()
+			topologyUngater := newTopologyUngater(kClient, nil, nil)
+
+			req := reconcile.Request{Namespace: sliceKey.Namespace, Name: cmp.Or(tc.requestName, sliceKey.Name)}
+			_, err := topologyUngater.Reconcile(ctx, req)
+			if diff := gocmp.Diff(tc.wantErr, err, cmpopts.EquateErrors()); diff != "" {
+				t.Fatalf("Reconcile error (-want,+got):\n%s", diff)
+			}
+
+			gotTopologyAssignments := make(map[string]*kueue.TopologyAssignment, len(tc.wantTopologyAssignments))
+			for name := range tc.wantTopologyAssignments {
+				var got kueue.Workload
+				if err := kClient.Get(ctx, types.NamespacedName{Namespace: sliceKey.Namespace, Name: name}, &got); err != nil {
+					t.Fatalf("Could not get Workload after reconcile: %v", err)
+				}
+				gotTopologyAssignments[name] = got.Status.Admission.PodSetAssignments[0].TopologyAssignment
+			}
+
+			var gotPods corev1.PodList
+			if err := kClient.List(ctx, &gotPods); err != nil {
+				t.Fatalf("Could not list Pods after reconcile: %v", err)
+			}
+
+			for name, want := range tc.wantTopologyAssignments {
+				if diff := gocmp.Diff(want, gotTopologyAssignments[name]); diff != "" {
+					t.Errorf("Topology assignment after reconcile (-want,+got):\n%s", diff)
+				}
+			}
+			for name, want := range tc.wantAdmissions {
+				var got kueue.Workload
+				if err := kClient.Get(ctx, types.NamespacedName{Namespace: sliceKey.Namespace, Name: name}, &got); err != nil {
+					t.Fatalf("Could not get Workload after reconcile: %v", err)
+				}
+				if diff := gocmp.Diff(want, got.Status.Admission, cmpopts.EquateEmpty()); diff != "" {
+					t.Errorf("Admission after reconcile (-want,+got):\n%s", diff)
+				}
+			}
+			if diff := gocmp.Diff(tc.wantPods, gotPods.Items, podCmpOpts...); diff != "" {
+				t.Errorf("Pods after reconcile (-want,+got):\n%s", diff)
+			}
+			// The ungate expectations are tracked by the slice chain name until
+			// the Pod handler observes the Pod update or deletion.
+			if diff := gocmp.Diff(tc.wantExpectedUIDs, topologyUngater.expectationsStore.ExpectedUIDs(sliceKey)); diff != "" {
+				t.Errorf("Unexpected pending UIDs (-want,+got):\n%s", diff)
+			}
+			if got, want := topologyUngater.expectationsStore.Satisfied(log, sliceKey), len(tc.wantExpectedUIDs) == 0; got != want {
+				t.Errorf("Satisfied(%s) = %v, want %v", sliceKey, got, want)
+			}
+			if len(tc.nodesOnRetry) > 0 {
+				for i := range tc.nodesOnRetry {
+					if err := kClient.Create(ctx, &tc.nodesOnRetry[i]); err != nil {
+						t.Fatalf("Could not create Node before retry: %v", err)
+					}
+				}
+				// The returned error requests this retry; no Pod or Workload update is needed.
+				if _, err := topologyUngater.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile retry returned error: %v", err)
+				}
+				for name, want := range tc.wantAssignmentsOnRetry {
+					var got kueue.Workload
+					if err := kClient.Get(ctx, types.NamespacedName{Namespace: sliceKey.Namespace, Name: name}, &got); err != nil {
+						t.Fatalf("Could not get Workload after retry: %v", err)
+					}
+					if diff := gocmp.Diff(want, got.Status.Admission.PodSetAssignments[0].TopologyAssignment); diff != "" {
+						t.Errorf("Topology assignment after retry (-want,+got):\n%s", diff)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestPodHandler_ElasticJobs_Create(t *testing.T) {
+	sliceKey := types.NamespacedName{Namespace: "ns", Name: "origin"}
+	basePod := testingpod.MakePod("late", "ns").UID("late-uid").
+		Annotation(kueue.WorkloadSliceNameAnnotation, sliceKey.Name).
+		Annotation(kueue.PodSetUnconstrainedTopologyAnnotation, "true").
+		Label(constants.PodSetLabel, "workers")
+
+	testCases := map[string]struct {
+		pod              *corev1.Pod
+		wantRequests     []reconcile.Request
+		wantExpectedUIDs []types.UID
+	}{
+		"create of a gated Pod referencing the origin slice enqueues the slice chain": {
+			pod:              basePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").TopologySchedulingGate().Obj(),
+			wantRequests:     []reconcile.Request{{NamespacedName: sliceKey}},
+			wantExpectedUIDs: []types.UID{"late-uid"},
+		},
+		"create of a gated Pod referencing the replacement slice enqueues the slice chain": {
+			pod:              basePod.Clone().Annotation(kueue.WorkloadAnnotation, "replacement").TopologySchedulingGate().Obj(),
+			wantRequests:     []reconcile.Request{{NamespacedName: sliceKey}},
+			wantExpectedUIDs: []types.UID{"late-uid"},
+		},
+		"create of an ungated Pod referencing the replacement slice observes the slice chain expectations": {
+			pod:          basePod.Clone().Annotation(kueue.WorkloadAnnotation, "replacement").Obj(),
+			wantRequests: []reconcile.Request{{NamespacedName: sliceKey}},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctx, log := utiltesting.ContextWithLog(t)
+			h := podHandler{expectationsStore: expectations.NewStore(TASTopologyUngater)}
+			h.expectationsStore.ExpectUIDs(log, sliceKey, []types.UID{tc.pod.UID})
+			q := &utiltesting.MockTypedRateLimitingInterface{}
+
+			h.Create(ctx, event.CreateEvent{Object: tc.pod}, q)
+
+			if diff := gocmp.Diff(tc.wantRequests, q.Items); diff != "" {
+				t.Errorf("Unexpected requests (-want,+got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(tc.wantExpectedUIDs, h.expectationsStore.ExpectedUIDs(sliceKey)); diff != "" {
+				t.Errorf("Unexpected pending UIDs (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestPodHandler_ElasticJobs_Update(t *testing.T) {
+	sliceKey := types.NamespacedName{Namespace: "ns", Name: "origin"}
+	basePod := testingpod.MakePod("late", "ns").UID("late-uid").
+		Annotation(kueue.WorkloadSliceNameAnnotation, sliceKey.Name).
+		Annotation(kueue.PodSetUnconstrainedTopologyAnnotation, "true").
+		Label(constants.PodSetLabel, "workers")
+
+	testCases := map[string]struct {
+		oldPod           *corev1.Pod
+		newPod           *corev1.Pod
+		wantRequests     []reconcile.Request
+		wantExpectedUIDs []types.UID
+	}{
+		"update ungating a Pod referencing the origin slice observes the slice chain expectations": {
+			oldPod:       basePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").TopologySchedulingGate().Obj(),
+			newPod:       basePod.Clone().Annotation(kueue.WorkloadAnnotation, "origin").NodeSelector(corev1.LabelHostname, "node").Obj(),
+			wantRequests: []reconcile.Request{{NamespacedName: sliceKey}},
+		},
+		"update ungating a Pod referencing the replacement slice observes the slice chain expectations": {
+			oldPod:       basePod.Clone().Annotation(kueue.WorkloadAnnotation, "replacement").TopologySchedulingGate().Obj(),
+			newPod:       basePod.Clone().Annotation(kueue.WorkloadAnnotation, "replacement").NodeSelector(corev1.LabelHostname, "node").Obj(),
+			wantRequests: []reconcile.Request{{NamespacedName: sliceKey}},
+		},
+		"update of a Pod which is still gated keeps the slice chain expectations pending": {
+			oldPod:           basePod.Clone().Annotation(kueue.WorkloadAnnotation, "replacement").TopologySchedulingGate().Obj(),
+			newPod:           basePod.Clone().Annotation(kueue.WorkloadAnnotation, "replacement").TopologySchedulingGate().Label("updated", "true").Obj(),
+			wantRequests:     []reconcile.Request{{NamespacedName: sliceKey}},
+			wantExpectedUIDs: []types.UID{"late-uid"},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctx, log := utiltesting.ContextWithLog(t)
+			h := podHandler{expectationsStore: expectations.NewStore(TASTopologyUngater)}
+			h.expectationsStore.ExpectUIDs(log, sliceKey, []types.UID{tc.newPod.UID})
+			q := &utiltesting.MockTypedRateLimitingInterface{}
+
+			h.Update(ctx, event.UpdateEvent{ObjectOld: tc.oldPod, ObjectNew: tc.newPod}, q)
+
+			if diff := gocmp.Diff(tc.wantRequests, q.Items); diff != "" {
+				t.Errorf("Unexpected requests (-want,+got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(tc.wantExpectedUIDs, h.expectationsStore.ExpectedUIDs(sliceKey)); diff != "" {
+				t.Errorf("Unexpected pending UIDs (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestPodHandler_ElasticJobs_Delete(t *testing.T) {
+	sliceKey := types.NamespacedName{Namespace: "ns", Name: "origin"}
+	basePod := testingpod.MakePod("late", "ns").UID("late-uid").
+		Annotation(kueue.WorkloadSliceNameAnnotation, sliceKey.Name).
+		Annotation(kueue.PodSetUnconstrainedTopologyAnnotation, "true").
+		Label(constants.PodSetLabel, "workers")
+
+	testCases := map[string]struct {
+		pod              *corev1.Pod
+		wantRequests     []reconcile.Request
+		wantExpectedUIDs []types.UID
+	}{
+		"delete of an ungated Pod referencing the replacement slice observes the slice chain expectations": {
+			pod:          basePod.Clone().Annotation(kueue.WorkloadAnnotation, "replacement").NodeSelector(corev1.LabelHostname, "node").Obj(),
+			wantRequests: []reconcile.Request{{NamespacedName: sliceKey}},
+		},
+		"delete of a gated Pod referencing the replacement slice observes the slice chain expectations": {
+			pod:          basePod.Clone().Annotation(kueue.WorkloadAnnotation, "replacement").TopologySchedulingGate().Obj(),
+			wantRequests: []reconcile.Request{{NamespacedName: sliceKey}},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctx, log := utiltesting.ContextWithLog(t)
+			h := podHandler{expectationsStore: expectations.NewStore(TASTopologyUngater)}
+			h.expectationsStore.ExpectUIDs(log, sliceKey, []types.UID{tc.pod.UID})
+			q := &utiltesting.MockTypedRateLimitingInterface{}
+
+			h.Delete(ctx, event.DeleteEvent{Object: tc.pod}, q)
+
+			if diff := gocmp.Diff(tc.wantRequests, q.Items); diff != "" {
+				t.Errorf("Unexpected requests (-want,+got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(tc.wantExpectedUIDs, h.expectationsStore.ExpectedUIDs(sliceKey)); diff != "" {
+				t.Errorf("Unexpected pending UIDs (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestPodHandler_ElasticJobs_Generic(t *testing.T) {
+	sliceKey := types.NamespacedName{Namespace: "ns", Name: "origin"}
+	basePod := testingpod.MakePod("late", "ns").UID("late-uid").
+		Annotation(kueue.WorkloadSliceNameAnnotation, sliceKey.Name).
+		Annotation(kueue.PodSetUnconstrainedTopologyAnnotation, "true").
+		Label(constants.PodSetLabel, "workers")
+
+	testCases := map[string]struct {
+		pod              *corev1.Pod
+		wantRequests     []reconcile.Request
+		wantExpectedUIDs []types.UID
+	}{
+		"generic event is ignored even for an ungated Pod": {
+			pod:              basePod.Clone().Annotation(kueue.WorkloadAnnotation, "replacement").NodeSelector(corev1.LabelHostname, "node").Obj(),
+			wantExpectedUIDs: []types.UID{"late-uid"},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctx, log := utiltesting.ContextWithLog(t)
+			h := podHandler{expectationsStore: expectations.NewStore(TASTopologyUngater)}
+			h.expectationsStore.ExpectUIDs(log, sliceKey, []types.UID{tc.pod.UID})
+			q := &utiltesting.MockTypedRateLimitingInterface{}
+
+			h.Generic(ctx, event.GenericEvent{Object: tc.pod}, q)
+
+			if diff := gocmp.Diff(tc.wantRequests, q.Items); diff != "" {
+				t.Errorf("Unexpected requests (-want,+got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(tc.wantExpectedUIDs, h.expectationsStore.ExpectedUIDs(sliceKey)); diff != "" {
+				t.Errorf("Unexpected pending UIDs (-want,+got):\n%s", diff)
 			}
 		})
 	}

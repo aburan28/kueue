@@ -27,7 +27,7 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
-	"sigs.k8s.io/kueue/test/util"
+	"sigs.k8s.io/kueue/test/util/behavioral"
 )
 
 const (
@@ -37,17 +37,14 @@ const (
 
 var _ = ginkgo.Describe("MultiKueueConfig Webhook", func() {
 	ginkgo.BeforeEach(func() {
-		fwk.StartManager(ctx, cfg, managerSetup)
-	})
-	ginkgo.AfterEach(func() {
-		fwk.StopManager(ctx)
+		fwk.StartManagerForSpec(ctx, cfg, managerSetup)
 	})
 	ginkgo.When("Creating a MultiKueueConfig", func() {
 		ginkgo.DescribeTable("Validate MultiKueueConfig on creation", func(mkc *kueue.MultiKueueConfig, matcher types.GomegaMatcher) {
 			err := k8sClient.Create(ctx, mkc)
 			if err == nil {
 				defer func() {
-					util.ExpectObjectToBeDeleted(ctx, k8sClient, mkc, true)
+					behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, mkc, true)
 				}()
 			}
 			gomega.Expect(err).Should(matcher)

@@ -1,0 +1,110 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package resources
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	resourcehelpers "k8s.io/component-helpers/resource"
+
+	"sigs.k8s.io/kueue/pkg/features"
+	utilresource "sigs.k8s.io/kueue/pkg/util/resource"
+)
+
+// Equal reports whether two Requests objects are Equal.
+func Equal(a, b Requests) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil || a.Len() != b.Len() {
+		return false
+	}
+	equal := true
+	a.ForEach(func(name corev1.ResourceName, val Amount) {
+		if equal && !b.ResourceValue(name).Equal(val) {
+			equal = false
+		}
+	})
+	return equal
+}
+
+// NewRequests creates an empty Requests instance based on feature gates.
+func NewRequests() Requests {
+	if features.Enabled(features.VectorizedResourceRequests) {
+		return &SliceRequests{}
+	}
+	return MapRequests{}
+}
+
+// NewRequestsFromMap creates a Requests instance from a map based on feature gates.
+// Each value already fits an int64, so wrapping it is exact. Vectorized requests
+// are built straight from m, with no intermediate map.
+func NewRequestsFromMap(m map[corev1.ResourceName]int64) Requests {
+	if len(m) == 0 {
+		return NewRequests()
+	}
+	if features.Enabled(features.VectorizedResourceRequests) {
+		return new(int64MapToSliceRequests(m))
+	}
+	am := make(MapRequests, len(m))
+	for name, v := range m {
+		am[name] = NewAmount(v)
+	}
+	return am
+}
+
+// NewRequestsFromResourceList creates a Requests instance from a corev1.ResourceList based on feature gates.
+func NewRequestsFromResourceList(rl corev1.ResourceList) Requests {
+	if features.Enabled(features.VectorizedResourceRequests) {
+		return new(ResourceListToSliceRequests(rl))
+	}
+	return NewMapRequests(rl)
+}
+
+// NewRequestsFromPodSpec creates a Requests instance from a PodSpec based on feature gates.
+func NewRequestsFromPodSpec(podSpec *corev1.PodSpec) Requests {
+	if podSpec == nil {
+		return NewRequests()
+	}
+	return NewRequestsFromResourceList(PodRequests(podSpec))
+}
+
+// PodRequests returns the effective requests for a PodSpec. For malformed specs,
+// it keeps the aggregate container request when a smaller pod-level request would
+// otherwise replace it. Valid PodSpecs are unchanged because Kubernetes requires
+// pod-level requests to cover the aggregate container requests.
+func PodRequests(podSpec *corev1.PodSpec) corev1.ResourceList {
+	if podSpec == nil {
+		return nil
+	}
+	pod := &corev1.Pod{Spec: *podSpec}
+	requests := resourcehelpers.PodRequests(pod, resourcehelpers.PodResourcesOptions{ExcludeOverhead: true})
+	containerRequests := resourcehelpers.AggregateContainerRequests(pod, resourcehelpers.PodResourcesOptions{})
+	requests = utilresource.MergeResourceListKeepMax(requests, containerRequests)
+	return utilresource.MergeResourceListKeepSum(requests, podSpec.Overhead)
+}
+
+// ToMap converts any Requests instance into a MapRequests map.
+func ToMap(r Requests) map[corev1.ResourceName]Amount {
+	if isEmpty(r) {
+		return nil
+	}
+	res := make(MapRequests, r.Len())
+	r.ForEach(func(name corev1.ResourceName, val Amount) {
+		res[name] = val
+	})
+	return res
+}

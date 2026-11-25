@@ -16,7 +16,25 @@ limitations under the License.
 
 package strings
 
-import "strings"
+import (
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
+
+	sliceutils "sigs.k8s.io/kueue/pkg/util/slices"
+)
+
+// TruncateNamePrefix cuts s to at most n bytes for use as the prefix of a
+// generated object name, then drops any trailing '.', since a '.' followed by
+// the '-' separator is not a valid DNS subdomain. A trailing '-' is kept: it
+// produces a valid name, and trimming it would rename existing objects.
+func TruncateNamePrefix(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimRight(s[:min(len(s), n)], ".")
+}
 
 func StringContainsSubstrings(s string, substrings ...string) bool {
 	for _, substring := range substrings {
@@ -35,4 +53,35 @@ func Join[T ~string](a []T, sep string) string {
 		strs[i] = string(v)
 	}
 	return strings.Join(strs, sep)
+}
+
+// JoinMap builds a string from a map of strings to integer slices.
+// Keys are sorted alphabetically. Values are converted to strings and joined with valueSep.
+// Entries are separated by entrySep.
+// Example:
+// m = map[string][]int{"a": {1, 2}, "b": {3}}
+// keyValueSep = ":"
+// valueSep = ","
+// entrySep = "; "
+// result = "a:1,2; b:3"
+func JoinMap[T ~string](m map[T][]int, keyValueSep string, valueSep string, entrySep string) string {
+	itoa := func(value *int) string { return strconv.Itoa(*value) }
+
+	keys := slices.Collect(maps.Keys(m))
+	slices.Sort(keys)
+
+	var builder strings.Builder
+	for i, key := range keys {
+		if i > 0 {
+			builder.WriteString(entrySep)
+		}
+		builder.WriteString(string(key))
+		if len(m[key]) > 0 {
+			builder.WriteString(keyValueSep)
+
+			indexes := strings.Join(sliceutils.Map(m[key], itoa), valueSep)
+			builder.WriteString(indexes)
+		}
+	}
+	return builder.String()
 }

@@ -34,7 +34,11 @@ import (
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 )
 
-func TestAdjustResources(t *testing.T) {
+func defaultResourceQuantity(name corev1.ResourceName, value int64) resource.Quantity {
+	return resources.NewResourceFormatter().ResourceQuantity(name, value)
+}
+
+func TestEffectiveResourceDefaults(t *testing.T) {
 	cases := map[string]struct {
 		runtimeClasses []nodev1.RuntimeClass
 		limitranges    []corev1.LimitRange
@@ -45,8 +49,8 @@ func TestAdjustResources(t *testing.T) {
 			runtimeClasses: []nodev1.RuntimeClass{
 				utiltesting.MakeRuntimeClass("runtime-a", "handler-a").
 					PodOverhead(corev1.ResourceList{
-						corev1.ResourceCPU:    resources.ResourceQuantity(corev1.ResourceCPU, 1),
-						corev1.ResourceMemory: resources.ResourceQuantity(corev1.ResourceMemory, 1024),
+						corev1.ResourceCPU:    defaultResourceQuantity(corev1.ResourceCPU, 1),
+						corev1.ResourceMemory: defaultResourceQuantity(corev1.ResourceMemory, 1024),
 					}).
 					RuntimeClass,
 			},
@@ -61,8 +65,8 @@ func TestAdjustResources(t *testing.T) {
 						RuntimeClass("runtime-a").
 						PodOverHead(
 							corev1.ResourceList{
-								corev1.ResourceCPU:    resources.ResourceQuantity(corev1.ResourceCPU, 2),
-								corev1.ResourceMemory: resources.ResourceQuantity(corev1.ResourceMemory, 2048),
+								corev1.ResourceCPU:    defaultResourceQuantity(corev1.ResourceCPU, 2),
+								corev1.ResourceMemory: defaultResourceQuantity(corev1.ResourceMemory, 2048),
 							}).
 						Obj(),
 					*utiltestingapi.MakePodSet("d", 1).
@@ -72,8 +76,8 @@ func TestAdjustResources(t *testing.T) {
 						RuntimeClass("runtime-e").
 						PodOverHead(
 							corev1.ResourceList{
-								corev1.ResourceCPU:    resources.ResourceQuantity(corev1.ResourceCPU, 2),
-								corev1.ResourceMemory: resources.ResourceQuantity(corev1.ResourceMemory, 2048),
+								corev1.ResourceCPU:    defaultResourceQuantity(corev1.ResourceCPU, 2),
+								corev1.ResourceMemory: defaultResourceQuantity(corev1.ResourceMemory, 2048),
 							}).
 						Obj(),
 				).
@@ -84,8 +88,8 @@ func TestAdjustResources(t *testing.T) {
 						RuntimeClass("runtime-a").
 						PodOverHead(
 							corev1.ResourceList{
-								corev1.ResourceCPU:    resources.ResourceQuantity(corev1.ResourceCPU, 1),
-								corev1.ResourceMemory: resources.ResourceQuantity(corev1.ResourceMemory, 1024),
+								corev1.ResourceCPU:    defaultResourceQuantity(corev1.ResourceCPU, 1),
+								corev1.ResourceMemory: defaultResourceQuantity(corev1.ResourceMemory, 1024),
 							}).
 						Obj(),
 					*utiltestingapi.MakePodSet("b", 1).
@@ -94,8 +98,8 @@ func TestAdjustResources(t *testing.T) {
 						RuntimeClass("runtime-a").
 						PodOverHead(
 							corev1.ResourceList{
-								corev1.ResourceCPU:    resources.ResourceQuantity(corev1.ResourceCPU, 2),
-								corev1.ResourceMemory: resources.ResourceQuantity(corev1.ResourceMemory, 2048),
+								corev1.ResourceCPU:    defaultResourceQuantity(corev1.ResourceCPU, 2),
+								corev1.ResourceMemory: defaultResourceQuantity(corev1.ResourceMemory, 2048),
 							}).
 						Obj(),
 					*utiltestingapi.MakePodSet("d", 1).
@@ -105,8 +109,8 @@ func TestAdjustResources(t *testing.T) {
 						RuntimeClass("runtime-e").
 						PodOverHead(
 							corev1.ResourceList{
-								corev1.ResourceCPU:    resources.ResourceQuantity(corev1.ResourceCPU, 2),
-								corev1.ResourceMemory: resources.ResourceQuantity(corev1.ResourceMemory, 2048),
+								corev1.ResourceCPU:    defaultResourceQuantity(corev1.ResourceCPU, 2),
+								corev1.ResourceMemory: defaultResourceQuantity(corev1.ResourceMemory, 2048),
 							}).
 						Obj(),
 				).
@@ -128,8 +132,8 @@ func TestAdjustResources(t *testing.T) {
 						RuntimeClass("runtime-a").
 						PodOverHead(
 							corev1.ResourceList{
-								corev1.ResourceCPU:    resources.ResourceQuantity(corev1.ResourceCPU, 1),
-								corev1.ResourceMemory: resources.ResourceQuantity(corev1.ResourceMemory, 1024),
+								corev1.ResourceCPU:    defaultResourceQuantity(corev1.ResourceCPU, 1),
+								corev1.ResourceMemory: defaultResourceQuantity(corev1.ResourceMemory, 1024),
 							}).
 						Obj(),
 					*utiltestingapi.MakePodSet("d", 1).
@@ -139,8 +143,8 @@ func TestAdjustResources(t *testing.T) {
 						RuntimeClass("runtime-e").
 						PodOverHead(
 							corev1.ResourceList{
-								corev1.ResourceCPU:    resources.ResourceQuantity(corev1.ResourceCPU, 1),
-								corev1.ResourceMemory: resources.ResourceQuantity(corev1.ResourceMemory, 1024),
+								corev1.ResourceCPU:    defaultResourceQuantity(corev1.ResourceCPU, 1),
+								corev1.ResourceMemory: defaultResourceQuantity(corev1.ResourceMemory, 1024),
 							}).
 						Obj(),
 				).
@@ -156,8 +160,8 @@ func TestAdjustResources(t *testing.T) {
 						RuntimeClass("runtime-a").
 						PodOverHead(
 							corev1.ResourceList{
-								corev1.ResourceCPU:    resources.ResourceQuantity(corev1.ResourceCPU, 1),
-								corev1.ResourceMemory: resources.ResourceQuantity(corev1.ResourceMemory, 1024),
+								corev1.ResourceCPU:    defaultResourceQuantity(corev1.ResourceCPU, 1),
+								corev1.ResourceMemory: defaultResourceQuantity(corev1.ResourceMemory, 1024),
 							}).
 						Obj(),
 					*utiltestingapi.MakePodSet("d", 1).
@@ -167,8 +171,8 @@ func TestAdjustResources(t *testing.T) {
 						RuntimeClass("runtime-e").
 						PodOverHead(
 							corev1.ResourceList{
-								corev1.ResourceCPU:    resources.ResourceQuantity(corev1.ResourceCPU, 1),
-								corev1.ResourceMemory: resources.ResourceQuantity(corev1.ResourceMemory, 1024),
+								corev1.ResourceCPU:    defaultResourceQuantity(corev1.ResourceCPU, 1),
+								corev1.ResourceMemory: defaultResourceQuantity(corev1.ResourceMemory, 1024),
 							}).
 						Obj(),
 				).
@@ -225,7 +229,10 @@ func TestAdjustResources(t *testing.T) {
 						Obj(),
 					*utiltestingapi.MakePodSet("b", 1).
 						Limit(corev1.ResourceCPU, "6").
-						Request(corev1.ResourceCPU, "3").
+						// The limits are copied into the missing requests before
+						// the LimitRange defaultRequest applies, mirroring the
+						// requests the created Pods will carry.
+						Request(corev1.ResourceCPU, "6").
 						InitContainers(corev1.Container{
 							Resources: corev1.ResourceRequirements{
 								Limits: corev1.ResourceList{
@@ -328,7 +335,9 @@ func TestAdjustResources(t *testing.T) {
 						PodLevelLimit(corev1.ResourceCPU, "4").
 						PodLevelLimit(corev1.ResourceMemory, "2Gi").
 						PodLevelRequest(corev1.ResourceCPU, "3").
-						PodLevelRequest(corev1.ResourceMemory, "512Mi").
+						// The user-set memory limit is copied into the missing
+						// request before the LimitRange defaultRequest applies.
+						PodLevelRequest(corev1.ResourceMemory, "2Gi").
 						Obj(),
 					*utiltestingapi.MakePodSet("b", 1).
 						PodLevelLimit(corev1.ResourceCPU, "6").
@@ -558,9 +567,17 @@ func TestAdjustResources(t *testing.T) {
 			).WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).
 				Build()
 			ctx, _ := utiltesting.ContextWithLog(t)
-			AdjustResources(ctx, cl, tc.wl)
-			if diff := cmp.Diff(tc.wl, tc.wantWl); diff != "" {
-				t.Errorf("Unexpected resources after adjusting (-want,+got): %s", diff)
+			original := tc.wl.DeepCopy()
+			info := NewInfoFromClient(ctx, cl, tc.wl)
+			if diff := cmp.Diff(original, tc.wl); diff != "" {
+				t.Errorf("Effective resource calculation mutated the raw Workload: %s", diff)
+			}
+			effective := tc.wl.DeepCopy()
+			for i := range effective.Spec.PodSets {
+				effective.Spec.PodSets[i].Template.Spec = *info.PodSpec(i)
+			}
+			if diff := cmp.Diff(tc.wantWl, effective); diff != "" {
+				t.Errorf("Unexpected effective resources (-want,+got): %s", diff)
 			}
 		})
 	}

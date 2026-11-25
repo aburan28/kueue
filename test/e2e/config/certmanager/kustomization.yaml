@@ -16,6 +16,11 @@ patches:
     kind: Secret
     name: kueue-webhook-server-cert
     namespace: kueue-system
+- path: patches/visibility-secret-deletion.yaml
+  target:
+    kind: Secret
+    name: kueue-visibility-server-cert
+    namespace: kueue-system
 - path: image_pull_policy.yaml
   target:
     kind: Deployment
@@ -26,10 +31,6 @@ patches:
 - path: cainjection-templates/cainjection_in_workloads.yaml
 - path: cainjection-templates/cainjection_in_resourceflavors.yaml
 - path: cainjection-templates/cainjection_in_cohorts.yaml
-- path: cainjection-templates/apiservice_cainjection_patch.yaml
-  target:
-    kind: APIService
-    name: v1beta1.visibility.kueue.x-k8s.io
 - path: cainjection-templates/apiservice_cainjection_patch.yaml
   target:
     kind: APIService
@@ -290,14 +291,6 @@ replacements:
     targets:
       - select:
           kind: APIService
-          name: v1beta1.visibility.kueue.x-k8s.io
-        fieldPaths:
-          - metadata.annotations.[cert-manager.io/inject-ca-from]
-        options:
-          delimiter: "/"
-          index: 1
-      - select:
-          kind: APIService
           name: v1beta2.visibility.kueue.x-k8s.io
         fieldPaths:
           - metadata.annotations.[cert-manager.io/inject-ca-from]
@@ -314,14 +307,6 @@ replacements:
       version: v1
       fieldPath: metadata.namespace
     targets:
-      - select:
-          kind: APIService
-          name: v1beta1.visibility.kueue.x-k8s.io
-        fieldPaths:
-          - metadata.annotations.[cert-manager.io/inject-ca-from]
-        options:
-          delimiter: "/"
-          index: 0
       - select:
           kind: APIService
           name: v1beta2.visibility.kueue.x-k8s.io

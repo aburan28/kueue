@@ -1,0 +1,99 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package dynamicquotaorchestrator
+
+import (
+	"context"
+	"testing"
+
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+
+	config "sigs.k8s.io/kueue/apis/config/v1beta2"
+	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
+	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
+	"sigs.k8s.io/kueue/pkg/constants"
+	"sigs.k8s.io/kueue/pkg/controller/core"
+	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
+	"sigs.k8s.io/kueue/pkg/features"
+	"sigs.k8s.io/kueue/pkg/scheduler"
+	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
+	"sigs.k8s.io/kueue/pkg/webhooks"
+	"sigs.k8s.io/kueue/test/integration/framework"
+	"sigs.k8s.io/kueue/test/util/behavioral"
+	"sigs.k8s.io/kueue/test/util/behavioral/integration"
+)
+
+var (
+	cfg       *rest.Config
+	k8sClient client.Client
+	ctx       context.Context
+	fwk       *framework.Framework
+)
+
+func TestAPIs(t *testing.T) {
+	behavioral.RunSuite(t, "DynamicQuotaOrchestrator Controller Suite")
+}
+
+var _ = ginkgo.BeforeSuite(func() {
+	features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.DynamicQuotaOrchestration, true)
+	features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.DQOLocalCapacityProvider, true)
+	fwk = &framework.Framework{}
+	cfg = fwk.Init()
+	ctx, k8sClient = fwk.SetupClient(cfg)
+	fwk.StartManager(ctx, cfg, managerSetup)
+})
+
+var _ = ginkgo.AfterSuite(func() {
+	fwk.Teardown()
+})
+
+func managerSetup(ctx context.Context, mgr manager.Manager) {
+	ginkgo.GinkgoHelper()
+	err := indexer.Setup(ctx, mgr.GetFieldIndexer())
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+	// The scheduler runs next to the core controllers, which also serve
+	// DynamicQuotaOrchestrator and the local-capacity CapacityProvider, so that
+	// tests cover the flow from Nodes to admission.
+	cCache := schdcache.New(mgr.GetClient())
+	preemptionExpectations := preemptexpectations.New()
+	queues := integration.NewManager(ctx, mgr.GetClient(), cCache, qcache.WithPreemptionExpectations(preemptionExpectations))
+
+	configuration := &config.Configuration{}
+	mgr.GetScheme().Default(configuration)
+
+	failedCtrl, err := core.SetupControllers(mgr, queues, cCache, configuration,
+		core.SetupControllersOpts{PreemptionExpectations: preemptionExpectations})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "controller", failedCtrl)
+
+	failedWebhook, err := webhooks.Setup(mgr, nil)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "webhook", failedWebhook)
+
+	sched := scheduler.New(
+		queues,
+		cCache,
+		mgr.GetClient(),
+		mgr.GetEventRecorder(constants.AdmissionName),
+		scheduler.WithPreemptionExpectations(preemptionExpectations),
+	)
+	err = mgr.Add(sched)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+}

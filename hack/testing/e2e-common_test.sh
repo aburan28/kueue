@@ -19,13 +19,25 @@ set -o nounset
 set -o pipefail
 
 test_dir=$(mktemp -d)
-trap 'rm -rf "${test_dir}"' EXIT
+# The fakes print errors that read like CI infra failures, so show output only on failure.
+exec 3>&1 4>&2 >"${test_dir}/test.log" 2>&1
+cleanup() {
+  local status=$?
+  if [[ "${status}" -ne 0 ]]; then
+    cat "${test_dir}/test.log" >&4
+  fi
+  rm -rf "${test_dir}"
+}
+trap cleanup EXIT
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 export ROOT_DIR
+# The real yq, for the tests that edit kustomization files. YQ is replaced by a fake below.
+real_yq="${YQ:-${ROOT_DIR}/bin/yq}"
 export SOURCE_DIR="${ROOT_DIR}/hack/testing"
 export GINKGO_ARGS="--label-filter=feature:trainjob"
 export E2E_KIND_VERSION="kindest/node:v1.36.1"
+export E2E_BIN_DIR="${test_dir}"
 export PATH="${test_dir}:$PATH"
 
 cat >"${test_dir}/kubectl" <<'EOF'
@@ -60,7 +72,7 @@ case "$*" in
     attempts=$(cat "${state_file}")
     attempts=$((attempts + 1))
     printf '%s' "${attempts}" >"${state_file}"
-    if [[ "${attempts}" -lt 2 ]]; then
+    if [[ "${attempts}" -lt 3 ]]; then
       printf 'pod-1\n'
       printf 'pod-1\n'
     else
@@ -72,12 +84,111 @@ case "$*" in
   *" create --dry-run=server -f "*)
     exit 0
     ;;
+  "wait --kubeconfig="*" --for=condition=Ready node --all"*)
+    attempts=$(cat "${NODE_WAIT_FAKE_STATE:?}")
+    attempts=$((attempts + 1))
+    printf '%s' "${attempts}" >"${NODE_WAIT_FAKE_STATE}"
+    if [[ "${attempts}" -lt "${NODE_WAIT_FAKE_READY_AFTER:-2}" ]]; then
+      printf 'timed out waiting for the condition on nodes/kind-control-plane\n'
+      exit 1
+    fi
+    printf 'node/kind-control-plane condition met\n'
+    exit 0
+    ;;
+  "config "*)
+    exit 0
+    ;;
+  "get nodes"*)
+    printf 'fake node list\n'
+    exit 0
+    ;;
+  "describe pods"*)
+    exit 0
+    ;;
 esac
 
 printf 'unexpected kubectl call: %s\n' "$*" >&2
 exit 1
 EOF
 chmod +x "${test_dir}/kubectl"
+
+cat >"${test_dir}/kind" <<'EOF'
+#!/usr/bin/env bash
+set -o errexit
+set -o nounset
+set -o pipefail
+
+printf '%s\n' "$*" >>"${KIND_FAKE_LOG:?}"
+
+case "$*" in
+  "create cluster "*)
+    if [[ -n "${KIND_FAKE_CREATE_ERROR:-}" ]]; then
+      printf '%s\n' "${KIND_FAKE_CREATE_ERROR}"
+      exit 1
+    fi
+    printf 'Creating cluster ...\n'
+    exit 0
+    ;;
+  "delete cluster "*)
+    exit 0
+    ;;
+esac
+
+printf 'unexpected kind call: %s\n' "$*" >&2
+exit 1
+EOF
+chmod +x "${test_dir}/kind"
+
+cat >"${test_dir}/docker" <<'EOF'
+#!/usr/bin/env bash
+set -o errexit
+set -o nounset
+set -o pipefail
+
+printf '%s\n' "$*" >>"${DOCKER_FAKE_LOG:?}"
+
+case "$*" in
+  "pull "*)
+    attempts=$(cat "${DOCKER_FAKE_STATE:?}")
+    attempts=$((attempts + 1))
+    printf '%s' "${attempts}" >"${DOCKER_FAKE_STATE}"
+    if [[ "${attempts}" -lt "${DOCKER_FAKE_PULL_OK_AFTER:-1}" ]]; then
+      printf '%s\n' "${DOCKER_FAKE_PULL_ERROR:?}" >&2
+      exit 1
+    fi
+    printf 'Status: Downloaded newer image\n'
+    exit 0
+    ;;
+  "image inspect "*)
+    exit "${DOCKER_FAKE_IMAGE_PRESENT:-1}"
+    ;;
+  "manifest inspect "*)
+    attempts=$(cat "${DOCKER_FAKE_MANIFEST_STATE:?}")
+    attempts=$((attempts + 1))
+    printf '%s' "${attempts}" >"${DOCKER_FAKE_MANIFEST_STATE}"
+    if [[ "${attempts}" -lt "${DOCKER_FAKE_MANIFEST_OK_AFTER:-1}" ]]; then
+      printf '%s\n' "${DOCKER_FAKE_MANIFEST_ERROR:?}" >&2
+      exit 1
+    fi
+    printf '{"fake":"manifest"}\n'
+    exit 0
+    ;;
+esac
+
+printf 'unexpected docker call: %s\n' "$*" >&2
+exit 1
+EOF
+chmod +x "${test_dir}/docker"
+
+cat >"${test_dir}/yq" <<'EOF'
+#!/usr/bin/env bash
+set -o errexit
+set -o nounset
+set -o pipefail
+
+printf 'registry.example.com/kueue:test\n'
+EOF
+chmod +x "${test_dir}/yq"
 
 # shellcheck source=hack/testing/e2e-common.sh
 source "${ROOT_DIR}/hack/testing/e2e-common.sh"
@@ -88,18 +199,36 @@ export KUBECTL_FAKE_STATE KUBECTL_FAKE_LOG
 printf '0' >"${KUBECTL_FAKE_STATE}"
 : >"${KUBECTL_FAKE_LOG}"
 
-e2e_wait_for_deployment_webhook_endpoints "test.kubeconfig" "kubeflow-system" \
+# The fake sleep records each delay instead of waiting.
+SLEEP_FAKE_DIR="${test_dir}/sleep-fake"
+SLEEP_FAKE_LOG="${test_dir}/sleep.log"
+export SLEEP_FAKE_LOG
+mkdir "${SLEEP_FAKE_DIR}"
+cat >"${SLEEP_FAKE_DIR}/sleep" <<'EOF'
+#!/usr/bin/env bash
+printf '%s ' "$1" >>"${SLEEP_FAKE_LOG}"
+EOF
+chmod +x "${SLEEP_FAKE_DIR}/sleep"
+
+PATH="${SLEEP_FAKE_DIR}:${PATH}" e2e_wait_for_deployment_webhook_endpoints "test.kubeconfig" "kubeflow-system" \
   "kubeflow-trainer-controller-manager" "kubeflow-trainer-controller-manager"
 
 endpoint_attempts=$(cat "${KUBECTL_FAKE_STATE}")
-if [[ "${endpoint_attempts}" != "2" ]]; then
+if [[ "${endpoint_attempts}" != "3" ]]; then
   echo "expected EndpointSlice polling to continue until ready endpoints match deployment replicas; got ${endpoint_attempts} attempt(s)" >&2
   exit 1
 fi
 
 status_dump_count=$(grep -c -- "-o wide" "${KUBECTL_FAKE_LOG}" || true)
-if [[ "${status_dump_count}" != "1" ]]; then
-  echo "expected EndpointSlice status to be dumped after an unsatisfied readiness check; got ${status_dump_count} dump(s)" >&2
+if [[ "${status_dump_count}" != "2" ]]; then
+  echo "expected EndpointSlice status to be dumped after each unsatisfied readiness check; got ${status_dump_count} dump(s)" >&2
+  exit 1
+fi
+
+# Polling keeps a constant delay: doubling it over 150 attempts would never time out.
+polling_delays=$(cat "${SLEEP_FAKE_LOG}")
+if [[ "${polling_delays}" != "2 2 " ]]; then
+  echo "expected EndpointSlice polling to keep a constant delay; got '${polling_delays}'" >&2
   exit 1
 fi
 
@@ -119,4 +248,402 @@ if [[ "${endpoint_line}" -ge "${probe_line}" ]]; then
   exit 1
 fi
 
-echo "e2e-common tests passed"
+# cluster_create retries the bring-up when the node readiness wait times out.
+export KIND="${test_dir}/kind"
+KIND_FAKE_LOG="${test_dir}/kind.log"
+NODE_WAIT_FAKE_STATE="${test_dir}/node-wait-state"
+export KIND_FAKE_LOG NODE_WAIT_FAKE_STATE
+: >"${KIND_FAKE_LOG}"
+printf '0' >"${NODE_WAIT_FAKE_STATE}"
+export ARTIFACTS="${test_dir}/artifacts"
+mkdir -p "${ARTIFACTS}"
+
+cluster_create "flake-test" "unused-kind-config.yaml" ""
+
+create_attempts=$(grep -c "^create cluster" "${KIND_FAKE_LOG}" || true)
+if [[ "${create_attempts}" != "2" ]]; then
+  echo "expected cluster creation to be retried after a node readiness timeout; got ${create_attempts} attempt(s)" >&2
+  exit 1
+fi
+
+node_wait_attempts=$(cat "${NODE_WAIT_FAKE_STATE}")
+if [[ "${node_wait_attempts}" != "2" ]]; then
+  echo "expected the node readiness wait to run once per bring-up attempt; got ${node_wait_attempts} run(s)" >&2
+  exit 1
+fi
+
+if ! ls "${ARTIFACTS}"/flake-test-create.log.failed-* >/dev/null 2>&1; then
+  echo "expected the failed bring-up log to be archived before the retry" >&2
+  exit 1
+fi
+
+# A bring-up failure matching no retriable error aborts after a single attempt.
+: >"${KIND_FAKE_LOG}"
+export KIND_FAKE_CREATE_ERROR="node(s) already exist for a cluster with the name"
+if cluster_create "failfast-test" "unused-kind-config.yaml" ""; then
+  echo "expected cluster_create to fail on a non-retriable error" >&2
+  exit 1
+fi
+unset KIND_FAKE_CREATE_ERROR
+
+create_attempts=$(grep -c "^create cluster" "${KIND_FAKE_LOG}" || true)
+if [[ "${create_attempts}" != "1" ]]; then
+  echo "expected a non-retriable failure to fail fast without retrying; got ${create_attempts} attempt(s)" >&2
+  exit 1
+fi
+
+# A persistent node readiness timeout exhausts all bring-up attempts and fails.
+: >"${KIND_FAKE_LOG}"
+printf '0' >"${NODE_WAIT_FAKE_STATE}"
+export NODE_WAIT_FAKE_READY_AFTER=99
+if cluster_create "persistent-test" "unused-kind-config.yaml" ""; then
+  echo "expected cluster_create to fail when nodes never become ready" >&2
+  exit 1
+fi
+unset NODE_WAIT_FAKE_READY_AFTER
+
+create_attempts=$(grep -c "^create cluster" "${KIND_FAKE_LOG}" || true)
+if [[ "${create_attempts}" != "3" ]]; then
+  echo "expected a persistent readiness timeout to exhaust all attempts; got ${create_attempts} attempt(s)" >&2
+  exit 1
+fi
+
+node_wait_attempts=$(cat "${NODE_WAIT_FAKE_STATE}")
+if [[ "${node_wait_attempts}" != "3" ]]; then
+  echo "expected the node readiness wait to run once per bring-up attempt; got ${node_wait_attempts} run(s)" >&2
+  exit 1
+fi
+
+archived_count=$(find "${ARTIFACTS}" -name "persistent-test-create.log.failed-*" | wc -l | tr -d ' ')
+if [[ "${archived_count}" != "2" ]]; then
+  echo "expected the first two attempts' logs to be archived; got ${archived_count}" >&2
+  exit 1
+fi
+
+if [[ ! -f "${ARTIFACTS}/persistent-test-create.log" ]]; then
+  echo "expected the final attempt's log to remain for failure reporting" >&2
+  exit 1
+fi
+
+# A transient registry error is retried until the pull succeeds.
+DOCKER_FAKE_LOG="${test_dir}/docker.log"
+DOCKER_FAKE_STATE="${test_dir}/docker-state"
+export DOCKER_FAKE_LOG DOCKER_FAKE_STATE
+: >"${DOCKER_FAKE_LOG}"
+printf '0' >"${DOCKER_FAKE_STATE}"
+export DOCKER_FAKE_PULL_OK_AFTER=2
+export DOCKER_FAKE_PULL_ERROR='Error response from daemon: Get "https://registry.example.com/v2/kueue/manifests/sha256:0badc0de": net/http: TLS handshake timeout'
+
+e2e_docker_pull_if_needed "registry.example.com/kueue:test"
+
+pull_attempts=$(grep -c "^pull " "${DOCKER_FAKE_LOG}" || true)
+if [[ "${pull_attempts}" != "2" ]]; then
+  echo "expected a TLS handshake timeout to be retried; got ${pull_attempts} attempt(s)" >&2
+  exit 1
+fi
+
+# A bare `unauthorized:` whose manifest lookup is equally inconclusive is a
+# degraded token service rather than a denial, so it is retried.
+DOCKER_FAKE_MANIFEST_STATE="${test_dir}/docker-manifest-state"
+export DOCKER_FAKE_MANIFEST_STATE
+: >"${DOCKER_FAKE_LOG}"
+printf '0' >"${DOCKER_FAKE_STATE}"
+printf '0' >"${DOCKER_FAKE_MANIFEST_STATE}"
+export DOCKER_FAKE_PULL_OK_AFTER=2
+export DOCKER_FAKE_PULL_ERROR='unauthorized: '
+export DOCKER_FAKE_MANIFEST_OK_AFTER=99
+export DOCKER_FAKE_MANIFEST_ERROR='unauthorized: '
+
+if ! e2e_docker_pull_if_needed "quay.example.com/prometheus-operator/prometheus-operator:v0.94.0"; then
+  echo "expected a bare unauthorized error to be retried until the pull succeeded" >&2
+  exit 1
+fi
+
+pull_attempts=$(grep -c "^pull " "${DOCKER_FAKE_LOG}" || true)
+if [[ "${pull_attempts}" != "2" ]]; then
+  echo "expected a bare unauthorized error to be retried; got ${pull_attempts} attempt(s)" >&2
+  exit 1
+fi
+
+# The same bare `unauthorized:` for a tag the registry does not have is settled by
+# the manifest lookup, so the pull fails fast instead of spending the full backoff.
+: >"${DOCKER_FAKE_LOG}"
+printf '0' >"${DOCKER_FAKE_STATE}"
+printf '0' >"${DOCKER_FAKE_MANIFEST_STATE}"
+export DOCKER_FAKE_PULL_OK_AFTER=99
+export DOCKER_FAKE_PULL_ERROR='unauthorized: '
+export DOCKER_FAKE_MANIFEST_OK_AFTER=99
+export DOCKER_FAKE_MANIFEST_ERROR='no such manifest: quay.example.com/prometheus-operator/prometheus-operator:v9.99.9'
+
+if e2e_docker_pull_if_needed "quay.example.com/prometheus-operator/prometheus-operator:v9.99.9"; then
+  echo "expected a missing tag behind a bare unauthorized error to fail the pull" >&2
+  exit 1
+fi
+
+pull_attempts=$(grep -c "^pull " "${DOCKER_FAKE_LOG}" || true)
+if [[ "${pull_attempts}" != "1" ]]; then
+  echo "expected a missing tag behind a bare unauthorized error to fail fast; got ${pull_attempts} attempt(s)" >&2
+  exit 1
+fi
+
+# A manifest lookup that 404s on the registry's own endpoint says nothing about the
+# tag, so the bare `unauthorized:` keeps its retries.
+: >"${DOCKER_FAKE_LOG}"
+printf '0' >"${DOCKER_FAKE_STATE}"
+printf '0' >"${DOCKER_FAKE_MANIFEST_STATE}"
+export DOCKER_FAKE_PULL_OK_AFTER=2
+export DOCKER_FAKE_PULL_ERROR='unauthorized: '
+export DOCKER_FAKE_MANIFEST_OK_AFTER=99
+export DOCKER_FAKE_MANIFEST_ERROR='404 page not found'
+
+if ! e2e_docker_pull_if_needed "quay.example.com/prometheus-operator/prometheus-operator:v0.94.0"; then
+  echo "expected a token-endpoint 404 to leave the retries in place" >&2
+  exit 1
+fi
+
+pull_attempts=$(grep -c "^pull " "${DOCKER_FAKE_LOG}" || true)
+if [[ "${pull_attempts}" != "2" ]]; then
+  echo "expected a token-endpoint 404 to be retried; got ${pull_attempts} attempt(s)" >&2
+  exit 1
+fi
+
+unset DOCKER_FAKE_MANIFEST_OK_AFTER DOCKER_FAKE_MANIFEST_ERROR
+
+# A missing image is not a transient failure, so it aborts after a single attempt.
+: >"${DOCKER_FAKE_LOG}"
+printf '0' >"${DOCKER_FAKE_STATE}"
+export DOCKER_FAKE_PULL_OK_AFTER=99
+export DOCKER_FAKE_PULL_ERROR='Error response from daemon: manifest for registry.example.com/kueue:missing not found'
+
+if e2e_docker_pull_if_needed "registry.example.com/kueue:missing"; then
+  echo "expected a missing manifest to fail the pull" >&2
+  exit 1
+fi
+unset DOCKER_FAKE_PULL_ERROR
+
+pull_attempts=$(grep -c "^pull " "${DOCKER_FAKE_LOG}" || true)
+if [[ "${pull_attempts}" != "1" ]]; then
+  echo "expected a missing manifest to fail fast without retrying; got ${pull_attempts} attempt(s)" >&2
+  exit 1
+fi
+
+# In dev mode a cached dependency image is reused instead of pulled again.
+: >"${DOCKER_FAKE_LOG}"
+printf '0' >"${DOCKER_FAKE_STATE}"
+export DOCKER_FAKE_PULL_OK_AFTER=1
+export DOCKER_FAKE_IMAGE_PRESENT=0
+
+E2E_MODE=dev E2E_SKIP_IMAGE_RELOAD=true e2e_docker_pull_if_needed "registry.example.com/dependency:test"
+
+pull_attempts=$(grep -c "^pull " "${DOCKER_FAKE_LOG}" || true)
+if [[ "${pull_attempts}" != "0" ]]; then
+  echo "expected a cached dependency image to be reused in dev mode; got ${pull_attempts} pull(s)" >&2
+  exit 1
+fi
+
+# Opting out of E2E_SKIP_IMAGE_RELOAD pulls even when the image is cached locally.
+: >"${DOCKER_FAKE_LOG}"
+printf '0' >"${DOCKER_FAKE_STATE}"
+export DOCKER_FAKE_PULL_OK_AFTER=1
+export DOCKER_FAKE_IMAGE_PRESENT=0
+
+E2E_MODE=dev E2E_SKIP_IMAGE_RELOAD=false e2e_docker_pull_if_needed "registry.example.com/kueue:test"
+unset DOCKER_FAKE_PULL_OK_AFTER
+unset DOCKER_FAKE_IMAGE_PRESENT
+
+pull_attempts=$(grep -c "^pull " "${DOCKER_FAKE_LOG}" || true)
+if [[ "${pull_attempts}" != "1" ]]; then
+  echo "expected a cached image to be pulled when E2E_SKIP_IMAGE_RELOAD is off; got ${pull_attempts} pull(s)" >&2
+  exit 1
+fi
+
+# e2e_docker_manifest_available retries a transient manifest-inspect failure until it succeeds.
+: >"${DOCKER_FAKE_LOG}"
+printf '0' >"${DOCKER_FAKE_MANIFEST_STATE}"
+export DOCKER_FAKE_MANIFEST_OK_AFTER=2
+export DOCKER_FAKE_MANIFEST_ERROR="net/http: TLS handshake timeout"
+
+if ! e2e_docker_manifest_available "registry.example.com/kueue:transient"; then
+  echo "expected a transient manifest-inspect failure to be retried until success" >&2
+  exit 1
+fi
+
+manifest_attempts=$(grep -c "^manifest inspect " "${DOCKER_FAKE_LOG}" || true)
+if [[ "${manifest_attempts}" != "2" ]]; then
+  echo "expected manifest inspect to be retried once after a transient failure; got ${manifest_attempts} attempt(s)" >&2
+  exit 1
+fi
+
+unset DOCKER_FAKE_MANIFEST_OK_AFTER DOCKER_FAKE_MANIFEST_ERROR
+
+# e2e_docker_manifest_available fails fast without retrying when the manifest is genuinely missing.
+: >"${DOCKER_FAKE_LOG}"
+printf '0' >"${DOCKER_FAKE_MANIFEST_STATE}"
+export DOCKER_FAKE_MANIFEST_OK_AFTER=99
+export DOCKER_FAKE_MANIFEST_ERROR="no such manifest: registry.example.com/kueue:missing"
+
+if e2e_docker_manifest_available "registry.example.com/kueue:missing"; then
+  echo "expected e2e_docker_manifest_available to fail for a genuinely missing manifest" >&2
+  exit 1
+fi
+
+manifest_attempts=$(grep -c "^manifest inspect " "${DOCKER_FAKE_LOG}" || true)
+if [[ "${manifest_attempts}" != "1" ]]; then
+  echo "expected a non-retriable manifest-inspect failure to fail fast without retrying; got ${manifest_attempts} attempt(s)" >&2
+  exit 1
+fi
+
+unset DOCKER_FAKE_MANIFEST_OK_AFTER DOCKER_FAKE_MANIFEST_ERROR
+
+# An unauthorized error that names a reason is a genuine denial, so it fails fast.
+: >"${DOCKER_FAKE_LOG}"
+printf '0' >"${DOCKER_FAKE_MANIFEST_STATE}"
+export DOCKER_FAKE_MANIFEST_OK_AFTER=99
+export DOCKER_FAKE_MANIFEST_ERROR="unauthorized: authentication required"
+
+if e2e_docker_manifest_available "registry.example.com/kueue:private"; then
+  echo "expected e2e_docker_manifest_available to fail for a denied manifest" >&2
+  exit 1
+fi
+
+manifest_attempts=$(grep -c "^manifest inspect " "${DOCKER_FAKE_LOG}" || true)
+if [[ "${manifest_attempts}" != "1" ]]; then
+  echo "expected a denied manifest inspect to fail fast without retrying; got ${manifest_attempts} attempt(s)" >&2
+  exit 1
+fi
+
+unset DOCKER_FAKE_MANIFEST_OK_AFTER DOCKER_FAKE_MANIFEST_ERROR
+
+# e2e_timed runs the step with its arguments unchanged and logs its start and end
+# time, status, duration and label; once the step completes,
+# e2e_timed_log_unfinished has nothing to log.
+timestamp_re='[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+timed_output=$(e2e_timed "kind/install_example" printf '%s|%s\n' "first arg" "second"; e2e_timed_log_unfinished 0)
+if [[ "${timed_output}" != *"first arg|second"* ]]; then
+  echo "expected e2e_timed to pass arguments through unchanged; got: ${timed_output}" >&2
+  exit 1
+fi
+if [[ $(grep -c '^e2e-timing:' <<<"${timed_output}") != "1" ]] ||
+  ! grep -qE "^e2e-timing: started=${timestamp_re} finished=${timestamp_re} status=0 duration=[0-9]+s step=kind/install_example$" <<<"${timed_output}"; then
+  echo "expected one e2e-timing line for a successful step; got: ${timed_output}" >&2
+  exit 1
+fi
+
+# The subshell below is a standalone statement: inside "if", "&&" or "||" bash
+# would ignore errexit, which is exactly the behavior being checked.
+set +o errexit
+
+# A multi-command step like install_* or kueue_deploy: under errexit it must
+# stop at the first failing command instead of running the rest of the step.
+function e2e_timed_test_step {
+  false
+  echo "step continued after failure"
+}
+
+# With errexit on, as in the e2e scripts, a failing step stops the step and the
+# caller, and the EXIT trap logs the step with the exit status.
+(set -o errexit; trap 'e2e_timed_log_unfinished $?' EXIT; e2e_timed "failing_step" e2e_timed_test_step; echo "caller continued after failure") >"${test_dir}/timed-errexit.out" 2>&1
+errexit_status=$?
+
+set -o errexit
+
+if [[ "${errexit_status}" != "1" ]] || grep -q "continued after failure" "${test_dir}/timed-errexit.out"; then
+  cat "${test_dir}/timed-errexit.out" >&2
+  echo "expected e2e_timed to stop the caller on failure (status ${errexit_status})" >&2
+  exit 1
+fi
+if [[ $(grep -c '^e2e-timing:' "${test_dir}/timed-errexit.out") != "1" ]] ||
+  ! grep -qE "^e2e-timing: started=${timestamp_re} finished=${timestamp_re} status=1 duration=[0-9]+s step=failing_step$" "${test_dir}/timed-errexit.out"; then
+  cat "${test_dir}/timed-errexit.out" >&2
+  echo "expected one e2e-timing line with status=1 from the EXIT trap for a failed step" >&2
+  exit 1
+fi
+
+# Preparing only the manager must retain remote-first selection, local fallback,
+# failure propagation, and forced refresh even when dev dependency reuse is on.
+(
+  IMAGE_TAG=registry.example.com/kueue:test
+  E2E_MODE=dev
+  E2E_SKIP_IMAGE_RELOAD=true
+  e2e_docker_manifest_available() { return "${remote_status}"; }
+  e2e_docker_pull_if_needed() {
+    [[ "$1" == "${IMAGE_TAG}" && "${E2E_SKIP_IMAGE_RELOAD}" == false ]] || exit 9
+    echo pull
+    return "${pull_status}"
+  }
+  docker() {
+    [[ "$*" == "image inspect ${IMAGE_TAG}" ]] || exit 9
+    return "${local_status}"
+  }
+  while read -r remote_status local_status pull_status expected_status expected_pull; do
+    status=0
+    prepare_kueue_image >"${test_dir}/prepare-manager.out" 2>&1 || status=$?
+    pulls=$(grep -c '^pull$' "${test_dir}/prepare-manager.out" || true)
+    if [[ "${status}" != "${expected_status}" || "${pulls}" != "${expected_pull}" ]]; then
+      cat "${test_dir}/prepare-manager.out" >&2
+      echo "unexpected manager preparation: remote=${remote_status} local=${local_status} pull=${pull_status}; status=${status}, pulls=${pulls}" >&2
+      exit 1
+    fi
+  done <<'EOF'
+0 0 0 0 1
+0 0 7 7 1
+1 0 0 0 0
+1 1 0 1 0
+EOF
+)
+
+# Rebuilt manager tags must be imported again unless dev explicitly skips
+# reinstalling Kueue. Both load paths must return their failures to the caller.
+(
+  IMAGE_TAG=registry.example.com/kueue:test
+  cluster_kind_load_image() { echo "cached $*"; return "${load_status}"; }
+  cluster_kind_load_image_impl() { echo "forced $*"; return "${load_status}"; }
+  while read -r E2E_MODE E2E_SKIP_REINSTALL load_status expected_path; do
+    status=0
+    output=$(cluster_kind_load_kueue_image example) || status=$?
+    if [[ "${status}" != "${load_status}" || "${output}" != "${expected_path} example ${IMAGE_TAG}" ]]; then
+      echo "unexpected manager loading: mode=${E2E_MODE} skip=${E2E_SKIP_REINSTALL}; status=${status}, output=${output}" >&2
+      exit 1
+    fi
+  done <<'EOF'
+ci false 0 forced
+ci true 0 forced
+dev false 0 forced
+dev true 0 cached
+ci false 7 forced
+dev true 7 cached
+EOF
+)
+
+# kustomization_add_patch adds patches like `kustomize edit add patch`, and
+# skips a patch that is already in the file, so a rerun does not add it twice.
+(
+  YQ="${real_yq}"
+  kustomization="${test_dir}/add-patch/kustomization.yaml"
+  mkdir -p "$(dirname "${kustomization}")"
+  printf 'resources:\n- manager.yaml\n' >"${kustomization}"
+  for run in 1 2; do
+    kustomization_add_patch "${kustomization}" webhook_patch.yaml
+    kustomization_add_patch "${kustomization}" metrics_patch.yaml Deployment
+    patches=$("${YQ}" -o=json -I=0 '.patches' "${kustomization}")
+    want='[{"path":"webhook_patch.yaml"},{"path":"metrics_patch.yaml","target":{"kind":"Deployment"}}]'
+    if [[ "${patches}" != "${want}" ]]; then
+      echo "unexpected patches after run ${run}: want ${want}, got ${patches}" >&2
+      exit 1
+    fi
+  done
+  # The same path with another target kind is a different patch.
+  kustomization_add_patch "${kustomization}" metrics_patch.yaml Service
+  patches=$("${YQ}" -o=json -I=0 '.patches' "${kustomization}")
+  want='[{"path":"webhook_patch.yaml"},{"path":"metrics_patch.yaml","target":{"kind":"Deployment"}},{"path":"metrics_patch.yaml","target":{"kind":"Service"}}]'
+  if [[ "${patches}" != "${want}" ]]; then
+    echo "unexpected patches after adding another kind: want ${want}, got ${patches}" >&2
+    exit 1
+  fi
+  if [[ "$("${YQ}" '.resources[0]' "${kustomization}")" != "manager.yaml" ]]; then
+    echo "kustomization_add_patch changed the resources" >&2
+    exit 1
+  fi
+)
+
+echo "e2e-common tests passed" >&3

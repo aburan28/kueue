@@ -19,12 +19,20 @@ package queue
 import (
 	"maps"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/component-base/featuregate"
 
+	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/features"
+	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
+	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	"sigs.k8s.io/kueue/pkg/workload"
 )
@@ -43,26 +51,6 @@ func TestNewRequeuer(t *testing.T) {
 		args args
 		want want
 	}{
-		"SchedulerLongRequeueInterval feature disabled": {
-			args: args{
-				featureGates: map[featuregate.Feature]bool{
-					features.SchedulerLongRequeueInterval: false,
-				},
-			},
-			want: want{
-				batchPeriod: time.Second,
-			},
-		},
-		"SchedulerLongRequeueInterval feature enabled": {
-			args: args{
-				featureGates: map[featuregate.Feature]bool{
-					features.SchedulerLongRequeueInterval: true,
-				},
-			},
-			want: want{
-				batchPeriod: 10 * time.Second,
-			},
-		},
 		"custom batch period": {
 			args: args{
 				opts: []RequeuerOption{
@@ -86,8 +74,9 @@ func TestNewRequeuer(t *testing.T) {
 }
 
 func TestInadmissibleWorkloads_Get(t *testing.T) {
-	wl1 := workload.NewInfo(utiltestingapi.MakeWorkload("wl1", "ns1").Obj())
-	wl2 := workload.NewInfo(utiltestingapi.MakeWorkload("wl2", "ns2").Obj())
+	_, log := utiltesting.ContextWithLog(t)
+	wl1 := workload.NewInfo(log, utiltestingapi.MakeWorkload("wl1", "ns1").Obj())
+	wl2 := workload.NewInfo(log, utiltestingapi.MakeWorkload("wl2", "ns2").Obj())
 	key1 := workload.Key(wl1.Obj)
 	key2 := workload.Key(wl2.Obj)
 
@@ -135,8 +124,9 @@ func TestInadmissibleWorkloads_Get(t *testing.T) {
 }
 
 func TestInadmissibleWorkloads_Insert(t *testing.T) {
-	wl1 := workload.NewInfo(utiltestingapi.MakeWorkload("wl1", "ns1").Obj())
-	wl2 := workload.NewInfo(utiltestingapi.MakeWorkload("wl2", "ns2").Obj())
+	_, log := utiltesting.ContextWithLog(t)
+	wl1 := workload.NewInfo(log, utiltestingapi.MakeWorkload("wl1", "ns1").Obj())
+	wl2 := workload.NewInfo(log, utiltestingapi.MakeWorkload("wl2", "ns2").Obj())
 	key1 := workload.Key(wl1.Obj)
 	key2 := workload.Key(wl2.Obj)
 
@@ -192,8 +182,9 @@ func TestInadmissibleWorkloads_Insert(t *testing.T) {
 }
 
 func TestInadmissibleWorkloads_Delete(t *testing.T) {
-	wl1 := workload.NewInfo(utiltestingapi.MakeWorkload("wl1", "ns1").Obj())
-	wl2 := workload.NewInfo(utiltestingapi.MakeWorkload("wl2", "ns2").Obj())
+	_, log := utiltesting.ContextWithLog(t)
+	wl1 := workload.NewInfo(log, utiltestingapi.MakeWorkload("wl1", "ns1").Obj())
+	wl2 := workload.NewInfo(log, utiltestingapi.MakeWorkload("wl2", "ns2").Obj())
 	key1 := workload.Key(wl1.Obj)
 	key2 := workload.Key(wl2.Obj)
 
@@ -254,8 +245,9 @@ func TestInadmissibleWorkloads_Delete(t *testing.T) {
 }
 
 func TestInadmissibleWorkloads_Len(t *testing.T) {
-	wl1 := workload.NewInfo(utiltestingapi.MakeWorkload("wl1", "ns1").Obj())
-	wl2 := workload.NewInfo(utiltestingapi.MakeWorkload("wl2", "ns2").Obj())
+	_, log := utiltesting.ContextWithLog(t)
+	wl1 := workload.NewInfo(log, utiltestingapi.MakeWorkload("wl1", "ns1").Obj())
+	wl2 := workload.NewInfo(log, utiltestingapi.MakeWorkload("wl2", "ns2").Obj())
 	key1 := workload.Key(wl1.Obj)
 	key2 := workload.Key(wl2.Obj)
 
@@ -299,7 +291,8 @@ func TestInadmissibleWorkloads_Len(t *testing.T) {
 }
 
 func TestInadmissibleWorkloads_Empty(t *testing.T) {
-	wl1 := workload.NewInfo(utiltestingapi.MakeWorkload("wl1", "ns1").Obj())
+	_, log := utiltesting.ContextWithLog(t)
+	wl1 := workload.NewInfo(log, utiltestingapi.MakeWorkload("wl1", "ns1").Obj())
 	key1 := workload.Key(wl1.Obj)
 
 	testcases := []struct {
@@ -333,77 +326,139 @@ func TestInadmissibleWorkloads_Empty(t *testing.T) {
 	}
 }
 
-func TestInadmissibleWorkloads_ReplaceAll(t *testing.T) {
-	wl1 := workload.NewInfo(utiltestingapi.MakeWorkload("wl1", "ns1").Obj())
-	wl2 := workload.NewInfo(utiltestingapi.MakeWorkload("wl2", "ns2").Obj())
-	wl3 := workload.NewInfo(utiltestingapi.MakeWorkload("wl3", "ns3").Obj())
-	key1 := workload.Key(wl1.Obj)
-	key2 := workload.Key(wl2.Obj)
-	key3 := workload.Key(wl3.Obj)
+func TestNotifyRetryInadmissibleAfter(t *testing.T) {
+	const batchPeriod = time.Second
 
-	testcases := []struct {
-		name       string
-		initial    map[workload.Reference]*workload.Info
-		newMap     map[workload.Reference]*workload.Info
-		wantLen    int
-		checkKeys  []workload.Reference
-		wantExists []bool
+	workloadMap := func(cqs ...kueue.ClusterQueueReference) map[kueue.ClusterQueueReference][]workload.Reference {
+		if len(cqs) == 0 {
+			return nil
+		}
+		res := make(map[kueue.ClusterQueueReference][]workload.Reference, len(cqs))
+		for _, cq := range cqs {
+			res[cq] = []workload.Reference{workload.Reference("ns/wl-" + string(cq))}
+		}
+		return res
+	}
+
+	cases := map[string]struct {
+		notifyCQ            kueue.ClusterQueueReference
+		delay               time.Duration
+		inadmissibleCQs     []kueue.ClusterQueueReference
+		wantWait            time.Duration
+		wantActiveCQs       []kueue.ClusterQueueReference
+		wantInadmissibleCQs []kueue.ClusterQueueReference
 	}{
-		{
-			name: "replace with empty map",
-			initial: map[workload.Reference]*workload.Info{
-				key1: wl1,
-			},
-			newMap:     map[workload.Reference]*workload.Info{},
-			wantLen:    0,
-			checkKeys:  []workload.Reference{key1},
-			wantExists: []bool{false},
+		"standalone ClusterQueue moves inadmissible workload to active after delay": {
+			notifyCQ:        "standalone-cq",
+			delay:           5 * time.Second,
+			inadmissibleCQs: []kueue.ClusterQueueReference{"standalone-cq"},
+			wantWait:        5 * time.Second,
+			wantActiveCQs:   []kueue.ClusterQueueReference{"standalone-cq"},
 		},
-		{
-			name: "replace with different workloads",
-			initial: map[workload.Reference]*workload.Info{
-				key1: wl1,
-			},
-			newMap: map[workload.Reference]*workload.Info{
-				key2: wl2,
-			},
-			wantLen:    1,
-			checkKeys:  []workload.Reference{key1, key2},
-			wantExists: []bool{false, true},
+		"nested cohort ClusterQueue moves cohort tree inadmissible workloads to active after delay": {
+			notifyCQ:            "child-cohort-cq",
+			delay:               5 * time.Second,
+			inadmissibleCQs:     []kueue.ClusterQueueReference{"child-cohort-cq", "root-cohort-cq", "standalone-cq"},
+			wantWait:            5 * time.Second,
+			wantActiveCQs:       []kueue.ClusterQueueReference{"child-cohort-cq", "root-cohort-cq"},
+			wantInadmissibleCQs: []kueue.ClusterQueueReference{"standalone-cq"},
 		},
-		{
-			name: "replace with multiple workloads",
-			initial: map[workload.Reference]*workload.Info{
-				key1: wl1,
-			},
-			newMap: map[workload.Reference]*workload.Info{
-				key2: wl2,
-				key3: wl3,
-			},
-			wantLen:    2,
-			checkKeys:  []workload.Reference{key1, key2, key3},
-			wantExists: []bool{false, true, true},
+		"delay shorter than batchPeriod waits batchPeriod": {
+			notifyCQ:        "standalone-cq",
+			delay:           200 * time.Millisecond,
+			inadmissibleCQs: []kueue.ClusterQueueReference{"standalone-cq"},
+			wantWait:        batchPeriod,
+			wantActiveCQs:   []kueue.ClusterQueueReference{"standalone-cq"},
+		},
+		"negative delay waits batchPeriod": {
+			notifyCQ:        "child-cohort-cq",
+			delay:           -2 * time.Second,
+			inadmissibleCQs: []kueue.ClusterQueueReference{"child-cohort-cq"},
+			wantWait:        batchPeriod,
+			wantActiveCQs:   []kueue.ClusterQueueReference{"child-cohort-cq"},
 		},
 	}
 
-	for _, tc := range testcases {
-		t.Run(tc.name, func(t *testing.T) {
-			iw := make(inadmissibleWorkloads)
-			maps.Copy(iw, tc.initial)
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, log := utiltesting.ContextWithLog(t)
+				requeuer := NewRequeuer(WithBatchPeriod(batchPeriod))
 
-			iw.replaceAll(tc.newMap)
-
-			if got := iw.len(); got != tc.wantLen {
-				t.Errorf("after replaceAll, len() = %d, want %d", got, tc.wantLen)
-			}
-
-			for i, key := range tc.checkKeys {
-				got := iw.get(key)
-				exists := got != nil
-				if exists != tc.wantExists[i] {
-					t.Errorf("after replaceAll, key %v exists = %v, want %v", key, exists, tc.wantExists[i])
+				workloads := make([]*kueue.Workload, 0, len(tc.inadmissibleCQs))
+				builder := utiltesting.NewClientBuilder().WithObjects(utiltesting.MakeNamespace("ns")).
+					WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType)
+				for _, cqName := range tc.inadmissibleCQs {
+					wl := utiltestingapi.MakeWorkload("wl-"+string(cqName), "ns").
+						Queue(kueue.LocalQueueName("lq-"+string(cqName))).
+						Request(corev1.ResourceCPU, "1").
+						Obj()
+					workloads = append(workloads, wl)
+					builder = builder.WithObjects(wl)
 				}
-			}
+				cl := builder.Build()
+				m := NewManager(cl, nil, requeuer, WithPreemptionExpectations(preemptexpectations.New()))
+
+				go func() {
+					_ = requeuer.Start(ctx)
+				}()
+
+				m.AddOrUpdateCohort(ctx, utiltestingapi.MakeCohort("root-cohort").Obj())
+				m.AddOrUpdateCohort(ctx, utiltestingapi.MakeCohort("child-cohort").Parent("root-cohort").Obj())
+				for _, cq := range []*kueue.ClusterQueue{
+					utiltestingapi.MakeClusterQueue("standalone-cq").Obj(),
+					utiltestingapi.MakeClusterQueue("root-cohort-cq").Cohort("root-cohort").Obj(),
+					utiltestingapi.MakeClusterQueue("child-cohort-cq").Cohort("child-cohort").Obj(),
+				} {
+					if err := m.AddClusterQueue(ctx, cq); err != nil {
+						t.Fatalf("Adding ClusterQueue %q: %v", cq.Name, err)
+					}
+					lq := utiltestingapi.MakeLocalQueue("lq-"+cq.Name, "ns").ClusterQueue(cq.Name).Obj()
+					if err := m.AddLocalQueue(ctx, lq); err != nil {
+						t.Fatalf("Adding LocalQueue %q: %v", lq.Name, err)
+					}
+				}
+				// Adding the queues schedules requeues, which would absorb a later requeue with a longer delay.
+				time.Sleep(batchPeriod)
+				synctest.Wait()
+
+				for _, wl := range workloads {
+					if err := m.AddOrUpdateWorkload(ctx, log, wl); err != nil {
+						t.Fatalf("Adding workload %q: %v", wl.Name, err)
+					}
+				}
+				popped := m.Heads(ctx)
+				if len(popped) != len(workloads) {
+					t.Fatalf("Heads() popped %d workloads, want %d", len(popped), len(workloads))
+				}
+				for i := range popped {
+					if !m.RequeueWorkload(ctx, &popped[i].Info, RequeueReasonPreemptionNoCandidates, "") {
+						t.Fatalf("Expected workload %q to be requeued as inadmissible", popped[i].Obj.Name)
+					}
+				}
+
+				initialInadmissible := workloadMap(tc.inadmissibleCQs...)
+				if diff := cmp.Diff(initialInadmissible, m.DumpInadmissible(), cmpopts.EquateEmpty()); diff != "" {
+					t.Fatalf("Initial inadmissible workloads (-want,+got):\n%s", diff)
+				}
+
+				NotifyRetryInadmissibleAfter(m, sets.New(tc.notifyCQ), tc.delay)
+
+				time.Sleep(tc.wantWait - time.Nanosecond)
+				synctest.Wait()
+				if diff := cmp.Diff(initialInadmissible, m.DumpInadmissible(), cmpopts.EquateEmpty()); diff != "" {
+					t.Fatalf("Before wait elapses, unexpected inadmissible workloads (-want,+got):\n%s", diff)
+				}
+
+				time.Sleep(time.Nanosecond)
+				synctest.Wait()
+				if diff := cmp.Diff(workloadMap(tc.wantInadmissibleCQs...), m.DumpInadmissible(), cmpopts.EquateEmpty()); diff != "" {
+					t.Errorf("At wait, unexpected inadmissible workloads (-want,+got):\n%s", diff)
+				}
+				if diff := cmp.Diff(workloadMap(tc.wantActiveCQs...), m.Dump(), cmpopts.EquateEmpty()); diff != "" {
+					t.Errorf("At wait, unexpected active workloads (-want,+got):\n%s", diff)
+				}
+			})
 		})
 	}
 }

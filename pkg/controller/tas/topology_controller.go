@@ -20,7 +20,7 @@ import (
 	"context"
 
 	"github.com/go-logr/logr"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -61,7 +61,7 @@ var _ predicate.TypedPredicate[*kueue.Topology] = (*topologyReconciler)(nil)
 
 func newTopologyReconciler(c client.Client, queues *qcache.Manager, cache *schdcache.Cache, roleTracker *roletracker.RoleTracker) *topologyReconciler {
 	return &topologyReconciler{
-		logName:          TASTopologyController,
+		logName:          "tas-topology-reconciler",
 		client:           c,
 		queues:           queues,
 		cache:            cache,
@@ -77,17 +77,17 @@ func (r *topologyReconciler) logger() logr.Logger {
 func (r *topologyReconciler) setupWithManager(mgr ctrl.Manager, cfg *configapi.Configuration) (string, error) {
 	return TASTopologyController, builder.TypedControllerManagedBy[reconcile.Request](mgr).
 		Named("tas_topology_controller").
-		WatchesRawSource(source.TypedKind(
+		WatchesRawSource(r.cache.TrackInitialSync(source.TypedKind(
 			mgr.GetCache(),
 			&kueue.Topology{},
 			&handler.TypedEnqueueRequestForObject[*kueue.Topology]{},
 			r,
-		)).
+		))).
 		WithOptions(controller.Options{
 			NeedLeaderElection:      new(false),
 			MaxConcurrentReconciles: mgr.GetControllerOptions().GroupKindConcurrency[kueue.SchemeGroupVersion.WithKind("Topology").GroupKind().String()],
 		}).
-		WithLogConstructor(roletracker.NewLogConstructor(r.roleTracker, TASTopologyController)).
+		WithLogConstructor(roletracker.NewLogConstructor(r.roleTracker, "tas-topology-reconciler")).
 		Watches(&kueue.ResourceFlavor{}, &resourceFlavorHandler{}).
 		Complete(core.WithLeadingManager(mgr, r, &kueue.Topology{}, cfg))
 }
@@ -103,7 +103,7 @@ func (r *topologyReconciler) Reconcile(ctx context.Context, req reconcile.Reques
 	}
 
 	log := ctrl.LoggerFrom(ctx)
-	log.V(2).Info("Reconcile Topology")
+	log.V(3).Info("Reconcile Topology")
 
 	if !topology.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(topology, kueue.ResourceInUseFinalizerName) {
@@ -114,7 +114,7 @@ func (r *topologyReconciler) Reconcile(ctx context.Context, req reconcile.Reques
 				}
 			}
 			if len(flavors) != 0 {
-				log.V(3).Info("topology is still in use", "ResourceFlavors", flavors)
+				log.V(3).Info("Topology is still in use", "resourceFlavors", flavors)
 				return ctrl.Result{}, nil
 			}
 			controllerutil.RemoveFinalizer(topology, kueue.ResourceInUseFinalizerName)
@@ -139,20 +139,38 @@ func (r *topologyReconciler) Generic(event.TypedGenericEvent[*kueue.Topology]) b
 
 func (r *topologyReconciler) Create(e event.TypedCreateEvent[*kueue.Topology]) bool {
 	log := r.logger().WithValues("topology", klog.KObj(e.Object))
-	log.V(2).Info("Topology create event")
+	log.V(3).Info("Topology create event")
 
 	defer r.queues.NotifyTopologyUpdateWatchers(nil, e.Object)
 	r.cache.AddOrUpdateTopology(log, e.Object)
 	return true
 }
 
-func (r *topologyReconciler) Update(event.TypedUpdateEvent[*kueue.Topology]) bool {
+func (r *topologyReconciler) Update(e event.TypedUpdateEvent[*kueue.Topology]) bool {
+	if equality.Semantic.DeepEqual(e.ObjectOld.Spec.Levels, e.ObjectNew.Spec.Levels) {
+		return true
+	}
+	log := r.logger().WithValues("topology", klog.KObj(e.ObjectNew))
+	log.V(4).Info("Topology levels updated",
+		"previousLevels", e.ObjectOld.Spec.Levels, "levels", e.ObjectNew.Spec.Levels)
+
+	cqNames := r.cache.AddOrUpdateTopology(log, e.ObjectNew)
+	// AddOrUpdateTopology only reports ClusterQueues that transitioned from
+	// pending to active. A levels change keeps the ClusterQueues active but
+	// changes which workloads the topology can accommodate, so the workloads
+	// left inadmissible under the previous levels would otherwise never be
+	// retried. Retry the inadmissible workloads in the ClusterQueues that use
+	// this topology.
+	cqNames.Insert(r.cache.ClusterQueuesUsingTopology(kueue.TopologyReference(e.ObjectNew.Name))...)
+	if len(cqNames) > 0 {
+		qcache.NotifyRetryInadmissible(r.queues, cqNames)
+	}
 	return true
 }
 
 func (r *topologyReconciler) Delete(e event.TypedDeleteEvent[*kueue.Topology]) bool {
 	log := r.logger().WithValues("topology", klog.KObj(e.Object))
-	log.V(2).Info("Topology delete event")
+	log.V(3).Info("Topology delete event")
 
 	defer r.queues.NotifyTopologyUpdateWatchers(e.Object, nil)
 	r.cache.DeleteTopology(log, kueue.TopologyReference(e.Object.Name))
@@ -178,8 +196,6 @@ func (h *resourceFlavorHandler) Delete(_ context.Context, e event.DeleteEvent, q
 		return
 	}
 	q.AddAfter(reconcile.Request{
-		NamespacedName: types.NamespacedName{
-			Name: string(*resourceFlavor.Spec.TopologyName),
-		},
+		Name: string(*resourceFlavor.Spec.TopologyName),
 	}, constants.UpdatesBatchPeriod)
 }

@@ -20,8 +20,6 @@ else
 endif
 
 GO_CMD ?= go
-# Use go.mod go version as a single source of truth of GO version.
-GO_VERSION := $(shell awk '/^go /{split($$2, v, "."); print v[1] "." v[2]}' go.mod|head -n1)
 
 GIT_TAG ?= $(shell git describe --tags --dirty --always)
 GIT_COMMIT ?= $(shell git rev-parse HEAD)
@@ -29,11 +27,20 @@ GIT_COMMIT ?= $(shell git rev-parse HEAD)
 HOST_IMAGE_PLATFORM ?= linux/$(shell go env GOARCH)
 PLATFORMS ?= linux/amd64,linux/arm64,linux/s390x,linux/ppc64le
 CLI_PLATFORMS ?= linux/amd64,linux/arm64,darwin/amd64,darwin/arm64
+CLI_BUILD_NPROCS ?= 4
 VIZ_PLATFORMS ?= linux/amd64,linux/arm64,linux/s390x,linux/ppc64le
 # Ray only provides PyPI wheels for amd64 and arm64
 RAY_PLATFORMS ?= linux/amd64,linux/arm64
 DOCKER_BUILDX_CMD ?= docker buildx
 IMAGE_BUILD_CMD ?= $(DOCKER_BUILDX_CMD) build
+# Bound the manager's concurrent cross-compilations only in the image presubmit.
+# Empty overrides retain Go's automatic parallelism.
+IMAGE_PRESUBMIT_GOMAXPROCS ?= 2
+IMAGE_PRESUBMIT_GO_PARALLELISM ?= 2
+# KueueViz's E2E invocation builds one manager image on a shared CPU budget.
+# Keep other image invocations automatic and honor explicit build overrides.
+IMAGE_BUILD_GOMAXPROCS ?= $(if $(filter test-e2e-kueueviz,$(MAKECMDGOALS)),1)
+IMAGE_BUILD_GO_PARALLELISM ?= $(if $(filter test-e2e-kueueviz,$(MAKECMDGOALS)),4)
 
 STAGING_IMAGE_REGISTRY := us-central1-docker.pkg.dev/k8s-staging-images/kueue
 IMAGE_REGISTRY ?= $(STAGING_IMAGE_REGISTRY)
@@ -50,8 +57,6 @@ IMAGE_TAG_KUEUEVIZ_FRONTEND := $(IMAGE_REPO_KUEUEVIZ_FRONTEND):$(GIT_TAG)
 IMAGE_TAG_KUEUE_POPULATOR := $(IMAGE_REPO_KUEUE_POPULATOR):$(GIT_TAG)
 IMAGE_TAG_KUEUE_PRIORITY_BOOSTER := $(IMAGE_REPO_KUEUE_PRIORITY_BOOSTER):$(GIT_TAG)
 
-CLUSTERPROFILE_PLUGIN_IMAGE_VERSION ?= 0.0.1
-
 PROJECT_DIR := $(shell dirname $(abspath $(lastword $(MAKEFILE_LIST))))
 BIN_DIR ?= $(PROJECT_DIR)/bin
 ARTIFACTS ?= $(PROJECT_DIR)/artifacts
@@ -62,18 +67,22 @@ TESTING_DIR := $(HACK_DIR)/testing
 MOCKS_DIR := internal/mocks
 
 RAY_VERSION := $(shell grep '^FROM' "${TESTING_DIR}/ray/Dockerfile" | cut -d: -f2 | cut -d@ -f1)
-RAYMINI_VERSION ?= 0.0.4
+RAYMINI_VERSION ?= 0.0.5
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
-BASE_IMAGE ?= gcr.io/distroless/static:nonroot@sha256:963fa6c544fe5ce420f1f54fb88b6fb01479f054c8056d0f74cc2c6000df5240
-BASE_BUILDER_IMAGE ?= golang
-BUILDER_IMAGE ?= $(BASE_BUILDER_IMAGE):$(GO_VERSION)@sha256:32c0e6e5c4f6707717051091b4d0b077464a679eaab563e11474efc5328e2aa5
+BASE_IMAGE ?= $(shell grep '^FROM' "${HACK_DIR}/images/distroless/Dockerfile" | awk '{print $$2}')
+BUILDER_IMAGE ?= $(shell grep '^FROM' "${HACK_DIR}/images/golang/Dockerfile" | awk '{print $$2}')
 CGO_ENABLED ?= 0
 
 YAML_PROCESSOR_LOG_LEVEL ?= info
 
-IMAGE_PUSH_RETRY = $(PROJECT_DIR)/hack/testing/retry.sh --attempts 7 --delay 2 --exponential --stream --continue-if "grep -qiE 'context deadline exceeded' {output}" -- env
+IMAGE_BUILD_RETRIABLE_ERRORS := context deadline exceeded|unexpected status from HEAD request to .*: 401 Unauthorized|unexpected status from POST request to .*: 502 Bad Gateway|connection reset by peer|too ?many ?requests|ref .* locked for .*: unavailable|tls handshake timeout|stream error: stream ID [0-9]+; INTERNAL_ERROR|http2: server sent GOAWAY|500 Internal Server Error|i/o timeout
+
+IMAGE_BUILD_RETRY = $(PROJECT_DIR)/hack/testing/retry.sh \
+	--stream \
+	--continue-if "grep -qiE '($(IMAGE_BUILD_RETRIABLE_ERRORS))' {output}" \
+	-- env
 
 MAKE_TIMING ?= $(if $(filter 1 true TRUE yes YES on ON,$(CI)),1,0)
 MAKE_TIMING_MIN_SECONDS ?= 1
@@ -110,10 +119,11 @@ LD_FLAGS += -X '$(version_pkg).BuildDate=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)'
 
 # Update these variables when preparing a new release or a release branch.
 # Then run `make prepare-release-branch`
-RELEASE_VERSION=v0.18.3
+RELEASE_VERSION=v0.20.7
 RELEASE_BRANCH=main
 # Application version for Helm and npm (strips leading 'v' from RELEASE_VERSION)
 APP_VERSION := $(shell echo $(RELEASE_VERSION) | cut -c2-)
+DOCS_VERSION := $(patsubst release-%,v%,$(RELEASE_BRANCH))
 
 .PHONY: all
 all: generate fmt vet build
@@ -135,16 +145,16 @@ all: generate fmt vet build
 help: ## Display this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
-include Makefile-deps.mk
+include hack/make/deps.mk
 
-include Makefile-test.mk
+include hack/make/test.mk
 
-include Makefile-kueue-populator.mk
-include Makefile-kueue-priority-booster.mk
+include hack/make/kueue-populator.mk
+include hack/make/kueue-priority-booster.mk
 
 # Repo-wide verification is defined in a separate fragment so it can be read/maintained
-# independently of build/test logic. See `Makefile-verify.mk` for what `make verify` runs.
-include Makefile-verify.mk
+# independently of build/test logic. See `hack/make/verify.mk` for what `make verify` runs.
+include hack/make/verify.mk
 
 ##@ Development
 
@@ -152,16 +162,20 @@ include Makefile-verify.mk
 manifests: controller-gen generate-code ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	$(CONTROLLER_GEN) \
 		crd:generateEmbeddedObjectMeta=true output:crd:artifacts:config=config/components/crd/bases\
-		paths="./apis/..."
+		paths="./apis/kueue/v1beta2/...;./apis/visibility/...;./apis/config/..."
+	$(CONTROLLER_GEN) \
+		crd:generateEmbeddedObjectMeta=true output:crd:artifacts:config=config/components/crd/alpha/bases\
+		paths="./apis/kueue/v1alpha1/..."
 	$(CONTROLLER_GEN) \
 		rbac:roleName=manager-role output:rbac:artifacts:config=config/components/rbac\
 		webhook output:webhook:artifacts:config=config/components/webhook\
-		paths="./pkg/controller/...;./pkg/webhooks/...;./pkg/util/cert/...;./pkg/visibility/..."
+		paths="./pkg/controller/...;./pkg/webhooks/...;./pkg/util/cert/...;./pkg/visibility/...;./pkg/config/..."
 
 .PHONY: compile-crd-manifests
 compile-crd-manifests: manifests kustomize
 	@mkdir -p config/components/crd/_output
 	$(KUSTOMIZE) build config/components/crd > config/components/crd/_output/crds-with-webhooks.yaml
+	$(KUSTOMIZE) build config/components/crd/alpha > config/components/crd/_output/crds-alpha.yaml
 
 .PHONY: update-helm
 update-helm: compile-crd-manifests yq yaml-processor
@@ -183,7 +197,7 @@ generate-mocks: mockgen ## Generate mockgen mocks
 		-destination=$(MOCKS_DIR)/controller/jobframework/interface.go \
 		-copyright_file hack/boilerplate.txt \
 		-package mocks \
-		sigs.k8s.io/kueue/pkg/controller/jobframework GenericJob,JobWithCustomValidation,JobWithManagedBy,JobWithCustomWorkloadActivation,JobWithCustomAnnotations,MultiKueueAdapter
+		sigs.k8s.io/kueue/pkg/controller/jobframework GenericJob,JobWithCustomValidation,JobWithManagedBy,JobWithCustomWorkloadActivation,JobWithCustomAnnotations,MultiKueueAdapter,ElasticWorkloadNameProvider
 	$(MOCKGEN) \
 		-destination=$(MOCKS_DIR)/controller/core/resourceflavor_controller.go \
 		-copyright_file hack/boilerplate.txt \
@@ -237,13 +251,23 @@ image-local-build:
 	$(MAKE) image-build PUSH="$(PUSH)" IMAGE_BUILD_EXTRA_OPTS="$(IMAGE_BUILD_EXTRA_OPTS)"
 	$(DOCKER_BUILDX_CMD) rm $$BUILDER
 
+# Keep compiler caches available until every presubmit image has been built.
+.PHONY: image-presubmit
+image-presubmit:
+	@builder=$$($(DOCKER_BUILDX_CMD) create --driver docker-container) || exit $$?; \
+	trap 'status=$$?; $(DOCKER_BUILDX_CMD) rm "$$builder" || status=1; exit $$status' EXIT; \
+	BUILDX_BUILDER="$$builder" $(MAKE) -j1 \
+		IMAGE_BUILD_GOMAXPROCS="$(IMAGE_PRESUBMIT_GOMAXPROCS)" \
+		IMAGE_BUILD_GO_PARALLELISM="$(IMAGE_PRESUBMIT_GO_PARALLELISM)" \
+		image-build importer-image kueueviz-image kueue-populator-image kueue-priority-booster-image
+
 # Build the multiplatform container image locally and push to repo.
 .PHONY: image-local-push
-image-local-push: export IMAGE_BUILD_CMD := $(IMAGE_PUSH_RETRY) $(IMAGE_BUILD_CMD)
 image-local-push: PUSH=--push
 image-local-push: image-local-build
 
 .PHONY: image-build
+image-build: IMAGE_BUILD_CMD := $(IMAGE_BUILD_RETRY) $(IMAGE_BUILD_CMD)
 image-build:
 	$(IMAGE_BUILD_CMD) \
 		-t $(IMAGE_TAG) \
@@ -254,6 +278,8 @@ image-build:
 		--build-arg CGO_ENABLED=$(CGO_ENABLED) \
 		--build-arg GIT_TAG=$(GIT_TAG) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg IMAGE_BUILD_GOMAXPROCS="$(IMAGE_BUILD_GOMAXPROCS)" \
+		--build-arg IMAGE_BUILD_GO_PARALLELISM="$(IMAGE_BUILD_GO_PARALLELISM)" \
 		$(PUSH) \
 		$(IMAGE_BUILD_EXTRA_OPTS) \
 		./
@@ -264,19 +290,22 @@ image-pushing-periodic:
 
 .PHONY: image-pushing-postsubmit
 image-pushing-postsubmit:
-	$(MAKE) -j5 image-push helm-chart-push kueueviz-image-push kueue-populator-image-push kueue-priority-booster-image-push
+	$(MAKE) -j2 image-push helm-chart-push kueueviz-image-push kueue-populator-image-push kueue-priority-booster-image-push
 
 .PHONY: image-push
-image-push: IMAGE_BUILD_CMD := $(IMAGE_PUSH_RETRY) $(IMAGE_BUILD_CMD)
 image-push: PUSH=--push
 image-push: image-build
 
+define _helm_chart_package_recipe
+DEST_CHART_DIR=$(DEST_CHART_DIR) \
+HELM="$(HELM)" YQ="$(YQ)" GIT_TAG="$(GIT_TAG)" IMAGE_REGISTRY="$(IMAGE_REGISTRY)" \
+HELM_CHART_PUSH=$(HELM_CHART_PUSH) \
+./hack/helm-chart-package.sh
+endef
+
 .PHONY: helm-chart-package
 helm-chart-package: yq helm ## Package a chart into a versioned chart archive file.
-	DEST_CHART_DIR=$(DEST_CHART_DIR) \
-	HELM="$(HELM)" YQ="$(YQ)" GIT_TAG="$(GIT_TAG)" IMAGE_REGISTRY="$(IMAGE_REGISTRY)" \
-	HELM_CHART_PUSH=$(HELM_CHART_PUSH) \
-	./hack/helm-chart-package.sh
+	$(_helm_chart_package_recipe)
 
 .PHONY: helm-chart-push
 helm-chart-push: HELM_CHART_PUSH=true
@@ -306,16 +335,12 @@ ifndef ignore-not-found
   ignore-not-found = false
 endif
 
-clean-manifests = \
-	(cd config/components/manager && \
-		$(KUSTOMIZE) edit set image controller=$(STAGING_IMAGE_REGISTRY)/kueue:$(RELEASE_BRANCH)) && \
-	(cd config/components/kueueviz && \
-  		$(KUSTOMIZE) edit set image backend=$(STAGING_IMAGE_REGISTRY)/kueueviz-backend:$(RELEASE_BRANCH) && \
-  		$(KUSTOMIZE) edit set image frontend=$(STAGING_IMAGE_REGISTRY)/kueueviz-frontend:$(RELEASE_BRANCH)) && \
-	(cd cmd/experimental/kueue-populator/config && \
-    	$(KUSTOMIZE) edit set image controller=$(STAGING_IMAGE_REGISTRY)/kueue-populator:$(RELEASE_BRANCH)) && \
-	(cd cmd/experimental/kueue-priority-booster/config && \
-    	$(KUSTOMIZE) edit set image controller=$(STAGING_IMAGE_REGISTRY)/kueue-priority-booster:$(RELEASE_BRANCH))
+set-release-branch-images = \
+	$(KUSTOMIZATION_SET_IMAGE) config/components/manager controller=$(STAGING_IMAGE_REGISTRY)/kueue:$(RELEASE_BRANCH) && \
+	$(KUSTOMIZATION_SET_IMAGE) config/components/kueueviz backend=$(STAGING_IMAGE_REGISTRY)/kueueviz-backend:$(RELEASE_BRANCH) && \
+	$(KUSTOMIZATION_SET_IMAGE) config/components/kueueviz frontend=$(STAGING_IMAGE_REGISTRY)/kueueviz-frontend:$(RELEASE_BRANCH) && \
+	$(KUSTOMIZATION_SET_IMAGE) cmd/experimental/kueue-populator/config controller=$(STAGING_IMAGE_REGISTRY)/kueue-populator:$(RELEASE_BRANCH) && \
+	$(KUSTOMIZATION_SET_IMAGE) cmd/experimental/kueue-priority-booster/config controller=$(STAGING_IMAGE_REGISTRY)/kueue-priority-booster:$(RELEASE_BRANCH)
 
 .PHONY: install
 install: compile-crd-manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
@@ -325,10 +350,18 @@ install: compile-crd-manifests kustomize ## Install CRDs into the K8s cluster sp
 uninstall: compile-crd-manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	$(KUSTOMIZE) build config/components/crd | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
 
+.PHONY: install-alpha-crds
+install-alpha-crds: compile-crd-manifests kustomize ## Install alpha CRDs into the K8s cluster specified in ~/.kube/config.
+	$(KUSTOMIZE) build config/components/crd/alpha | kubectl apply --server-side -f -
+
+.PHONY: uninstall-alpha-crds
+uninstall-alpha-crds: compile-crd-manifests kustomize ## Uninstall alpha CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	$(KUSTOMIZE) build config/components/crd/alpha | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
+
 .PHONY: deploy
-deploy: compile-crd-manifests kustomize prepare-manifests ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+deploy: compile-crd-manifests yq prepare-manifests ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	kubectl apply --server-side -k config/default
-	@$(call clean-manifests)
+	@$(call set-release-branch-images)
 
 .PHONY: prometheus
 prometheus:
@@ -339,8 +372,8 @@ undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/confi
 	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
 
 .PHONY: site-server
-site-server: hugo
-	(cd site; $(HUGO) server)
+site-server: hugo dart-sass
+	(cd site; npm install --no-audit --no-fund && PATH="$(DART_SASS_DIR):$$PATH" $(HUGO) server)
 
 ##@ Release
 .PHONY: clean-artifacts
@@ -351,36 +384,70 @@ clean-artifacts:
 clean-release-artifacts:
 	$(MAKE) clean-artifacts ARTIFACTS="$(RELEASE_ARTIFACTS)"
 
-.PHONY: prepare-manifests
-prepare-manifests:
-	cd config/components/manager && $(KUSTOMIZE) edit set image controller=$(IMAGE_TAG)
-	cd config/components/kueueviz && $(KUSTOMIZE) edit set image backend=$(IMAGE_TAG_KUEUEVIZ_BACKEND)
-	cd config/components/kueueviz && $(KUSTOMIZE) edit set image frontend=$(IMAGE_TAG_KUEUEVIZ_FRONTEND)
-	cd cmd/experimental/kueue-populator/config && $(KUSTOMIZE) edit set image controller=$(IMAGE_TAG_KUEUE_POPULATOR)
-	cd cmd/experimental/kueue-priority-booster/config && $(KUSTOMIZE) edit set image controller=$(IMAGE_TAG_KUEUE_PRIORITY_BOOSTER)
+define _prepare_manifests_recipe
+$(KUSTOMIZATION_SET_IMAGE) config/components/manager controller=$(IMAGE_TAG)
+$(KUSTOMIZATION_SET_IMAGE) config/components/kueueviz backend=$(IMAGE_TAG_KUEUEVIZ_BACKEND)
+$(KUSTOMIZATION_SET_IMAGE) config/components/kueueviz frontend=$(IMAGE_TAG_KUEUEVIZ_FRONTEND)
+$(KUSTOMIZATION_SET_IMAGE) cmd/experimental/kueue-populator/config controller=$(IMAGE_TAG_KUEUE_POPULATOR)
+$(KUSTOMIZATION_SET_IMAGE) cmd/experimental/kueue-priority-booster/config controller=$(IMAGE_TAG_KUEUE_PRIORITY_BOOSTER)
+endef
 
+.PHONY: prepare-manifests
+prepare-manifests: yq
+	$(_prepare_manifests_recipe)
+
+# Keep first so the build fails before helm-chart-package and
+# prepare-manifests rewrite tracked files.
+.PHONY: verify-git-tag
+verify-git-tag:
+	@if [[ ! "$(GIT_TAG)" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+|-devel)?(-[0-9]+-g[0-9a-f]+)?(-dirty)?$$ ]]; then \
+		echo "GIT_TAG must match a supported Kueue tag format (e.g. vX.Y.Z, vX.Y.Z-rc.N, or vX.Y.Z-devel-<build>-g<commit>); got \"$(GIT_TAG)\"" >&2; \
+		exit 1; \
+	fi
+
+define _artifacts_recipe
+$(KUSTOMIZE) build config/default -o $(ARTIFACTS)/manifests.yaml
+$(KUSTOMIZE) build config/dev -o $(ARTIFACTS)/manifests-dev.yaml
+$(KUSTOMIZE) build config/alpha-enabled -o $(ARTIFACTS)/manifests-alpha-enabled.yaml
+$(KUSTOMIZE) build config/prometheus -o $(ARTIFACTS)/prometheus.yaml
+$(KUSTOMIZE) build config/visibility-apf -o $(ARTIFACTS)/visibility-apf.yaml
+$(KUSTOMIZE) build config/kueueviz -o $(ARTIFACTS)/kueueviz.yaml
+$(KUSTOMIZE) build config/kueueviz-single-host -o $(ARTIFACTS)/kueueviz-single-host.yaml
+$(KUSTOMIZE) build config/networkpolicy -o $(ARTIFACTS)/network-policies.yaml
+$(KUSTOMIZE) build cmd/experimental/kueue-populator/config -o $(ARTIFACTS)/kueue-populator.yaml
+$(KUSTOMIZE) build cmd/experimental/kueue-priority-booster/config -o $(ARTIFACTS)/kueue-priority-booster.yaml
+$(KUSTOMIZE) build config/components/map -o $(ARTIFACTS)/workload-map.yaml
+$(KUSTOMIZE) build config/components/crd/alpha -o $(ARTIFACTS)/alpha-crds.yaml
+@$(call set-release-branch-images)
+endef
+
+define _cli_artifacts_recipe
+CGO_ENABLED=$(CGO_ENABLED) GO_CMD="$(GO_CMD)" LD_FLAGS="$(LD_FLAGS)" BUILD_PATH="$(ARTIFACTS)" BUILD_NAME=kubectl-kueue PLATFORMS="$(CLI_PLATFORMS)" BUILD_NPROCS="$(CLI_BUILD_NPROCS)" ./hack/multiplatform-build.sh ./cmd/kueuectl/main.go
+endef
+
+# helm-chart-package and prepare-manifests write to the working tree, so they run from the recipe
+# body, not as prerequisites, which Make builds in parallel. See the note above the verify-*
+# wrappers in `hack/make/verify.mk`.
 .PHONY: artifacts
 artifacts: DEST_CHART_DIR="$(ARTIFACTS)"
-artifacts: clean-artifacts kustomize helm-chart-package prepare-manifests ## Generate local artifacts.
-	$(KUSTOMIZE) build config/default -o $(ARTIFACTS)/manifests.yaml
-	$(KUSTOMIZE) build config/dev -o $(ARTIFACTS)/manifests-dev.yaml
-	$(KUSTOMIZE) build config/alpha-enabled -o $(ARTIFACTS)/manifests-alpha-enabled.yaml
-	$(KUSTOMIZE) build config/prometheus -o $(ARTIFACTS)/prometheus.yaml
-	$(KUSTOMIZE) build config/visibility-apf -o $(ARTIFACTS)/visibility-apf.yaml
-	$(KUSTOMIZE) build config/kueueviz -o $(ARTIFACTS)/kueueviz.yaml
-	$(KUSTOMIZE) build cmd/experimental/kueue-populator/config -o $(ARTIFACTS)/kueue-populator.yaml
-	$(KUSTOMIZE) build cmd/experimental/kueue-priority-booster/config -o $(ARTIFACTS)/kueue-priority-booster.yaml
-	@$(call clean-manifests)
-	CGO_ENABLED=$(CGO_ENABLED) GO_CMD="$(GO_CMD)" LD_FLAGS="$(LD_FLAGS)" BUILD_PATH="$(ARTIFACTS)" BUILD_NAME=kubectl-kueue PLATFORMS="$(CLI_PLATFORMS)" ./hack/multiplatform-build.sh ./cmd/kueuectl/main.go
+artifacts: verify-git-tag clean-artifacts kustomize helm yq ## Generate local artifacts.
+	$(_helm_chart_package_recipe)
+	$(_prepare_manifests_recipe)
+	$(_artifacts_recipe)
+	$(_cli_artifacts_recipe)
 
 .PHONY: release-artifacts
 release-artifacts: ## Generate release artifacts.
 	$(MAKE) artifacts ARTIFACTS="$(RELEASE_ARTIFACTS)"
 
 .PHONY: prepare-release-branch
-prepare-release-branch: yq kustomize ## Prepare the release branch with the release version.
+prepare-release-branch: yq helm-docs ## Prepare the release branch with the release version.
+	@$(call set-release-branch-images)
 	$(SED) -r 's/v[0-9]+\.[0-9]+\.[0-9]+/$(RELEASE_VERSION)/g' -i README.md -i site/hugo.toml -i cmd/kueueviz/INSTALL.md
 	$(SED) -r 's/chart_version = "[0-9]+\.[0-9]+\.[0-9]+/chart_version = "$(APP_VERSION)/g' -i README.md -i site/hugo.toml
+	@if [ "$(RELEASE_BRANCH)" != "main" ] && echo "$(RELEASE_BRANCH)" | grep -q '^release-[0-9]\+\.[0-9]\+'; then \
+		$(SED) -r 's#https://kueue\.sigs\.k8s\.io/(v[0-9]+\.[0-9]+/)?docs(/|[#)"]|$$)#https://kueue.sigs.k8s.io/$(DOCS_VERSION)/docs\2#g' -i README.md; \
+	fi
 	$(SED) -r 's/--version="[0-9]+\.[0-9]+\.[0-9]+/--version="$(APP_VERSION)/g' -i charts/kueue/README.md.gotmpl -i cmd/kueueviz/INSTALL.md
 	$(SED) -r 's/[0-9]+\.[0-9]+\.[0-9]+/$(APP_VERSION)/g' -i charts/kueue/README.md
 	$(YQ) e '.appVersion = "$(RELEASE_VERSION)" | .version = "$(APP_VERSION)"' -i charts/kueue/Chart.yaml
@@ -398,7 +465,7 @@ prepare-release-branch: yq kustomize ## Prepare the release branch with the rele
 	$(YQ) e '.kueuePriorityBooster.image.tag = "$(RELEASE_BRANCH)"' -i cmd/experimental/kueue-priority-booster/charts/kueue-priority-booster/values.yaml
 	$(SED) -r 's/[0-9]+\.[0-9]+\.[0-9]+/$(APP_VERSION)/g' -i cmd/experimental/kueue-priority-booster/README.md
 
-	$(MAKE) generate-helm-docs
+	$(_generate_helm_docs_recipe)
 
 .PHONY: update-security-insights
 update-security-insights: yq
@@ -416,7 +483,7 @@ update-security-insights: yq
 # Developers don't need to build this image, as it will be available as us-central1-docker.pkg.dev/k8s-staging-images/kueue/debug
 .PHONY: debug-image-push
 debug-image-push: ## Build and push the debug image to the registry
-	$(IMAGE_PUSH_RETRY) $(IMAGE_BUILD_CMD) \
+	$(IMAGE_BUILD_RETRY) $(IMAGE_BUILD_CMD) \
 		-t $(IMAGE_REGISTRY)/debug:$(GIT_TAG) \
 		-t $(IMAGE_REGISTRY)/debug:$(RELEASE_BRANCH) \
 		--platform=$(PLATFORMS) \
@@ -428,6 +495,7 @@ importer-build:
 	$(GO_BUILD_ENV) $(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/importer cmd/importer/main.go
 
 .PHONY: importer-image-build
+importer-image-build: IMAGE_BUILD_CMD := $(IMAGE_BUILD_RETRY) $(IMAGE_BUILD_CMD)
 importer-image-build:
 	$(IMAGE_BUILD_CMD) \
 		-t $(IMAGE_REGISTRY)/importer:$(GIT_TAG) \
@@ -441,7 +509,6 @@ importer-image-build:
 		-f ./cmd/importer/Dockerfile ./
 
 .PHONY: importer-image-push
-importer-image-push: IMAGE_BUILD_CMD := $(IMAGE_PUSH_RETRY) $(IMAGE_BUILD_CMD)
 importer-image-push: PUSH=--push
 importer-image-push: importer-image-build
 
@@ -454,6 +521,7 @@ importer-image: importer-image-build
 
 # Build the kueueviz dashboard images (frontend and backend)
 .PHONY: kueueviz-image-build
+kueueviz-image-build: IMAGE_BUILD_CMD := $(IMAGE_BUILD_RETRY) $(IMAGE_BUILD_CMD)
 kueueviz-image-build:
 	$(IMAGE_BUILD_CMD) \
 		-t $(IMAGE_TAG_KUEUEVIZ_BACKEND) \
@@ -469,12 +537,12 @@ kueueviz-image-build:
 		-t $(IMAGE_TAG_KUEUEVIZ_FRONTEND) \
 		-t $(IMAGE_REPO_KUEUEVIZ_FRONTEND):$(RELEASE_BRANCH) \
 		--platform=$(VIZ_PLATFORMS) \
+		--build-context retry=./hack/testing \
 		$(PUSH) \
 		$(IMAGE_BUILD_EXTRA_OPTS) \
 		-f ./cmd/kueueviz/frontend/Dockerfile ./cmd/kueueviz/frontend
 
 .PHONY: kueueviz-image-push
-kueueviz-image-push: IMAGE_BUILD_CMD := $(IMAGE_PUSH_RETRY) $(IMAGE_BUILD_CMD)
 kueueviz-image-push: PUSH=--push
 kueueviz-image-push: kueueviz-image-build
 
@@ -488,6 +556,7 @@ kueueviz-image: kueueviz-image-build
 .PHONY: kueue-populator-image-build
 kueue-populator-image-build:
 	$(MAKE) -C cmd/experimental/kueue-populator image-build \
+	    IMAGE_BUILD_CMD="$(subst ",\",$(IMAGE_BUILD_RETRY) $(IMAGE_BUILD_CMD))" \
 		IMAGE_REGISTRY=$(IMAGE_REGISTRY) \
 		IMAGE_TAG=$(IMAGE_TAG_KUEUE_POPULATOR) \
 		PLATFORMS="$(PLATFORMS)" \
@@ -498,7 +567,6 @@ kueue-populator-image-build:
 		IMAGE_BUILD_EXTRA_OPTS="$(IMAGE_BUILD_EXTRA_OPTS) -t $(IMAGE_REPO_KUEUE_POPULATOR):$(RELEASE_BRANCH)"
 
 .PHONY: kueue-populator-image-push
-kueue-populator-image-push: export IMAGE_BUILD_CMD := $(IMAGE_PUSH_RETRY) $(IMAGE_BUILD_CMD)
 kueue-populator-image-push: PUSH=--push
 kueue-populator-image-push: kueue-populator-image-build
 
@@ -512,6 +580,7 @@ kueue-populator-image: kueue-populator-image-build
 .PHONY: kueue-priority-booster-image-build
 kueue-priority-booster-image-build:
 	$(MAKE) -C cmd/experimental/kueue-priority-booster image-build \
+	    IMAGE_BUILD_CMD="$(subst ",\",$(IMAGE_BUILD_RETRY) $(IMAGE_BUILD_CMD))" \
 		IMAGE_REGISTRY=$(IMAGE_REGISTRY) \
 		IMAGE_TAG=$(IMAGE_TAG_KUEUE_PRIORITY_BOOSTER) \
 		PLATFORMS="$(PLATFORMS)" \
@@ -522,7 +591,6 @@ kueue-priority-booster-image-build:
 		IMAGE_BUILD_EXTRA_OPTS="$(IMAGE_BUILD_EXTRA_OPTS) -t $(IMAGE_REPO_KUEUE_PRIORITY_BOOSTER):$(RELEASE_BRANCH)"
 
 .PHONY: kueue-priority-booster-image-push
-kueue-priority-booster-image-push: export IMAGE_BUILD_CMD := $(IMAGE_PUSH_RETRY) $(IMAGE_BUILD_CMD)
 kueue-priority-booster-image-push: PUSH=--push
 kueue-priority-booster-image-push: kueue-priority-booster-image-build
 
@@ -554,8 +622,9 @@ generate-kueuectl-docs: kueuectl-docs
 		$(PROJECT_DIR)/site/content/en/docs/reference/kubectl-kueue/commands
 
 .PHONY: generate-helm-docs
+_generate_helm_docs_recipe = $(HELM_DOCS) -c $(PROJECT_DIR)/charts/kueue
 generate-helm-docs: helm-docs
-	$(HELM_DOCS) -c $(PROJECT_DIR)/charts/kueue
+	$(_generate_helm_docs_recipe)
 
 .PHONY: generate-metrics-tables
 generate-metrics-tables: metricsdoc
@@ -563,6 +632,7 @@ generate-metrics-tables: metricsdoc
 
 # Build the ray-project-mini image
 .PHONY: ray-project-mini-image-build
+ray-project-mini-image-build: IMAGE_BUILD_CMD := $(IMAGE_BUILD_RETRY) $(IMAGE_BUILD_CMD)
 ray-project-mini-image-build:
 	$(IMAGE_BUILD_CMD) \
 		-t $(IMAGE_REGISTRY)/ray-project-mini:$(RAYMINI_VERSION) \
@@ -574,7 +644,6 @@ ray-project-mini-image-build:
 		-f ./hack/testing/ray-mini/Dockerfile ./
 
 .PHONY: ray-project-mini-image-build-push
-ray-project-mini-image-build-push: IMAGE_BUILD_CMD := $(IMAGE_PUSH_RETRY) $(IMAGE_BUILD_CMD)
 ray-project-mini-image-build-push: PUSH=--push
 ray-project-mini-image-build-push: ray-project-mini-image-build
 
@@ -583,19 +652,3 @@ ray-project-mini-image-build-push: ray-project-mini-image-build
 kind-ray-project-mini-image-build: RAY_PLATFORMS=$(HOST_IMAGE_PLATFORM)
 kind-ray-project-mini-image-build: PUSH=--load
 kind-ray-project-mini-image-build: ray-project-mini-image-build
-
-# Build the secretreader-plugin image
-.PHONY: secretreader-plugin-image-build
-secretreader-plugin-image-build:
-	$(IMAGE_BUILD_CMD) \
-		-t $(IMAGE_REGISTRY)/secretreader-plugin:$(CLUSTERPROFILE_PLUGIN_IMAGE_VERSION) \
-		--platform=$(PLATFORMS) \
-		--build-arg PLUGIN_VERSION=$(CLUSTERPROFILE_VERSION) \
-		$(PUSH) \
-		-f hack/testing/secretreader/Dockerfile ./
-
-# The step is required for local e2e test run
-.PHONY: kind-secretreader-plugin-image-build
-kind-secretreader-plugin-image-build: PLATFORMS=$(HOST_IMAGE_PLATFORM)
-kind-secretreader-plugin-image-build: PUSH=--load
-kind-secretreader-plugin-image-build: secretreader-plugin-image-build

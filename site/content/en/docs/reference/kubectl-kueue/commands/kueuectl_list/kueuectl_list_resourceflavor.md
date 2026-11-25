@@ -13,7 +13,9 @@ The file is auto-generated from the Go source code of the component using the
 ## Synopsis
 
 
-List ResourceFlavor
+Lists ResourceFlavors that match the given criteria.
+
+KUEUECTL_LIST_REQUEST_LIMIT sets how many objects kueuectl fetches from the Kubernetes API per request. It does not limit the output: all matching objects are listed. The default is 100; 0 fetches all objects in a single request.
 
 ```
 kueuectl list resourceflavor [--selector KEY=VALUE] [--field-selector FIELD_NAME=VALUE]
@@ -236,6 +238,15 @@ kueuectl list resourceflavor [--selector KEY=VALUE] [--field-selector FIELD_NAME
         <td></td>
         <td style="line-height: 130%; word-wrap: break-word;">
             <p>If present, the namespace scope for this CLI request</p>
+        </td>
+    </tr>
+    <tr>
+        <td colspan="2">--proxy-url string</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td style="line-height: 130%; word-wrap: break-word;">
+            <p>Proxy URL to use for requests to the API server</p>
         </td>
     </tr>
     <tr>

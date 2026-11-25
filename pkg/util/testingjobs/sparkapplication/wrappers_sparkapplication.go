@@ -17,8 +17,6 @@ package sparkapplication
 import (
 	sparkappv1beta2 "github.com/kubeflow/spark-operator/v2/api/v1beta2"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
 	controllerconstants "sigs.k8s.io/kueue/pkg/controller/constants"
 )
@@ -31,10 +29,8 @@ type SparkApplicationWrapper struct {
 // MakeSparkApplication creates a wrapper for SparkApplication with some default values
 func MakeSparkApplication(name, ns string) *SparkApplicationWrapper {
 	return &SparkApplicationWrapper{sparkappv1beta2.SparkApplication{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: ns,
-		},
+		Name:      name,
+		Namespace: ns,
 		Spec: sparkappv1beta2.SparkApplicationSpec{
 			Type:                sparkappv1beta2.SparkApplicationTypeScala,
 			Mode:                sparkappv1beta2.DeployModeCluster,
@@ -43,18 +39,18 @@ func MakeSparkApplication(name, ns string) *SparkApplicationWrapper {
 			Arguments:           []string{"1000"},
 			Driver: sparkappv1beta2.DriverSpec{
 				SparkPodSpec: sparkappv1beta2.SparkPodSpec{
-					Memory:         new("512Mi"),
+					Memory:         new("512m"),
 					ServiceAccount: new("spark-operator-spark"),
 				},
 				CoreRequest: new("100m"),
 			},
 			Executor: sparkappv1beta2.ExecutorSpec{
 				SparkPodSpec: sparkappv1beta2.SparkPodSpec{
-					Memory:         new("512Mi"),
+					Memory:         new("512m"),
 					ServiceAccount: new("spark-operator-spark"),
 				},
 				CoreRequest:         new("100m"),
-				Instances:           ptr.To[int32](1),
+				Instances:           new(int32(1)),
 				DeleteOnTermination: new(false),
 			},
 		},
@@ -147,6 +143,15 @@ func (w *SparkApplicationWrapper) DynamicAllocation(dynamicAllocation *sparkappv
 	return w
 }
 
+// SparkConf sets a sparkConf entry.
+func (w *SparkApplicationWrapper) SparkConf(key, value string) *SparkApplicationWrapper {
+	if w.Spec.SparkConf == nil {
+		w.Spec.SparkConf = map[string]string{}
+	}
+	w.Spec.SparkConf[key] = value
+	return w
+}
+
 // DriverServiceAccount sets the driver service account.
 func (w *SparkApplicationWrapper) DriverServiceAccount(sa string) *SparkApplicationWrapper {
 	w.Spec.Driver.ServiceAccount = new(sa)
@@ -228,6 +233,27 @@ func (w *SparkApplicationWrapper) ExecutorTolerations(ts []corev1.Toleration) *S
 // ExecutorTemplate sets a pod template on the executor pod.
 func (w *SparkApplicationWrapper) ExecutorTemplate(t *corev1.PodTemplateSpec) *SparkApplicationWrapper {
 	w.Spec.Executor.Template = t
+	return w
+}
+
+// ExecutorSchedulingGates sets scheduling gates on the executor pod template.
+func (w *SparkApplicationWrapper) ExecutorSchedulingGates(gates ...corev1.PodSchedulingGate) *SparkApplicationWrapper {
+	if w.Spec.Executor.Template == nil {
+		w.Spec.Executor.Template = &corev1.PodTemplateSpec{}
+	}
+	w.Spec.Executor.Template.Spec.SchedulingGates = gates
+	return w
+}
+
+// AppState sets the application state in the status.
+func (w *SparkApplicationWrapper) AppState(state sparkappv1beta2.ApplicationStateType) *SparkApplicationWrapper {
+	w.Status.AppState.State = state
+	return w
+}
+
+// SubmissionID sets the submission ID in the status.
+func (w *SparkApplicationWrapper) SubmissionID(id string) *SparkApplicationWrapper {
+	w.Status.SubmissionID = id
 	return w
 }
 

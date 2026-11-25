@@ -17,68 +17,321 @@ limitations under the License.
 package scheduler
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"iter"
+	"reflect"
+	"slices"
+	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	zaplog "go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/component-base/featuregate"
+	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
+	crzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/cache/scheduler/simulator"
 	"sigs.k8s.io/kueue/pkg/features"
+	"sigs.k8s.io/kueue/pkg/podset"
 	"sigs.k8s.io/kueue/pkg/resources"
 	"sigs.k8s.io/kueue/pkg/util/tas"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
+	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	"sigs.k8s.io/kueue/pkg/util/testingjobs/node"
+	"sigs.k8s.io/kueue/pkg/workload"
 )
 
+type testDomainSpec struct {
+	domain domain
+	state  domainState
+	parent *testDomainSpec
+}
+
+// addDomainsWithState populates s.domainStates for specs and their ancestor
+// chain, returning the allocated domain pointers in the same order as specs.
+func addDomainsWithState(s *TASFlavorSnapshot, specs []testDomainSpec) []*domain {
+	added := make(map[*testDomainSpec]*domain)
+	var addSpec func(spec *testDomainSpec) *domain
+	addSpec = func(spec *testDomainSpec) *domain {
+		if existing, ok := added[spec]; ok {
+			return existing
+		}
+		d := spec.domain
+		if spec.parent != nil {
+			d.parent = addSpec(spec.parent)
+		}
+		d.idx = len(s.domainStates)
+		s.domainStates = append(s.domainStates, spec.state)
+		ptr := &d
+		added[spec] = ptr
+		return ptr
+	}
+	result := make([]*domain, len(specs))
+	for i := range specs {
+		result[i] = addSpec(&specs[i])
+	}
+	return result
+}
+
+func newFreeCapacityTestSnapshot(capacities map[tas.TopologyDomainID]leafCapacity) *TASFlavorSnapshot {
+	leaves := make(leafDomainByID, len(capacities))
+	leafCapacities := make([]leafCapacity, 0, len(capacities))
+	for id, capacity := range capacities {
+		leaves[id] = &leafDomain{id: id, leafIdx: len(leafCapacities)}
+		leafCapacities = append(leafCapacities, capacity)
+	}
+	return &TASFlavorSnapshot{
+		topologyTree:   &topologyTree{leaves: leaves},
+		leafCapacities: leafCapacities,
+	}
+}
+
 func TestFreeCapacityPerDomain(t *testing.T) {
-	snapshot := &TASFlavorSnapshot{
-		leaves: leafDomainByID{
-			"domain2": &leafDomain{
-				freeCapacity: resources.Requests{
-					corev1.ResourceCPU:    1000,
-					corev1.ResourceMemory: 2 * 1024 * 1024 * 1024, // 2 GiB
-				},
-				tasUsage: resources.Requests{
-					corev1.ResourceMemory: 1 * 1024 * 1024 * 1024, // 1 GiB
-					corev1.ResourceCPU:    500,
-				},
+	cases := map[string]struct {
+		// snapshot is a function, so that the requests are built with the
+		// VectorizedResourceRequests feature gate already set.
+		snapshot func() *TASFlavorSnapshot
+		expected string
+	}{
+		"domains with free capacity and TAS usage": {
+			snapshot: func() *TASFlavorSnapshot {
+				return newFreeCapacityTestSnapshot(map[tas.TopologyDomainID]leafCapacity{
+					"domain2": {
+						freeCapacity: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
+							corev1.ResourceCPU:    1000,
+							corev1.ResourceMemory: 2 * 1024 * 1024 * 1024, // 2 GiB
+						}),
+						tasUsage: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
+							corev1.ResourceMemory: 1 * 1024 * 1024 * 1024, // 1 GiB
+							corev1.ResourceCPU:    500,
+						}),
+					},
+					"domain1": {
+						freeCapacity: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
+							corev1.ResourceMemory: 4 * 1024 * 1024 * 1024, // 4 GiB
+							corev1.ResourceCPU:    2000,
+							"nvidia.com/gpu":      1,
+						}),
+						tasUsage: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
+							corev1.ResourceCPU:    500,
+							"nvidia.com/gpu":      1,
+							corev1.ResourceMemory: 2 * 1024 * 1024 * 1024, // 1 GiB
+						}),
+					},
+				})
 			},
-			"domain1": &leafDomain{
-				freeCapacity: resources.Requests{
-					corev1.ResourceMemory: 4 * 1024 * 1024 * 1024, // 4 GiB
-					corev1.ResourceCPU:    2000,
-					"nvidia.com/gpu":      1,
-				},
-				tasUsage: resources.Requests{
-					corev1.ResourceCPU:    500,
-					"nvidia.com/gpu":      1,
-					corev1.ResourceMemory: 2 * 1024 * 1024 * 1024, // 1 GiB
-				},
+			expected: `{"domain1":{"freeCapacity":{"cpu":"2","memory":"4Gi","nvidia.com/gpu":"1"},"tasUsage":{"cpu":"500m","memory":"2Gi","nvidia.com/gpu":"1"}},"domain2":{"freeCapacity":{"cpu":"1","memory":"2Gi"},"tasUsage":{"cpu":"500m","memory":"1Gi"}}}`,
+		},
+		"domain with free capacity, but without TAS usage": {
+			snapshot: func() *TASFlavorSnapshot {
+				return newFreeCapacityTestSnapshot(map[tas.TopologyDomainID]leafCapacity{
+					"domain1": {
+						freeCapacity: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
+							corev1.ResourceCPU: 1000,
+						}),
+						// tasUsage is left nil, as there is no TAS workload
+						// admitted in the domain.
+					},
+				})
 			},
+			expected: `{"domain1":{"freeCapacity":{"cpu":"1"},"tasUsage":{}}}`,
+		},
+		"domain without free capacity and without TAS usage": {
+			snapshot: func() *TASFlavorSnapshot {
+				return newFreeCapacityTestSnapshot(map[tas.TopologyDomainID]leafCapacity{"domain1": {}})
+			},
+			expected: `{"domain1":{"freeCapacity":{},"tasUsage":{}}}`,
+		},
+		"snapshot without domains": {
+			snapshot: func() *TASFlavorSnapshot {
+				return newFreeCapacityTestSnapshot(nil)
+			},
+			expected: `{}`,
 		},
 	}
 
-	expected := `{"domain1":{"freeCapacity":{"cpu":"2","memory":"4Gi","nvidia.com/gpu":"1"},"tasUsage":{"cpu":"500m","memory":"2Gi","nvidia.com/gpu":"1"}},"domain2":{"freeCapacity":{"cpu":"1","memory":"2Gi"},"tasUsage":{"cpu":"500m","memory":"1Gi"}}}`
-	var wantErr error
+	for name, tc := range cases {
+		for _, enableVectorizedRequests := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s, VectorizedResourceRequests=%t", name, enableVectorizedRequests), func(t *testing.T) {
+				features.SetFeatureGateDuringTest(t, features.VectorizedResourceRequests, enableVectorizedRequests)
 
-	got, gotErr := snapshot.SerializeFreeCapacityPerDomain()
-	if diff := cmp.Diff(wantErr, gotErr, cmpopts.EquateErrors()); len(diff) != 0 {
-		t.Errorf("Unexpected error (-want,+got):\n%s", diff)
+				snapshot := tc.snapshot()
+				var wantErr error
+
+				got, gotErr := snapshot.SerializeFreeCapacityPerDomain()
+				if diff := cmp.Diff(wantErr, gotErr, cmpopts.EquateErrors()); len(diff) != 0 {
+					t.Errorf("Unexpected error (-want,+got):\n%s", diff)
+				}
+				if diff := cmp.Diff(tc.expected, got); diff != "" {
+					t.Errorf("SerializeFreeCapacityPerDomain() mismatch (-expected +got):\n%s", diff)
+				}
+			})
+		}
 	}
-	if diff := cmp.Diff(expected, got); diff != "" {
-		t.Errorf("SerializeFreeCapacityPerDomain() mismatch (-expected +got):\n%s", diff)
+}
+
+// Usage recorded against a domain the snapshot does not hold is skipped rather
+// than panicking. This happens when the backing node was deleted or stopped
+// being Ready between the Workload being admitted and the snapshot being taken.
+func TestApplyTASUsageSkipsDomainTheSnapshotDoesNotHold(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	const rackLabel = "cloud.provider.com/topology-rack"
+	_, log := utiltesting.ContextWithLog(t)
+
+	rackNode := node.MakeNode("n1").
+		Label(rackLabel, "r1").
+		StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}).
+		Ready().
+		Obj()
+	tree := newTopologyTree([]string{rackLabel}, []*corev1.Node{rackNode}, 0)
+	snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator())
+
+	oneCPU := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000})
+	snapshot.updateTASUsage(tas.DomainID([]string{"gone"}), oneCPU, add, 1)
+
+	if got := len(snapshot.domainTASUsage); got != 0 {
+		t.Errorf("usage recorded for %d domains, want none", got)
+	}
+}
+
+// A virtual topology keeps usage on the domains rather than the leaves, so the
+// dump must report those domains or it reads as if nothing is used.
+func TestFreeCapacityPerDomainReportsUsageDomains(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	const rackLabel = "cloud.provider.com/topology-rack"
+	_, log := utiltesting.ContextWithLog(t)
+
+	rackNode := node.MakeNode("").
+		Label(rackLabel, "r1").
+		StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}).
+		Ready()
+	tree := newTopologyTree([]string{rackLabel}, []*corev1.Node{
+		rackNode.Clone().Name("n1").Obj(),
+		rackNode.Clone().Name("n2").Obj(),
+	}, 0)
+	snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator(),
+		withResourceFormatter(resources.NewResourceFormatter()))
+	snapshot.updateTASUsage(tas.DomainID([]string{"r1"}),
+		resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000}), add, 1)
+
+	got, err := snapshot.SerializeFreeCapacityPerDomain()
+	if err != nil {
+		t.Fatalf("SerializeFreeCapacityPerDomain() error = %v", err)
+	}
+	want := `"r1":{"freeCapacity":{"cpu":"4"},"tasUsage":{"cpu":"1","pods":"1"}}`
+	if !strings.Contains(got, want) {
+		t.Errorf("SerializeFreeCapacityPerDomain() = %s, want it to contain %s", got, want)
+	}
+}
+
+func TestIsTopologyAssignmentStale(t *testing.T) {
+	const blockLabel = "cloud.provider.com/topology-block"
+	const rackLabel = "cloud.provider.com/topology-rack"
+
+	hostnameLowest := newTopologyTree(
+		[]string{blockLabel, corev1.LabelHostname},
+		[]*corev1.Node{
+			node.MakeNode("n1").
+				Label(blockLabel, "b1").
+				Label(corev1.LabelHostname, "n1").
+				Obj(),
+		},
+		0,
+	)
+	rackLowest := newTopologyTree(
+		[]string{blockLabel, rackLabel},
+		[]*corev1.Node{
+			node.MakeNode("n1").
+				Label(blockLabel, "b1").
+				Label(rackLabel, "r1").
+				Obj(),
+		},
+		0,
+	)
+
+	cases := map[string]struct {
+		tree            *topologyTree
+		assignment      *tas.TopologyAssignment
+		wantStale       bool
+		wantStaleDomain string
+	}{
+		"existing hostname leaf is not stale": {
+			tree: hostnameLowest,
+			assignment: &tas.TopologyAssignment{
+				Levels:  []string{corev1.LabelHostname},
+				Domains: []tas.TopologyDomainAssignment{{Values: []string{"n1"}}},
+			},
+		},
+		"missing hostname leaf is stale": {
+			tree: hostnameLowest,
+			assignment: &tas.TopologyAssignment{
+				Levels:  []string{corev1.LabelHostname},
+				Domains: []tas.TopologyDomainAssignment{{Values: []string{"n2"}}},
+			},
+			wantStale:       true,
+			wantStaleDomain: "n2",
+		},
+		"deleted node is stale even when its hostname matches an existing root domain ID": {
+			tree: hostnameLowest,
+			assignment: &tas.TopologyAssignment{
+				Levels:  []string{corev1.LabelHostname},
+				Domains: []tas.TopologyDomainAssignment{{Values: []string{"b1"}}},
+			},
+			wantStale:       true,
+			wantStaleDomain: "b1",
+		},
+		"existing non-hostname leaf is not stale": {
+			tree: rackLowest,
+			assignment: &tas.TopologyAssignment{
+				Levels:  []string{blockLabel, rackLabel},
+				Domains: []tas.TopologyDomainAssignment{{Values: []string{"b1", "r1"}}},
+			},
+		},
+		"missing non-hostname leaf is stale": {
+			tree: rackLowest,
+			assignment: &tas.TopologyAssignment{
+				Levels:  []string{blockLabel, rackLabel},
+				Domains: []tas.TopologyDomainAssignment{{Values: []string{"b1", "r2"}}},
+			},
+			wantStale:       true,
+			wantStaleDomain: "b1",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			snapshot := &TASFlavorSnapshot{topologyTree: tc.tree}
+			gotStale, gotStaleDomain := snapshot.IsTopologyAssignmentStale(tc.assignment)
+			if gotStale != tc.wantStale {
+				t.Errorf("IsTopologyAssignmentStale() stale = %t, want %t", gotStale, tc.wantStale)
+			}
+			if gotStaleDomain != tc.wantStaleDomain {
+				t.Errorf("IsTopologyAssignmentStale() stale domain = %q, want %q", gotStaleDomain, tc.wantStaleDomain)
+			}
+		})
 	}
 }
 
 func TestMergeTopologyAssignments(t *testing.T) {
-	nodes := []corev1.Node{
-		*node.MakeNode("x").Label("level-1", "a").Label("level-2", "b").Obj(),
-		*node.MakeNode("y").Label("level-1", "a").Label("level-2", "c").Obj(),
-		*node.MakeNode("z").Label("level-1", "d").Label("level-2", "e").Obj(),
-		*node.MakeNode("w").Label("level-1", "d").Label("level-2", "f").Obj(),
+	nodes := []*corev1.Node{
+		node.MakeNode("x").Label("level-1", "a").Label("level-2", "b").Obj(),
+		node.MakeNode("y").Label("level-1", "a").Label("level-2", "c").Obj(),
+		node.MakeNode("z").Label("level-1", "d").Label("level-2", "e").Obj(),
+		node.MakeNode("w").Label("level-1", "d").Label("level-2", "f").Obj(),
 	}
 	levels := []string{"level-1", "level-2"}
+	tree := newTopologyTree(levels, nodes, 0)
 
 	cases := map[string]struct {
 		a    *tas.TopologyAssignment
@@ -346,15 +599,73 @@ func TestMergeTopologyAssignments(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			_, log := utiltesting.ContextWithLog(t)
-			s := newTASFlavorSnapshot(log, "dummy", levels)
-			for i := range nodes {
-				s.addNode(&nodes[i])
-			}
-			s.initialize()
+			s := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "dummy"}, tree, newDefaultSimulator())
 
 			got := s.mergeTopologyAssignments(tc.a, tc.b)
 			if diff := cmp.Diff(tc.want, *got); diff != "" {
 				t.Errorf("unexpected topology assignment (-want,+got): %s", diff)
+			}
+		})
+	}
+}
+
+func TestMergeTopologyAssignmentsWithMissingNodes(t *testing.T) {
+	tree := newTopologyTree([]string{"rack", corev1.LabelHostname}, []*corev1.Node{
+		node.MakeNode("node-a").Label("rack", "rack-2").Label(corev1.LabelHostname, "node-a").Obj(),
+		node.MakeNode("node-c").Label("rack", "rack-1").Label(corev1.LabelHostname, "node-c").Obj(),
+	}, 0)
+	nodeA := tas.TopologyDomainAssignment{Values: []string{"node-a"}, Count: 1}
+	nodeB := tas.TopologyDomainAssignment{Values: []string{"node-b"}, Count: 1}
+	nodeC := tas.TopologyDomainAssignment{Values: []string{"node-c"}, Count: 1}
+	nodeD := tas.TopologyDomainAssignment{Values: []string{"node-d"}, Count: 1}
+	cases := map[string]struct {
+		domains []tas.TopologyDomainAssignment
+		want    []tas.TopologyDomainAssignment
+	}{
+		"known nodes retain topology ordering rather than hostname ordering": {
+			domains: []tas.TopologyDomainAssignment{nodeA, nodeC},
+			want:    []tas.TopologyDomainAssignment{nodeC, nodeA},
+		},
+		"missing node at the start": {
+			domains: []tas.TopologyDomainAssignment{nodeB, nodeA, nodeC},
+			want:    []tas.TopologyDomainAssignment{nodeB, nodeC, nodeA},
+		},
+		"missing node between known nodes": {
+			domains: []tas.TopologyDomainAssignment{nodeA, nodeB, nodeC},
+			want:    []tas.TopologyDomainAssignment{nodeB, nodeC, nodeA},
+		},
+		"missing node at the end": {
+			domains: []tas.TopologyDomainAssignment{nodeC, nodeA, nodeB},
+			want:    []tas.TopologyDomainAssignment{nodeB, nodeC, nodeA},
+		},
+		"all nodes missing use hostname ordering": {
+			domains: []tas.TopologyDomainAssignment{nodeD, nodeB},
+			want:    []tas.TopologyDomainAssignment{nodeB, nodeD},
+		},
+		"duplicate known nodes merge despite a missing node": {
+			domains: []tas.TopologyDomainAssignment{nodeA, nodeB, nodeC, nodeA},
+			want: []tas.TopologyDomainAssignment{
+				nodeB, nodeC, {Values: []string{"node-a"}, Count: 2},
+			},
+		},
+		"duplicate missing nodes merge despite known nodes": {
+			domains: []tas.TopologyDomainAssignment{nodeB, nodeA, nodeC, nodeB},
+			want: []tas.TopologyDomainAssignment{
+				{Values: []string{"node-b"}, Count: 2}, nodeC, nodeA,
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := &TASFlavorSnapshot{topologyTree: tree}
+			levels := []string{corev1.LabelHostname}
+			a := &tas.TopologyAssignment{Levels: levels, Domains: tc.domains[:len(tc.domains)/2]}
+			b := &tas.TopologyAssignment{Levels: levels, Domains: tc.domains[len(tc.domains)/2:]}
+
+			got := s.mergeTopologyAssignments(a, b)
+			want := &tas.TopologyAssignment{Levels: levels, Domains: tc.want}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("unexpected topology assignment (-want,+got):\n%s", diff)
 			}
 		})
 	}
@@ -421,7 +732,7 @@ func TestHasLevel(t *testing.T) {
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			_, log := utiltesting.ContextWithLog(t)
-			s := newTASFlavorSnapshot(log, "dummy", levels)
+			s := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "dummy"}, newTopologyTree(levels, nil, 0), newDefaultSimulator())
 			got := s.HasLevel(tc.podSetTopologyRequest)
 			if diff := cmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("unexpected HasLevel result (-want,+got): %s", diff)
@@ -430,216 +741,919 @@ func TestHasLevel(t *testing.T) {
 	}
 }
 
-// TestSortedDomainsWithLeader verifies the sorting criteria (in order of priority):
-// 1. leaderState - descending (always)
-// 2. sliceStateWithLeader - descending (BestFit) or ascending (LeastFreeCapacity)
-// 3. stateWithLeader - ascending (always, as tiebreaker)
-// 4. levelValues - ascending (always, as final tiebreaker)
-func TestSortedDomainsWithLeader(t *testing.T) {
+// TestSortedDomains verifies the sorting criteria (in order of priority):
+// 1. leaderCount - descending (only when the obligation includes the leader)
+// 2. affinityScore - descending (when TASRespectNodeAffinityPreferred is enabled)
+// 3. sliceCount[obligation] - descending (BestFit) or ascending (LeastFreeCapacity)
+// 4. podCount[obligation.podIndex()] - ascending (always, as tiebreaker)
+// 5. ancestor free capacity (sliceCount, then podCount, for the obligation, without the leader obligation when neither domain can host the leader) - ascending bottom-up
+// 6. levelValues - ascending (always, as final tiebreaker)
+//
+// Cases without an explicit obligation sort for obligationNone.
+func TestSortedDomains(t *testing.T) {
 	levels := []string{"block"}
 
+	blockLarge := &testDomainSpec{
+		domain: domain{id: "b1", levelValues: []string{"b1"}},
+		state: domainState{
+			sliceCount: [4]int32{obligationNone: 2},
+			podCount:   [2]int32{obligationNone: 16},
+		},
+	}
+	blockSmall := &testDomainSpec{
+		domain: domain{id: "b2", levelValues: []string{"b2"}},
+		state: domainState{
+			sliceCount: [4]int32{obligationNone: 1},
+			podCount:   [2]int32{obligationNone: 8},
+		},
+	}
+	blockMediumOneSlice := &testDomainSpec{
+		domain: domain{id: "b3", levelValues: []string{"b3"}},
+		state: domainState{
+			sliceCount: [4]int32{obligationNone: 1},
+			podCount:   [2]int32{obligationNone: 12},
+		},
+	}
+	subblockPartial := &testDomainSpec{
+		domain: domain{id: "b1-sb1", levelValues: []string{"b1", "sb1"}},
+		state: domainState{
+			sliceCount: [4]int32{obligationNone: 2},
+			podCount:   [2]int32{obligationNone: 2},
+		},
+		parent: blockLarge,
+	}
+	subblockIntactInLarge := &testDomainSpec{
+		domain: domain{id: "b1-sb2", levelValues: []string{"b1", "sb2"}},
+		state: domainState{
+			sliceCount: [4]int32{obligationNone: 4},
+			podCount:   [2]int32{obligationNone: 4},
+		},
+		parent: blockLarge,
+	}
+	subblockIntactInSmall := &testDomainSpec{
+		domain: domain{id: "b2-sb1", levelValues: []string{"b2", "sb1"}},
+		state: domainState{
+			sliceCount: [4]int32{obligationNone: 4},
+			podCount:   [2]int32{obligationNone: 4},
+		},
+		parent: blockSmall,
+	}
+	blockLargeLeader := &testDomainSpec{
+		domain: domain{id: "b1", levelValues: []string{"b1"}},
+		state: domainState{
+			leaderCount: 1,
+			sliceCount:  [4]int32{obligationLeader: 2},
+			podCount:    [2]int32{obligationLeader: 14},
+		},
+	}
+	blockSmallLeader := &testDomainSpec{
+		domain: domain{id: "b2", levelValues: []string{"b2"}},
+		state: domainState{
+			leaderCount: 1,
+			sliceCount:  [4]int32{obligationLeader: 1},
+			podCount:    [2]int32{obligationLeader: 8},
+		},
+	}
+	subblockPartialLeader := &testDomainSpec{
+		domain: domain{id: "b1-sb1", levelValues: []string{"b1", "sb1"}},
+		state: domainState{
+			leaderCount: 1,
+			sliceCount:  [4]int32{obligationLeader: 2},
+			podCount:    [2]int32{obligationLeader: 2},
+		},
+		parent: blockLargeLeader,
+	}
+	subblockIntactInLargeLeader := &testDomainSpec{
+		domain: domain{id: "b1-sb2", levelValues: []string{"b1", "sb2"}},
+		state: domainState{
+			leaderCount: 1,
+			sliceCount:  [4]int32{obligationLeader: 4},
+			podCount:    [2]int32{obligationLeader: 4},
+		},
+		parent: blockLargeLeader,
+	}
+	subblockIntactInSmallLeader := &testDomainSpec{
+		domain: domain{id: "b2-sb1", levelValues: []string{"b2", "sb1"}},
+		state: domainState{
+			leaderCount: 1,
+			sliceCount:  [4]int32{obligationLeader: 4},
+			podCount:    [2]int32{obligationLeader: 4},
+		},
+		parent: blockSmallLeader,
+	}
+
 	testCases := map[string]struct {
-		domains                              []*domain
+		domains                              []testDomainSpec
+		obligation                           obligationMask
 		unconstrained                        bool
 		enableTASPreferredSchedulingAffinity bool
+		disableTASAncestorCapacityTieBreak   bool
 		wantOrder                            []string
 	}{
 		"affinityScore descending: higher affinity score comes first": {
 			enableTASPreferredSchedulingAffinity: true,
-			domains: []*domain{
-				{id: "low-affinity", affinityScore: 10, leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 10, levelValues: []string{"a"}},
-				{id: "high-affinity", affinityScore: 100, leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 10, levelValues: []string{"b"}},
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "low-affinity", levelValues: []string{"a"}},
+					state: domainState{
+						affinityScore: 10,
+						sliceCount:    [4]int32{obligationNone: 5},
+						podCount:      [2]int32{obligationNone: 10},
+					},
+				},
+				{
+					domain: domain{id: "high-affinity", levelValues: []string{"b"}},
+					state: domainState{
+						affinityScore: 100,
+						sliceCount:    [4]int32{obligationNone: 5},
+						podCount:      [2]int32{obligationNone: 10},
+					},
+				},
 			},
 			unconstrained: false,
 			wantOrder:     []string{"high-affinity", "low-affinity"},
 		},
 		"affinityScore ignored when feature gate is disabled": {
 			enableTASPreferredSchedulingAffinity: false,
-			domains: []*domain{
-				{id: "low-affinity", affinityScore: 10, leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 10, levelValues: []string{"a"}},
-				{id: "high-affinity", affinityScore: 100, leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 10, levelValues: []string{"b"}},
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "low-affinity", levelValues: []string{"a"}},
+					state: domainState{
+						affinityScore: 10,
+						sliceCount:    [4]int32{obligationNone: 5},
+						podCount:      [2]int32{obligationNone: 10},
+					},
+				},
+				{
+					domain: domain{id: "high-affinity", levelValues: []string{"b"}},
+					state: domainState{
+						affinityScore: 100,
+						sliceCount:    [4]int32{obligationNone: 5},
+						podCount:      [2]int32{obligationNone: 10},
+					},
+				},
 			},
 			unconstrained: false,
 			wantOrder:     []string{"low-affinity", "high-affinity"},
 		},
-		"leaderState descending: domains that can host leader come first": {
-			domains: []*domain{
-				{id: "no-leader", leaderState: 0, sliceStateWithLeader: 10, stateWithLeader: 10, levelValues: []string{"a"}},
-				{id: "has-leader", leaderState: 1, sliceStateWithLeader: 1, stateWithLeader: 1, levelValues: []string{"b"}},
-			},
-			unconstrained: false,
-			wantOrder:     []string{"has-leader", "no-leader"},
-		},
-		"leader capability prioritized over preferred affinity": {
-			enableTASPreferredSchedulingAffinity: true,
-			domains: []*domain{
-				{id: "preferred-no-leader", affinityScore: 100, leaderState: 0, sliceStateWithLeader: 0, stateWithLeader: 0, levelValues: []string{"a"}},
-				{id: "non-preferred-has-leader", affinityScore: 10, leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 10, levelValues: []string{"b"}},
-			},
-			unconstrained: false,
-			wantOrder:     []string{"non-preferred-has-leader", "preferred-no-leader"},
-		},
-		"BestFit: sliceStateWithLeader descending": {
-			domains: []*domain{
-				{id: "a", leaderState: 1, sliceStateWithLeader: 3, stateWithLeader: 1, levelValues: []string{"a"}},
-				{id: "b", leaderState: 1, sliceStateWithLeader: 1, stateWithLeader: 1, levelValues: []string{"b"}},
-				{id: "c", leaderState: 1, sliceStateWithLeader: 2, stateWithLeader: 1, levelValues: []string{"c"}},
+		"BestFit: sliceCount descending": {
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "a", levelValues: []string{"a"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 3},
+						podCount:   [2]int32{obligationNone: 1},
+					},
+				},
+				{
+					domain: domain{id: "b", levelValues: []string{"b"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 1},
+					},
+				},
+				{
+					domain: domain{id: "c", levelValues: []string{"c"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 2},
+						podCount:   [2]int32{obligationNone: 1},
+					},
+				},
 			},
 			unconstrained: false,
 			wantOrder:     []string{"a", "c", "b"},
 		},
-		"LeastFreeCapacity: sliceStateWithLeader ascending": {
-			domains: []*domain{
-				{id: "a", leaderState: 1, sliceStateWithLeader: 3, stateWithLeader: 1, levelValues: []string{"a"}},
-				{id: "b", leaderState: 1, sliceStateWithLeader: 1, stateWithLeader: 1, levelValues: []string{"b"}},
-				{id: "c", leaderState: 1, sliceStateWithLeader: 2, stateWithLeader: 1, levelValues: []string{"c"}},
+		"LeastFreeCapacity: sliceCount ascending": {
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "a", levelValues: []string{"a"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 3},
+						podCount:   [2]int32{obligationNone: 1},
+					},
+				},
+				{
+					domain: domain{id: "b", levelValues: []string{"b"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 1},
+					},
+				},
+				{
+					domain: domain{id: "c", levelValues: []string{"c"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 2},
+						podCount:   [2]int32{obligationNone: 1},
+					},
+				},
 			},
 			unconstrained: true,
 			wantOrder:     []string{"b", "c", "a"},
 		},
-		"BestFit: stateWithLeader ascending as tiebreaker": {
-			domains: []*domain{
-				{id: "large", leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 100, levelValues: []string{"a"}},
-				{id: "small", leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 10, levelValues: []string{"b"}},
-				{id: "medium", leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 50, levelValues: []string{"c"}},
+		"BestFit: podCount ascending as tiebreaker": {
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "large", levelValues: []string{"a"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 5},
+						podCount:   [2]int32{obligationNone: 100},
+					},
+				},
+				{
+					domain: domain{id: "small", levelValues: []string{"b"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 5},
+						podCount:   [2]int32{obligationNone: 10},
+					},
+				},
+				{
+					domain: domain{id: "medium", levelValues: []string{"c"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 5},
+						podCount:   [2]int32{obligationNone: 50},
+					},
+				},
 			},
 			unconstrained: false,
 			wantOrder:     []string{"small", "medium", "large"},
 		},
-		"LeastFreeCapacity: stateWithLeader ascending as tiebreaker": {
-			domains: []*domain{
-				{id: "large", leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 100, levelValues: []string{"a"}},
-				{id: "small", leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 10, levelValues: []string{"b"}},
-				{id: "medium", leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 50, levelValues: []string{"c"}},
+		"LeastFreeCapacity: podCount ascending as tiebreaker": {
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "large", levelValues: []string{"a"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 5},
+						podCount:   [2]int32{obligationNone: 100},
+					},
+				},
+				{
+					domain: domain{id: "small", levelValues: []string{"b"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 5},
+						podCount:   [2]int32{obligationNone: 10},
+					},
+				},
+				{
+					domain: domain{id: "medium", levelValues: []string{"c"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 5},
+						podCount:   [2]int32{obligationNone: 50},
+					},
+				},
 			},
 			unconstrained: true,
 			wantOrder:     []string{"small", "medium", "large"},
 		},
+		"BestFit: ancestor sliceCount and podCount ascending as tiebreaker": {
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "b1-r1", levelValues: []string{"b1", "r1"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 8},
+					},
+					parent: blockLarge,
+				},
+				{
+					domain: domain{id: "b3-r1", levelValues: []string{"b3", "r1"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 8},
+					},
+					parent: blockMediumOneSlice,
+				},
+				{
+					domain: domain{id: "b2-r1", levelValues: []string{"b2", "r1"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 8},
+					},
+					parent: blockSmall,
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"b2-r1", "b3-r1", "b1-r1"},
+		},
+		"ancestor capacity ignored when feature gate is disabled": {
+			disableTASAncestorCapacityTieBreak: true,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "b1-r1", levelValues: []string{"b1", "r1"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 8},
+					},
+					parent: blockLarge,
+				},
+				{
+					domain: domain{id: "b3-r1", levelValues: []string{"b3", "r1"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 8},
+					},
+					parent: blockMediumOneSlice,
+				},
+				{
+					domain: domain{id: "b2-r1", levelValues: []string{"b2", "r1"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 8},
+					},
+					parent: blockSmall,
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"b1-r1", "b2-r1", "b3-r1"},
+		},
+		"LeastFreeCapacity: ancestor sliceCount and podCount ascending as tiebreaker": {
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "b1-r1", levelValues: []string{"b1", "r1"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 8},
+					},
+					parent: blockLarge,
+				},
+				{
+					domain: domain{id: "b3-r1", levelValues: []string{"b3", "r1"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 8},
+					},
+					parent: blockMediumOneSlice,
+				},
+				{
+					domain: domain{id: "b2-r1", levelValues: []string{"b2", "r1"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 8},
+					},
+					parent: blockSmall,
+				},
+			},
+			unconstrained: true,
+			wantOrder:     []string{"b2-r1", "b3-r1", "b1-r1"},
+		},
+		"three-level hierarchy breaks ties bottom-up from parent to grandparent": {
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "b1-sb2-h2", levelValues: []string{"b1", "sb2", "h2"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 1},
+					},
+					parent: subblockIntactInLarge,
+				},
+				{
+					domain: domain{id: "b2-sb1-h1", levelValues: []string{"b2", "sb1", "h1"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 1},
+					},
+					parent: subblockIntactInSmall,
+				},
+				{
+					domain: domain{id: "b1-sb1-h1", levelValues: []string{"b1", "sb1", "h1"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 1},
+					},
+					parent: subblockPartial,
+				},
+				{
+					domain: domain{id: "b1-sb2-h1", levelValues: []string{"b1", "sb2", "h1"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 1},
+						podCount:   [2]int32{obligationNone: 1},
+					},
+					parent: subblockIntactInLarge,
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"b1-sb1-h1", "b2-sb1-h1", "b1-sb2-h1", "b1-sb2-h2"},
+		},
 		"levelValues ascending as final tiebreaker": {
-			domains: []*domain{
-				{id: "c", leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 10, levelValues: []string{"c"}},
-				{id: "a", leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 10, levelValues: []string{"a"}},
-				{id: "b", leaderState: 1, sliceStateWithLeader: 5, stateWithLeader: 10, levelValues: []string{"b"}},
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "c", levelValues: []string{"c"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 5},
+						podCount:   [2]int32{obligationNone: 10},
+					},
+				},
+				{
+					domain: domain{id: "a", levelValues: []string{"a"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 5},
+						podCount:   [2]int32{obligationNone: 10},
+					},
+				},
+				{
+					domain: domain{id: "b", levelValues: []string{"b"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 5},
+						podCount:   [2]int32{obligationNone: 10},
+					},
+				},
 			},
 			unconstrained: false,
 			wantOrder:     []string{"a", "b", "c"},
+		},
+		"obligationLeader: affinityScore descending: higher affinity score comes first": {
+			obligation:                           obligationLeader,
+			enableTASPreferredSchedulingAffinity: true,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "low-affinity", levelValues: []string{"a"}},
+					state: domainState{
+						affinityScore: 10,
+						leaderCount:   1,
+						sliceCount:    [4]int32{obligationLeader: 5},
+						podCount:      [2]int32{obligationLeader: 10},
+					},
+				},
+				{
+					domain: domain{id: "high-affinity", levelValues: []string{"b"}},
+					state: domainState{
+						affinityScore: 100,
+						leaderCount:   1,
+						sliceCount:    [4]int32{obligationLeader: 5},
+						podCount:      [2]int32{obligationLeader: 10},
+					},
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"high-affinity", "low-affinity"},
+		},
+		"obligationLeader: affinityScore ignored when feature gate is disabled": {
+			obligation:                           obligationLeader,
+			enableTASPreferredSchedulingAffinity: false,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "low-affinity", levelValues: []string{"a"}},
+					state: domainState{
+						affinityScore: 10,
+						leaderCount:   1,
+						sliceCount:    [4]int32{obligationLeader: 5},
+						podCount:      [2]int32{obligationLeader: 10},
+					},
+				},
+				{
+					domain: domain{id: "high-affinity", levelValues: []string{"b"}},
+					state: domainState{
+						affinityScore: 100,
+						leaderCount:   1,
+						sliceCount:    [4]int32{obligationLeader: 5},
+						podCount:      [2]int32{obligationLeader: 10},
+					},
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"low-affinity", "high-affinity"},
+		},
+		"obligationLeader: leaderCount descending: domains that can host leader come first": {
+			obligation: obligationLeader,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "no-leader", levelValues: []string{"a"}},
+					state: domainState{
+						leaderCount: 0,
+						sliceCount:  [4]int32{obligationLeader: 10},
+						podCount:    [2]int32{obligationLeader: 10},
+					},
+				},
+				{
+					domain: domain{id: "has-leader", levelValues: []string{"b"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 1},
+						podCount:    [2]int32{obligationLeader: 1},
+					},
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"has-leader", "no-leader"},
+		},
+		"obligationLeader: leader capability prioritized over preferred affinity": {
+			obligation:                           obligationLeader,
+			enableTASPreferredSchedulingAffinity: true,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "preferred-no-leader", levelValues: []string{"a"}},
+					state: domainState{
+						affinityScore: 100,
+						leaderCount:   0,
+						sliceCount:    [4]int32{obligationLeader: 0},
+						podCount:      [2]int32{obligationLeader: 0},
+					},
+				},
+				{
+					domain: domain{id: "non-preferred-has-leader", levelValues: []string{"b"}},
+					state: domainState{
+						affinityScore: 10,
+						leaderCount:   1,
+						sliceCount:    [4]int32{obligationLeader: 5},
+						podCount:      [2]int32{obligationLeader: 10},
+					},
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"non-preferred-has-leader", "preferred-no-leader"},
+		},
+		"obligationLeader: BestFit: leader slice capacity descending": {
+			obligation: obligationLeader,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "a", levelValues: []string{"a"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 3},
+						podCount:    [2]int32{obligationLeader: 1},
+					},
+				},
+				{
+					domain: domain{id: "b", levelValues: []string{"b"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 1},
+						podCount:    [2]int32{obligationLeader: 1},
+					},
+				},
+				{
+					domain: domain{id: "c", levelValues: []string{"c"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 2},
+						podCount:    [2]int32{obligationLeader: 1},
+					},
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"a", "c", "b"},
+		},
+		"obligationLeader: LeastFreeCapacity: leader slice capacity ascending": {
+			obligation: obligationLeader,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "a", levelValues: []string{"a"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 3},
+						podCount:    [2]int32{obligationLeader: 1},
+					},
+				},
+				{
+					domain: domain{id: "b", levelValues: []string{"b"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 1},
+						podCount:    [2]int32{obligationLeader: 1},
+					},
+				},
+				{
+					domain: domain{id: "c", levelValues: []string{"c"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 2},
+						podCount:    [2]int32{obligationLeader: 1},
+					},
+				},
+			},
+			unconstrained: true,
+			wantOrder:     []string{"b", "c", "a"},
+		},
+		"obligationLeader: BestFit: podCount[obligationLeader] ascending as tiebreaker": {
+			obligation: obligationLeader,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "large", levelValues: []string{"a"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 5},
+						podCount:    [2]int32{obligationLeader: 100},
+					},
+				},
+				{
+					domain: domain{id: "small", levelValues: []string{"b"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 5},
+						podCount:    [2]int32{obligationLeader: 10},
+					},
+				},
+				{
+					domain: domain{id: "medium", levelValues: []string{"c"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 5},
+						podCount:    [2]int32{obligationLeader: 50},
+					},
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"small", "medium", "large"},
+		},
+		"obligationLeader: LeastFreeCapacity: podCount[obligationLeader] ascending as tiebreaker": {
+			obligation: obligationLeader,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "large", levelValues: []string{"a"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 5},
+						podCount:    [2]int32{obligationLeader: 100},
+					},
+				},
+				{
+					domain: domain{id: "small", levelValues: []string{"b"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 5},
+						podCount:    [2]int32{obligationLeader: 10},
+					},
+				},
+				{
+					domain: domain{id: "medium", levelValues: []string{"c"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 5},
+						podCount:    [2]int32{obligationLeader: 50},
+					},
+				},
+			},
+			unconstrained: true,
+			wantOrder:     []string{"small", "medium", "large"},
+		},
+		"obligationLeader: ancestor leader capacity ascending breaks equal domain ties": {
+			obligation: obligationLeader,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "b1-r1", levelValues: []string{"b1", "r1"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 1},
+						podCount:    [2]int32{obligationLeader: 8},
+					},
+					parent: blockLargeLeader,
+				},
+				{
+					domain: domain{id: "b2-r1", levelValues: []string{"b2", "r1"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 1},
+						podCount:    [2]int32{obligationLeader: 8},
+					},
+					parent: blockSmallLeader,
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"b2-r1", "b1-r1"},
+		},
+		"obligationLeader: ancestor leader capacity ignored when feature gate is disabled": {
+			obligation:                         obligationLeader,
+			disableTASAncestorCapacityTieBreak: true,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "b1-r1", levelValues: []string{"b1", "r1"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 1},
+						podCount:    [2]int32{obligationLeader: 8},
+					},
+					parent: blockLargeLeader,
+				},
+				{
+					domain: domain{id: "b2-r1", levelValues: []string{"b2", "r1"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 1},
+						podCount:    [2]int32{obligationLeader: 8},
+					},
+					parent: blockSmallLeader,
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"b1-r1", "b2-r1"},
+		},
+		"obligationLeader: non-leader domains fall back to worker ancestor capacity": {
+			obligation: obligationLeader,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "b1-r1", levelValues: []string{"b1", "r1"}},
+					state:  domainState{leaderCount: 0},
+					parent: &testDomainSpec{
+						domain: domain{id: "b1", levelValues: []string{"b1"}},
+						// No leader-capable nodes in b1 leaves podCount[obligationLeader] at 0 despite 16 worker slots.
+						state: domainState{
+							sliceCount: [4]int32{obligationNone: 2, obligationLeader: 0},
+							podCount:   [2]int32{obligationNone: 16},
+						},
+					},
+				},
+				{
+					domain: domain{id: "b2-r1", levelValues: []string{"b2", "r1"}},
+					state:  domainState{leaderCount: 0},
+					parent: &testDomainSpec{
+						domain: domain{id: "b2", levelValues: []string{"b2"}},
+						state: domainState{
+							leaderCount: 1,
+							sliceCount:  [4]int32{obligationNone: 1, obligationLeader: 1},
+							podCount:    [2]int32{obligationNone: 8, obligationLeader: 7},
+						},
+					},
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"b2-r1", "b1-r1"},
+		},
+		"obligationLeader: three-level hierarchy breaks leader ties bottom-up from parent to grandparent": {
+			obligation: obligationLeader,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "b1-sb2-h2", levelValues: []string{"b1", "sb2", "h2"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 1},
+						podCount:    [2]int32{obligationLeader: 1},
+					},
+					parent: subblockIntactInLargeLeader,
+				},
+				{
+					domain: domain{id: "b2-sb1-h1", levelValues: []string{"b2", "sb1", "h1"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 1},
+						podCount:    [2]int32{obligationLeader: 1},
+					},
+					parent: subblockIntactInSmallLeader,
+				},
+				{
+					domain: domain{id: "b1-sb1-h1", levelValues: []string{"b1", "sb1", "h1"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 1},
+						podCount:    [2]int32{obligationLeader: 1},
+					},
+					parent: subblockPartialLeader,
+				},
+				{
+					domain: domain{id: "b1-sb2-h1", levelValues: []string{"b1", "sb2", "h1"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 1},
+						podCount:    [2]int32{obligationLeader: 1},
+					},
+					parent: subblockIntactInLargeLeader,
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"b1-sb1-h1", "b2-sb1-h1", "b1-sb2-h1", "b1-sb2-h2"},
+		},
+		"obligationLeader: levelValues ascending as final tiebreaker": {
+			obligation: obligationLeader,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "c", levelValues: []string{"c"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 5},
+						podCount:    [2]int32{obligationLeader: 10},
+					},
+				},
+				{
+					domain: domain{id: "a", levelValues: []string{"a"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 5},
+						podCount:    [2]int32{obligationLeader: 10},
+					},
+				},
+				{
+					domain: domain{id: "b", levelValues: []string{"b"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationLeader: 5},
+						podCount:    [2]int32{obligationLeader: 10},
+					},
+				},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"a", "b", "c"},
+		},
+		"obligationNone ignores leader capacity": {
+			obligation: obligationNone,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "leader-capable", levelValues: []string{"a"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationNone: 1, obligationLeader: 1},
+						podCount:    [2]int32{obligationNone: 4, obligationLeader: 3},
+					},
+				},
+				{
+					domain: domain{id: "worker-only", levelValues: []string{"b"}},
+					state: domainState{
+						sliceCount: [4]int32{obligationNone: 2},
+						podCount:   [2]int32{obligationNone: 8},
+					},
+				},
+			},
+			wantOrder: []string{"worker-only", "leader-capable"},
+		},
+		"obligationLeader: ranks by leader capacity, not worker capacity": {
+			obligation: obligationLeader,
+			domains: []testDomainSpec{
+				{
+					domain: domain{id: "more-workers", levelValues: []string{"a"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationNone: 5, obligationLeader: 1},
+						podCount:    [2]int32{obligationNone: 5, obligationLeader: 1},
+					},
+				},
+				{
+					domain: domain{id: "more-with-leader", levelValues: []string{"b"}},
+					state: domainState{
+						leaderCount: 1,
+						sliceCount:  [4]int32{obligationNone: 2, obligationLeader: 2},
+						podCount:    [2]int32{obligationNone: 2, obligationLeader: 2},
+					},
+				},
+			},
+			wantOrder: []string{"more-with-leader", "more-workers"},
 		},
 	}
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			features.SetFeatureGateDuringTest(t, features.TASRespectNodeAffinityPreferred, tc.enableTASPreferredSchedulingAffinity)
+			features.SetFeatureGateDuringTest(t, features.TASAncestorCapacityTieBreak, !tc.disableTASAncestorCapacityTieBreak)
 			_, log := utiltesting.ContextWithLog(t)
-			s := newTASFlavorSnapshot(log, "test", levels)
+			s := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "test"}, newTopologyTree(levels, nil, 0), newDefaultSimulator())
 
-			sorted := s.sortedDomainsWithLeader(tc.domains, tc.unconstrained)
+			sorted := s.sortedDomains(addDomainsWithState(s, tc.domains), tc.obligation, tc.unconstrained, nil)
 
-			gotOrder := make([]string, len(sorted))
-			for i, d := range sorted {
-				gotOrder[i] = string(d.id)
-			}
-
-			if diff := cmp.Diff(tc.wantOrder, gotOrder); diff != "" {
+			if diff := cmp.Diff(tc.wantOrder, domainIDs(sorted)); diff != "" {
 				t.Errorf("unexpected domain order (-want,+got): %s", diff)
 			}
 		})
 	}
 }
 
-// TestSortedDomains verifies the sorting criteria (in order of priority):
-// 1. affinityScore - descending (when TASRespectNodeAffinityPreferred is enabled)
-// 2. sliceState - descending (BestFit) or ascending (LeastFreeCapacity)
-// 3. state - ascending (always, as tiebreaker)
-// 4. levelValues - ascending (always, as final tiebreaker)
-func TestSortedDomains(t *testing.T) {
-	levels := []string{"block"}
+func TestCompareDomainLevelValues(t *testing.T) {
+	_, log := utiltesting.ContextWithLog(t)
+	hostnameLevels := []string{"block", "rack", corev1.LabelHostname}
+	nonHostnameLevels := []string{"block", "rack"}
+
+	parent1 := &domain{id: "b1-r1", levelValues: []string{"b1", "r1"}}
+	parent2 := &domain{id: "b1-r2", levelValues: []string{"b1", "r2"}}
 
 	testCases := map[string]struct {
-		domains                              []*domain
-		unconstrained                        bool
-		enableTASPreferredSchedulingAffinity bool
-		wantOrder                            []string
+		levels []string
+		a      *domain
+		b      *domain
+		want   int
 	}{
-		"affinityScore descending: higher affinity score comes first": {
-			enableTASPreferredSchedulingAffinity: true,
-			domains: []*domain{
-				{id: "low-affinity", affinityScore: 10, sliceState: 5, state: 10, levelValues: []string{"a"}},
-				{id: "high-affinity", affinityScore: 100, sliceState: 5, state: 10, levelValues: []string{"b"}},
-			},
-			unconstrained: false,
-			wantOrder:     []string{"high-affinity", "low-affinity"},
+		"leafIsNode with same-parent sibling domains: ascending by hostname": {
+			levels: hostnameLevels,
+			a:      &domain{id: "node-a", parent: parent1, levelValues: []string{"b1", "r1", "node-a"}},
+			b:      &domain{id: "node-b", parent: parent1, levelValues: []string{"b1", "r1", "node-b"}},
+			want:   -1,
 		},
-		"affinityScore ignored when feature gate is disabled": {
-			enableTASPreferredSchedulingAffinity: false,
-			domains: []*domain{
-				{id: "low-affinity", affinityScore: 10, sliceState: 5, state: 10, levelValues: []string{"a"}},
-				{id: "high-affinity", affinityScore: 100, sliceState: 5, state: 10, levelValues: []string{"b"}},
-			},
-			unconstrained: false,
-			wantOrder:     []string{"low-affinity", "high-affinity"},
+		"leafIsNode with same-parent sibling domains: descending by hostname": {
+			levels: hostnameLevels,
+			a:      &domain{id: "node-b", parent: parent1, levelValues: []string{"b1", "r1", "node-b"}},
+			b:      &domain{id: "node-a", parent: parent1, levelValues: []string{"b1", "r1", "node-a"}},
+			want:   1,
 		},
-		"BestFit: sliceState descending": {
-			domains: []*domain{
-				{id: "a", sliceState: 3, state: 1, levelValues: []string{"a"}},
-				{id: "b", sliceState: 1, state: 1, levelValues: []string{"b"}},
-				{id: "c", sliceState: 2, state: 1, levelValues: []string{"c"}},
-			},
-			unconstrained: false,
-			wantOrder:     []string{"a", "c", "b"},
+		"leafIsNode with same-parent sibling domains: equal hostname": {
+			levels: hostnameLevels,
+			a:      &domain{id: "node-a", parent: parent1, levelValues: []string{"b1", "r1", "node-a"}},
+			b:      &domain{id: "node-a", parent: parent1, levelValues: []string{"b1", "r1", "node-a"}},
+			want:   0,
 		},
-		"LeastFreeCapacity: sliceState ascending": {
-			domains: []*domain{
-				{id: "a", sliceState: 3, state: 1, levelValues: []string{"a"}},
-				{id: "b", sliceState: 1, state: 1, levelValues: []string{"b"}},
-				{id: "c", sliceState: 2, state: 1, levelValues: []string{"c"}},
-			},
-			unconstrained: true,
-			wantOrder:     []string{"b", "c", "a"},
+		"fallback comparator: multi-level inputs with different parents sorted lexicographically across levels": {
+			levels: hostnameLevels,
+			a:      &domain{id: "node-z", parent: parent1, levelValues: []string{"b1", "r1", "node-z"}},
+			b:      &domain{id: "node-a", parent: parent2, levelValues: []string{"b1", "r2", "node-a"}},
+			want:   -1,
 		},
-		"BestFit: state ascending as tiebreaker": {
-			domains: []*domain{
-				{id: "large", sliceState: 5, state: 100, levelValues: []string{"a"}},
-				{id: "small", sliceState: 5, state: 10, levelValues: []string{"b"}},
-				{id: "medium", sliceState: 5, state: 50, levelValues: []string{"c"}},
-			},
-			unconstrained: false,
-			wantOrder:     []string{"small", "medium", "large"},
-		},
-		"LeastFreeCapacity: state ascending as tiebreaker": {
-			domains: []*domain{
-				{id: "large", sliceState: 5, state: 100, levelValues: []string{"a"}},
-				{id: "small", sliceState: 5, state: 10, levelValues: []string{"b"}},
-				{id: "medium", sliceState: 5, state: 50, levelValues: []string{"c"}},
-			},
-			unconstrained: true,
-			wantOrder:     []string{"small", "medium", "large"},
-		},
-		"levelValues ascending as final tiebreaker": {
-			domains: []*domain{
-				{id: "c", sliceState: 5, state: 10, levelValues: []string{"c"}},
-				{id: "a", sliceState: 5, state: 10, levelValues: []string{"a"}},
-				{id: "b", sliceState: 5, state: 10, levelValues: []string{"b"}},
-			},
-			unconstrained: false,
-			wantOrder:     []string{"a", "b", "c"},
+		"fallback comparator: non-hostname levels sorted lexicographically across levels": {
+			levels: nonHostnameLevels,
+			a:      &domain{id: "b1-r1", levelValues: []string{"b1", "r1"}},
+			b:      &domain{id: "b1-r2", levelValues: []string{"b1", "r2"}},
+			want:   -1,
 		},
 	}
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			features.SetFeatureGateDuringTest(t, features.TASRespectNodeAffinityPreferred, tc.enableTASPreferredSchedulingAffinity)
-			_, log := utiltesting.ContextWithLog(t)
-			s := newTASFlavorSnapshot(log, "test", levels)
-
-			sorted := s.sortedDomains(tc.domains, tc.unconstrained)
-
-			gotOrder := make([]string, len(sorted))
-			for i, d := range sorted {
-				gotOrder[i] = string(d.id)
-			}
-
-			if diff := cmp.Diff(tc.wantOrder, gotOrder); diff != "" {
-				t.Errorf("unexpected domain order (-want,+got): %s", diff)
+			s := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "test"}, newTopologyTree(tc.levels, nil, 0), newDefaultSimulator())
+			got := s.compareDomainLevelValues(tc.a, tc.b)
+			if (got < 0 && tc.want >= 0) || (got > 0 && tc.want <= 0) || (got == 0 && tc.want != 0) {
+				t.Errorf("compareDomainLevelValues() = %d, want sign matching %d", got, tc.want)
 			}
 		})
 	}
@@ -690,10 +1704,10 @@ func TestCountPodsInAssignment(t *testing.T) {
 }
 
 func TestComputeAssumedUsageFromAssignment(t *testing.T) {
-	singlePodRequests := resources.Requests{
+	singlePodRequests := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
 		corev1.ResourceCPU:    1000,
 		corev1.ResourceMemory: 1024,
-	}
+	})
 
 	cases := map[string]struct {
 		assignment *tas.TopologyAssignment
@@ -714,11 +1728,11 @@ func TestComputeAssumedUsageFromAssignment(t *testing.T) {
 				},
 			},
 			want: map[tas.TopologyDomainID]resources.Requests{
-				"node-a": {
+				"node-a": resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
 					corev1.ResourceCPU:    1000,
 					corev1.ResourceMemory: 1024,
 					corev1.ResourcePods:   1,
-				},
+				}),
 			},
 		},
 		"multiple domains": {
@@ -730,24 +1744,24 @@ func TestComputeAssumedUsageFromAssignment(t *testing.T) {
 				},
 			},
 			want: map[tas.TopologyDomainID]resources.Requests{
-				"node-a": {
+				"node-a": resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
 					corev1.ResourceCPU:    2000,
 					corev1.ResourceMemory: 2048,
 					corev1.ResourcePods:   2,
-				},
-				"node-b": {
+				}),
+				"node-b": resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
 					corev1.ResourceCPU:    3000,
 					corev1.ResourceMemory: 3072,
 					corev1.ResourcePods:   3,
-				},
+				}),
 			},
 		},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got := tas.ComputeUsagePerDomain(tc.assignment, singlePodRequests)
-			if diff := cmp.Diff(tc.want, got); diff != "" {
+			got := tas.ComputeUsagePerDomain(tc.assignment, func(tas.TopologyDomainID) resources.Requests { return singlePodRequests })
+			if diff := cmp.Diff(tc.want, got, cmp.Comparer(resources.Equal)); diff != "" {
 				t.Errorf("ComputeUsagePerDomain() mismatch (-want +got):\n%s", diff)
 			}
 		})
@@ -763,10 +1777,10 @@ func TestAddAssumedUsage(t *testing.T) {
 	}{
 		"includes pod count for existing and new domains": {
 			assumedUsage: map[tas.TopologyDomainID]resources.Requests{
-				"node-a": {
+				"node-a": resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
 					corev1.ResourceCPU:  1000,
 					corev1.ResourcePods: 1,
-				},
+				}),
 			},
 			assignment: &tas.TopologyAssignment{
 				Levels: []string{"hostname"},
@@ -776,22 +1790,22 @@ func TestAddAssumedUsage(t *testing.T) {
 				},
 			},
 			tasRequests: &TASPodSetRequests{
-				SinglePodRequests: resources.Requests{
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
 					corev1.ResourceCPU:    500,
 					corev1.ResourceMemory: 2048,
-				},
+				}),
 			},
 			want: map[tas.TopologyDomainID]resources.Requests{
-				"node-a": {
+				"node-a": resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
 					corev1.ResourceCPU:    1500,
 					corev1.ResourceMemory: 2048,
 					corev1.ResourcePods:   2,
-				},
-				"node-b": {
+				}),
+				"node-b": resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
 					corev1.ResourceCPU:    1000,
 					corev1.ResourceMemory: 4096,
 					corev1.ResourcePods:   2,
-				},
+				}),
 			},
 		},
 		"includes pod count starting from empty assumed usage": {
@@ -803,25 +1817,27 @@ func TestAddAssumedUsage(t *testing.T) {
 				},
 			},
 			tasRequests: &TASPodSetRequests{
-				SinglePodRequests: resources.Requests{
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
 					corev1.ResourceCPU:    250,
 					corev1.ResourceMemory: 512,
-				},
+				}),
 			},
 			want: map[tas.TopologyDomainID]resources.Requests{
-				"node-a": {
+				"node-a": resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
 					corev1.ResourceCPU:    750,
 					corev1.ResourceMemory: 1536,
 					corev1.ResourcePods:   3,
-				},
+				}),
 			},
 		},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			addAssumedUsage(tc.assumedUsage, tc.assignment, tc.tasRequests)
-			if diff := cmp.Diff(tc.want, tc.assumedUsage); diff != "" {
+			snapshot := &TASFlavorSnapshot{}
+			assumedUsage := newAssumedUsage(tc.assumedUsage)
+			snapshot.addAssumedUsage(assumedUsage, tc.assignment, tc.tasRequests)
+			if diff := cmp.Diff(tc.want, assumedUsage.perDomain, cmp.Comparer(resources.Equal)); diff != "" {
 				t.Errorf("addAssumedUsage() mismatch (-want +got):\n%s", diff)
 			}
 		})
@@ -834,6 +1850,11 @@ func TestTruncateAssignment(t *testing.T) {
 		newCount   int32
 		want       *tas.TopologyAssignment
 	}{
+		"nil assignment": {
+			assignment: nil,
+			newCount:   3,
+			want:       nil,
+		},
 		"truncate to zero": {
 			assignment: &tas.TopologyAssignment{
 				Levels: []string{"hostname"},
@@ -938,5 +1959,2164 @@ func TestTruncateAssignment(t *testing.T) {
 				t.Errorf("TruncateAssignment() mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestTASCachingRemainingResourcesFeatureGate(t *testing.T) {
+	for _, enableCaching := range []bool{true, false} {
+		t.Run(fmt.Sprintf("enableCaching=%t", enableCaching), func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.TASCachingRemainingResources, enableCaching)
+
+			_, log := utiltesting.ContextWithLog(t)
+			nodeObj := node.MakeNode("node-a").
+				Label("hostname", "node-a").
+				StatusAllocatable(corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("8"),
+					corev1.ResourceMemory: resource.MustParse("10Gi"),
+					corev1.ResourcePods:   resource.MustParse("110"),
+				}).
+				Ready().
+				Obj()
+			snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, newTopologyTree([]string{"hostname"}, []*corev1.Node{nodeObj}, 0), newDefaultSimulator())
+			domainID := snapshot.nodeToDomain[nodeObj.Name]
+
+			if snapshot.leaves[domainID] == nil {
+				t.Fatalf("leaves[%q] = nil, want non-nil", domainID)
+			}
+
+			flavorUsage := workload.TASFlavorUsage{
+				{
+					Values: []string{"node-a"},
+					SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
+						corev1.ResourceCPU: 5000,
+					}),
+					Count: 1,
+				},
+			}
+
+			// Warm the Fits cache before adding TAS usage
+			if got := snapshot.Fits(flavorUsage); !got {
+				t.Errorf("Fits() before adding usage = %t, want true", got)
+			}
+
+			// Add TAS usage of 4 CPU (4000m), leaving 4 CPU (8000m - 4000m = 4000m) remaining
+			usage := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
+				corev1.ResourceCPU: 4000,
+			})
+			snapshot.updateTASUsage(domainID, usage, add, 1)
+
+			// Fits should now return false because 5 CPU > 4 CPU remaining
+			if got := snapshot.Fits(flavorUsage); got {
+				t.Errorf("Fits() after adding usage = %t, want false", got)
+			}
+
+			// Remove TAS usage
+			snapshot.updateTASUsage(domainID, usage, subtract, 1)
+
+			// Fits should now return true again after cache invalidation / re-evaluation
+			if got := snapshot.Fits(flavorUsage); !got {
+				t.Errorf("Fits() after removing usage = %t, want true", got)
+			}
+		})
+	}
+}
+
+func TestFitsNonHostnameLowestLevel(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	const blockLabel = "cloud.provider.com/topology-block"
+	const rackLabel = "cloud.provider.com/topology-rack"
+
+	rackNode := node.MakeNode("").
+		Label(blockLabel, "b1").
+		Label(rackLabel, "r1").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("8"),
+			corev1.ResourcePods: resource.MustParse("110"),
+		}).
+		Ready()
+
+	cases := map[string]struct {
+		featureGates map[featuregate.Feature]bool
+		admitted     workload.TASFlavorUsage
+		usage        workload.TASFlavorUsage
+		want         bool
+	}{
+		"pods fit across the rack's nodes": {
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 5000}),
+				Count:             2,
+			}},
+			want: true,
+		},
+		// The rack aggregates 16 CPU, but each node fits only one 5-CPU pod.
+		"pods fit in the rack's aggregate but not per node": {
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 5000}),
+				Count:             3,
+			}},
+			want: false,
+		},
+		"two PodSets take one node each": {
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 8000}),
+				Count:             1,
+			}, {
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 8000}),
+				Count:             1,
+			}},
+			want: true,
+		},
+		"a third PodSet finds the rack taken": {
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 8000}),
+				Count:             1,
+			}, {
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 8000}),
+				Count:             1,
+			}, {
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 8000}),
+				Count:             1,
+			}},
+			want: false,
+		},
+		// Admitted usage is recorded against the rack, so its nodes still show
+		// 8 CPU free each and only the rack's remainder rejects the second PodSet.
+		"a second PodSet finds what the first took from a rack already in use": {
+			admitted: workload.TASFlavorUsage{{
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 8000}),
+				Count:             1,
+			}},
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 8000}),
+				Count:             1,
+			}, {
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 8000}),
+				Count:             1,
+			}},
+			want: false,
+		},
+		"a second PodSet finds what the first took from a rack that is one leaf": {
+			featureGates: map[featuregate.Feature]bool{features.TASNodeFeasibilityForAllLevels: false},
+			admitted: workload.TASFlavorUsage{{
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 8000}),
+				Count:             1,
+			}},
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 8000}),
+				Count:             1,
+			}, {
+				Values:            []string{"b1", "r1"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 8000}),
+				Count:             1,
+			}},
+			want: false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGatesDuringTest(t, tc.featureGates)
+			_, log := utiltesting.ContextWithLog(t)
+			nodes := []*corev1.Node{rackNode.Clone().Name("n1").Obj(), rackNode.Clone().Name("n2").Obj()}
+			tree := newTopologyTree([]string{blockLabel, rackLabel}, nodes, 0)
+			snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator())
+			snapshot.updateTASUsageForHeldDomains(tc.admitted, add)
+			if got := snapshot.Fits(tc.usage); got != tc.want {
+				t.Errorf("Fits() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// Usage recorded against a domain that spans several nodes bounds the domain,
+// not its nodes: which node inside the domain holds a Pod is decided by
+// kube-scheduler after ungating and is never reported back. Charging a share
+// of it to every node instead makes the nodes look full and rejects Workloads
+// the domain has room for.
+func TestFindAssignmentsWithDomainRecordedUsage(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	const blockLabel = "cloud.provider.com/topology-block"
+	const rackLabel = "cloud.provider.com/topology-rack"
+	rack := rackLabel
+	oneCPU := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000})
+
+	// A rack of two nodes, one CPU each.
+	rackNode := node.MakeNode("").
+		Label(blockLabel, "b1").
+		Label(rackLabel, "r1").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("1"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).
+		Ready()
+	nodes := []*corev1.Node{
+		rackNode.Clone().Name("n1").Label(corev1.LabelHostname, "n1").Obj(),
+		rackNode.Clone().Name("n2").Label(corev1.LabelHostname, "n2").Obj(),
+	}
+
+	podSet := func(name kueue.PodSetReference) TASPodSetRequests {
+		return TASPodSetRequests{
+			PodSet: &kueue.PodSet{
+				Name:            name,
+				TopologyRequest: &kueue.PodSetTopologyRequest{Preferred: &rack},
+			},
+			SinglePodRequests: oneCPU,
+			Count:             1,
+		}
+	}
+
+	// A PodSet pinned to one node by its nodeSelector.
+	podSetOn := func(name kueue.PodSetReference, nodeName string) TASPodSetRequests {
+		tr := podSet(name)
+		tr.PodSet.Template.Spec.NodeSelector = map[string]string{corev1.LabelHostname: nodeName}
+		return tr
+	}
+
+	cases := map[string]struct {
+		priorRackUsage int32
+		requests       FlavorTASRequests
+		wantFit        bool
+	}{
+		// Both PodSets can only run on n1, which holds one of them. The rack
+		// has room for both, so only per-node in-cycle usage rejects this.
+		"two PodSets pinned to the same node do not both fit on it": {
+			requests: FlavorTASRequests{podSetOn("ps-a", "n1"), podSetOn("ps-b", "n1")},
+			wantFit:  false,
+		},
+		"two PodSets pinned to different nodes fit": {
+			requests: FlavorTASRequests{podSetOn("ps-a", "n1"), podSetOn("ps-b", "n2")},
+			wantFit:  true,
+		},
+		"two PodSets of one Pod each land on a node of their own": {
+			requests: FlavorTASRequests{podSet("ps-a"), podSet("ps-b")},
+			wantFit:  true,
+		},
+		"a Pod fits next to a Workload already admitted on the rack": {
+			priorRackUsage: 1,
+			requests:       FlavorTASRequests{podSet("ps-b")},
+			wantFit:        true,
+		},
+		"no Pod fits once the rack's capacity is fully used": {
+			priorRackUsage: 2,
+			requests:       FlavorTASRequests{podSet("ps-b")},
+			wantFit:        false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx, log := utiltesting.ContextWithLog(t)
+			tree := newTopologyTree([]string{blockLabel, rackLabel}, nodes, 0)
+			snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator())
+			if tc.priorRackUsage > 0 {
+				snapshot.updateTASUsage(tas.DomainID([]string{"b1", "r1"}),
+					oneCPU.ScaledUp(int64(tc.priorRackUsage)), add, tc.priorRackUsage)
+			}
+			gotFit := snapshot.FindTopologyAssignmentsForFlavor(ctx, tc.requests).Failure() == nil
+			if gotFit != tc.wantFit {
+				t.Errorf("FindTopologyAssignmentsForFlavor() fit = %t, want %t", gotFit, tc.wantFit)
+			}
+		})
+	}
+}
+
+// Usage domain IDs name the explicit-lowest level while the hostname level is
+// virtual, so a node whose name equals a domain ID must not capture that
+// domain's usage.
+func TestUsageDomainIgnoresNodeNameCollision(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	const rackLabel = "cloud.provider.com/topology-rack"
+	_, log := utiltesting.ContextWithLog(t)
+
+	rackNode := node.MakeNode("").
+		StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}).
+		Ready()
+	nodeA := rackNode.Clone().Name("node-a").Label(corev1.LabelHostname, "node-a").Label(rackLabel, "r1").Obj()
+	nodeB := rackNode.Clone().Name("node-b").Label(corev1.LabelHostname, "node-b").Label(rackLabel, "r1").Obj()
+	// A third node is named like rack r1 itself, but lives in rack r2.
+	nodeNamedR1 := rackNode.Clone().Name("r1").Label(corev1.LabelHostname, "r1").Label(rackLabel, "r2").Obj()
+
+	tree := newTopologyTree([]string{rackLabel}, []*corev1.Node{nodeA, nodeB, nodeNamedR1}, 0)
+	snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator())
+	leaves := slices.Collect(snapshot.leavesOf(snapshot.usageDomain("r1")))
+	if len(leaves) != 2 {
+		t.Fatalf("usageDomain(\"r1\") holds %d leaves, want rack r1's 2 leaves", len(leaves))
+	}
+	for _, leaf := range leaves {
+		if leaf.node.Name == "r1" {
+			t.Error("usageDomain(\"r1\") resolved to the node named \"r1\" instead of the rack")
+		}
+	}
+
+	// Control: with hostname declared as the lowest level, usage domains are
+	// the leaves themselves and the leaf lookup must keep working.
+	declaredTree := newTopologyTree([]string{rackLabel, corev1.LabelHostname}, []*corev1.Node{nodeA, nodeB}, 0)
+	declaredSnapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, declaredTree, newDefaultSimulator())
+	declaredLeaves := slices.Collect(declaredSnapshot.leavesOf(declaredSnapshot.usageDomain("node-a")))
+	if len(declaredLeaves) != 1 || declaredLeaves[0].node.Name != "node-a" {
+		t.Errorf("usageDomain(\"node-a\") holds %d leaves, want the node-a leaf", len(declaredLeaves))
+	}
+}
+
+// The domain-keyed side has to stay the map the sibling flavors were given, or
+// they stop seeing each other's placements. The leaf-keyed side must not, since
+// node names do not identify the same capacity across flavors.
+func TestAssumedUsageRecordsIntoTheSharedDomainMap(t *testing.T) {
+	shared := map[tas.TopologyDomainID]resources.Requests{}
+	assumedUsage := newAssumedUsage(shared)
+
+	assumedUsage.perDomain["r1"] = resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000})
+	assumedUsage.recordLeafUsage(map[tas.TopologyDomainID]resources.Requests{
+		"n1": resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 2000}),
+	})
+
+	want := map[tas.TopologyDomainID]resources.Requests{
+		"r1": resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000}),
+	}
+	if diff := cmp.Diff(want, shared, cmp.Comparer(resources.Equal)); diff != "" {
+		t.Errorf("shared cross-flavor usage mismatch (-want +got):\n%s", diff)
+	}
+	if newAssumedUsage(nil).perDomain == nil {
+		t.Error("newAssumedUsage(nil) left perDomain nil, recording domain usage would panic")
+	}
+}
+
+// Preemption simulation treats usage it could reclaim as absent, but the
+// placements made earlier in this cycle belong to the Workload being assigned,
+// so no preemption can free them and they stay subtracted.
+func TestSimulateEmptyKeepsInCycleUsage(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	const blockLabel = "cloud.provider.com/topology-block"
+	const rackLabel = "cloud.provider.com/topology-rack"
+	rack := rackLabel
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	rackNode := node.MakeNode("").
+		Label(blockLabel, "b1").
+		Label(rackLabel, "r1").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("1"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).Ready()
+	nodes := []*corev1.Node{
+		rackNode.Clone().Name("n1").Obj(),
+		rackNode.Clone().Name("n2").Obj(),
+	}
+
+	tree := newTopologyTree([]string{blockLabel, rackLabel}, nodes, 0)
+	snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator())
+
+	oneCPU := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000})
+	// An elastic Workload already placed both of the rack's CPUs in this cycle.
+	assumedUsage := newAssumedUsage(map[tas.TopologyDomainID]resources.Requests{
+		tas.DomainID([]string{"b1", "r1"}): resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
+			corev1.ResourceCPU:  2000,
+			corev1.ResourcePods: 2,
+		}),
+	})
+	tasRequests := TASPodSetRequests{
+		PodSet: &kueue.PodSet{
+			Name:            "ps",
+			TopologyRequest: &kueue.PodSetTopologyRequest{Preferred: &rack},
+		},
+		SinglePodRequests: oneCPU,
+		Count:             1,
+	}
+
+	_, _, reason := snapshot.findTopologyAssignment(ctx, tasRequests, nil, assumedUsage, true, "", nil, nil)
+	if reason == "" {
+		t.Error("findTopologyAssignment() reported a fit while simulating an empty flavor, want none: the rack's two CPUs went to Pods of this same Workload")
+	}
+}
+
+// Preferred node affinity is scored only where node feasibility is evaluated, so
+// on a Topology whose lowest level is not the hostname it was never scored at
+// all. The injected level makes every leaf a node, so the scores are computed
+// and roll up to the domain the assignment names.
+func TestPreferredNodeAffinityIsRespectedWithInjectedHostnameLevel(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	features.SetFeatureGateDuringTest(t, features.TASRespectNodeAffinityPreferred, true)
+	const blockLabel = "cloud.provider.com/topology-block"
+	const rackLabel = "cloud.provider.com/topology-rack"
+	const perfLabel = "example.com/perf"
+	rack := rackLabel
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	rackNode := node.MakeNode("").
+		Label(blockLabel, "b1").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("1"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).Ready()
+	// Both racks hold two nodes of one CPU, so only the preference separates them.
+	nodes := []*corev1.Node{
+		rackNode.Clone().Name("n1").Label(rackLabel, "r1").Obj(),
+		rackNode.Clone().Name("n2").Label(rackLabel, "r1").Obj(),
+		rackNode.Clone().Name("n3").Label(rackLabel, "r2").Label(perfLabel, "fast").Obj(),
+		rackNode.Clone().Name("n4").Label(rackLabel, "r2").Label(perfLabel, "fast").Obj(),
+	}
+
+	tree := newTopologyTree([]string{blockLabel, rackLabel}, nodes, 0)
+	snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator())
+
+	podSet := &kueue.PodSet{
+		Name:            "ps",
+		TopologyRequest: &kueue.PodSetTopologyRequest{Preferred: &rack},
+	}
+	podSet.Template.Spec.Affinity = &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{{
+				Weight: 100,
+				Preference: corev1.NodeSelectorTerm{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      perfLabel,
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   []string{"fast"},
+					}},
+				},
+			}},
+		},
+	}
+	tasRequests := TASPodSetRequests{
+		PodSet: podSet,
+		SinglePodRequests: resources.NewRequestsFromMap(
+			map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000}),
+		Count: 2,
+	}
+
+	assignments, _, reason := snapshot.findTopologyAssignment(ctx, tasRequests, nil, newAssumedUsage(nil), false, "", nil, nil)
+	if reason != "" {
+		t.Fatalf("findTopologyAssignment() = %q, want the Pods to fit in the preferred rack", reason)
+	}
+	perRack := map[string]int32{}
+	for _, domain := range assignments["ps"].Domains {
+		perRack[domain.Values[len(domain.Values)-1]] += domain.Count
+	}
+	if perRack["r2"] != 2 {
+		t.Errorf("findTopologyAssignment() placed r1=%d r2=%d, want both Pods on rack r2, whose nodes match the preference",
+			perRack["r1"], perRack["r2"])
+	}
+}
+
+// The injected hostname level sits below the level slices are counted at, so its
+// leaves carry no slice count. Balanced placement must not read that as a domain
+// worth pruning, or it clears every leaf and silently stops balancing.
+func TestBalancedPlacementWithInjectedHostnameLevel(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	features.SetFeatureGateDuringTest(t, features.TASBalancedPlacement, true)
+	const blockLabel = "cloud.provider.com/topology-block"
+	const rackLabel = "cloud.provider.com/topology-rack"
+	rack := rackLabel
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	rackNode := node.MakeNode("").
+		Label(blockLabel, "b1").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("2"),
+			corev1.ResourcePods: resource.MustParse("20"),
+		}).Ready()
+	// Two racks of two nodes, four CPUs each.
+	nodes := []*corev1.Node{
+		rackNode.Clone().Name("n1").Label(rackLabel, "r1").Obj(),
+		rackNode.Clone().Name("n2").Label(rackLabel, "r1").Obj(),
+		rackNode.Clone().Name("n3").Label(rackLabel, "r2").Obj(),
+		rackNode.Clone().Name("n4").Label(rackLabel, "r2").Obj(),
+	}
+
+	tree := newTopologyTree([]string{blockLabel, rackLabel}, nodes, 0)
+	snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator())
+
+	oneCPU := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000})
+	tasRequests := TASPodSetRequests{
+		PodSet: &kueue.PodSet{
+			Name:            "ps",
+			TopologyRequest: &kueue.PodSetTopologyRequest{Preferred: &rack},
+		},
+		SinglePodRequests: oneCPU,
+		Count:             6,
+	}
+
+	assignments, _, reason := snapshot.findTopologyAssignment(ctx, tasRequests, nil, newAssumedUsage(nil), false, "", nil, nil)
+	if reason != "" {
+		t.Fatalf("findTopologyAssignment() = %q, want the six Pods to fit across both racks", reason)
+	}
+	perRack := map[string]int32{}
+	for _, domain := range assignments["ps"].Domains {
+		perRack[domain.Values[len(domain.Values)-1]] += domain.Count
+	}
+	// Eight CPUs over two equal racks, so a balanced placement is three each.
+	if perRack["r1"] != 3 || perRack["r2"] != 3 {
+		t.Errorf("findTopologyAssignment() placed r1=%d r2=%d, want 3 and 3", perRack["r1"], perRack["r2"])
+	}
+}
+
+// A TopologyAssignment recovered from a Workload is keyed by the domain it
+// names, so it must not be charged to a leaf which is a node of the same name.
+// Only a Topology of a single level can collide: below that, domain IDs join
+// their level values with a separator no node name can hold.
+func TestAssumedDomainUsageIsNotChargedToNodeOfTheSameName(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	const rackLabel = "cloud.provider.com/topology-rack"
+	rack := rackLabel
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	rackNode := node.MakeNode("").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("1"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).Ready()
+	// The node named "r1" is in rack r2, so rack r1's usage is not its own.
+	nodes := []*corev1.Node{
+		rackNode.Clone().Name("r1").Label(rackLabel, "r2").Obj(),
+		rackNode.Clone().Name("n1").Label(rackLabel, "r1").Obj(),
+	}
+
+	tree := newTopologyTree([]string{rackLabel}, nodes, 0)
+	snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator())
+
+	oneCPU := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000})
+	// What an elastic Workload's previous assignment on rack r1 records.
+	assumedUsage := newAssumedUsage(map[tas.TopologyDomainID]resources.Requests{
+		"r1": resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
+			corev1.ResourceCPU:  1000,
+			corev1.ResourcePods: 1,
+		}),
+	})
+	tasRequests := TASPodSetRequests{
+		PodSet: &kueue.PodSet{
+			Name:            "ps",
+			TopologyRequest: &kueue.PodSetTopologyRequest{Preferred: &rack},
+		},
+		SinglePodRequests: oneCPU,
+		Count:             1,
+	}
+
+	if _, _, reason := snapshot.findTopologyAssignment(ctx, tasRequests, nil, assumedUsage, false, "", nil, nil); reason != "" {
+		t.Errorf("findTopologyAssignment() = %q, want the Pod to fit on the node named r1, which is in rack r2", reason)
+	}
+}
+
+// Two PodSets placed in one cycle both draw on the same usage domain. Recording
+// the placement against the leaf alone leaves the domain's own bound blind to
+// it, and recording it against the domain alone loses which node went, so both
+// have to be kept: neither implies the other.
+func TestTwoPodSetsShareTheDomainBudget(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	const blockLabel = "cloud.provider.com/topology-block"
+	const rackLabel = "cloud.provider.com/topology-rack"
+	block := blockLabel
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	rackNode := node.MakeNode("").
+		Label(blockLabel, "b1").
+		Label(rackLabel, "r1").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("1"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).Ready()
+	nodes := []*corev1.Node{
+		rackNode.Clone().Name("n1").Obj(),
+		rackNode.Clone().Name("n2").Obj(),
+	}
+
+	tree := newTopologyTree([]string{blockLabel, rackLabel}, nodes, 0)
+	snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator())
+
+	oneCPU := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000})
+	// An admitted Workload holds one of the rack's two CPUs, and no node carries
+	// that usage.
+	snapshot.updateTASUsage(tas.DomainID([]string{"b1", "r1"}), oneCPU, add, 1)
+
+	podSet := func(name string) TASPodSetRequests {
+		groupName := name
+		return TASPodSetRequests{
+			PodSet: &kueue.PodSet{
+				Name: kueue.PodSetReference(name),
+				TopologyRequest: &kueue.PodSetTopologyRequest{
+					Required:        &block,
+					PodSetGroupName: &groupName,
+				},
+			},
+			SinglePodRequests: oneCPU,
+			Count:             1,
+			PodSetGroupName:   &groupName,
+		}
+	}
+
+	// Two PodSets of one Pod each need two CPUs, one more than the rack keeps.
+	result := snapshot.FindTopologyAssignmentsForFlavor(ctx, FlavorTASRequests{podSet("ps-a"), podSet("ps-b")})
+	if result.Failure() == nil {
+		var total int32
+		for _, podSetResult := range result {
+			for _, domain := range podSetResult.TopologyAssignment.Domains {
+				total += domain.Count
+			}
+		}
+		t.Errorf("FindTopologyAssignmentsForFlavor() admitted %d Pods, want no admission as rack r1 keeps one CPU", total)
+	}
+}
+
+// A usage domain has to be judged against its own remaining capacity for the
+// workers, for the leader, and for the two together. Its nodes carry none of
+// the usage recorded on it, so they always look emptier than the domain is.
+func TestLeaderIsNotPlacedInUsedUpDomain(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	const rackLabel = "cloud.provider.com/topology-rack"
+	unconstrained := true
+	oneCPU := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000})
+	twoCPU := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 2000})
+
+	cases := map[string]struct {
+		rackUsage      int32
+		leaderRequests resources.Requests
+		workerCount    int32
+	}{
+		// The rack is spent, so neither PodSet may land in it even though its
+		// node reports five free CPUs.
+		"a spent rack takes no Pod of either PodSet": {
+			rackUsage:      5,
+			leaderRequests: oneCPU,
+			workerCount:    1,
+		},
+		// The rack keeps one CPU: room for a worker, not for the leader.
+		"a rack that fits a worker but not the leader takes no leader": {
+			rackUsage:      4,
+			leaderRequests: twoCPU,
+			workerCount:    1,
+		},
+		// The rack fits the leader, but then has nothing left beside it.
+		"a rack that fits only the leader takes no worker beside it": {
+			rackUsage:      3,
+			leaderRequests: twoCPU,
+			workerCount:    2,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx, log := utiltesting.ContextWithLog(t)
+			rackNode := node.MakeNode("").
+				StatusAllocatable(corev1.ResourceList{
+					corev1.ResourceCPU:  resource.MustParse("5"),
+					corev1.ResourcePods: resource.MustParse("10"),
+				}).Ready()
+			nodes := []*corev1.Node{
+				rackNode.Clone().Name("n1").Label(rackLabel, "r1").Obj(),
+				rackNode.Clone().Name("n2").Label(rackLabel, "r2").Obj(),
+			}
+			tree := newTopologyTree([]string{rackLabel}, nodes, 0)
+			snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator())
+			snapshot.updateTASUsage("r1", oneCPU.ScaledUp(int64(tc.rackUsage)), add, tc.rackUsage)
+
+			podSet := func(name kueue.PodSetReference, singlePodRequests resources.Requests, count int32) TASPodSetRequests {
+				return TASPodSetRequests{
+					PodSet: &kueue.PodSet{
+						Name:            name,
+						TopologyRequest: &kueue.PodSetTopologyRequest{Unconstrained: &unconstrained},
+					},
+					SinglePodRequests: singlePodRequests,
+					Count:             count,
+				}
+			}
+			workers := podSet("workers", oneCPU, tc.workerCount)
+			leader := podSet("leader", tc.leaderRequests, 1)
+
+			assignments, _, reason := snapshot.findTopologyAssignment(ctx, workers, &leader, newAssumedUsage(nil), false, "", nil, nil)
+			if reason != "" {
+				t.Fatalf("findTopologyAssignment() = %q, want the Pods to fit in rack r2", reason)
+			}
+			// Rack r1 keeps 5 CPUs minus what the admitted Workload took.
+			wantFree := 5 - tc.rackUsage
+			var gotCPU int32
+			for _, tr := range []TASPodSetRequests{workers, leader} {
+				for _, domain := range assignments[tr.PodSet.Name].Domains {
+					if domain.Values[0] == "r1" {
+						cores, _ := tr.SinglePodRequests.ResourceValue(corev1.ResourceCPU).QuoInt64(1000).Int64()
+						gotCPU += domain.Count * int32(cores)
+					}
+				}
+			}
+			if gotCPU > wantFree {
+				t.Errorf("findTopologyAssignment() gave rack r1 %d CPU(s), want at most %d", gotCPU, wantFree)
+			}
+		})
+	}
+}
+
+// Simulated removal of one Workload's usage must not erase the usage of the
+// Workloads that remain admitted, or preemption would free capacity twice.
+func TestFitsAfterPerWorkloadRemoval(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	const blockLabel = "cloud.provider.com/topology-block"
+	const rackLabel = "cloud.provider.com/topology-rack"
+	dev := corev1.ResourceName("example.com/device")
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	tasCache := NewTASCache(nil, resources.NewResourceFormatter())
+	rackNode := node.MakeNode("").
+		Label(blockLabel, "b1").
+		Label(rackLabel, "r1").
+		StatusAllocatable(corev1.ResourceList{dev: resource.MustParse("1"), corev1.ResourcePods: resource.MustParse("110")}).
+		Ready()
+	for _, name := range []string{"n1", "n2"} {
+		tasCache.SyncNode(rackNode.Clone().Name(name).Label(corev1.LabelHostname, name).Obj())
+	}
+	fc := tasCache.NewTASFlavorCache(
+		topologyInformation{Levels: []string{blockLabel, rackLabel}},
+		flavorInformation{TopologyName: "default"},
+	)
+	singleDevice := []workload.TopologyDomainRequests{{
+		Values: []string{"b1", "r1"},
+		SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
+			dev: 1,
+		}),
+		Count: 1,
+	}}
+	bothDevices := workload.TASFlavorUsage{{
+		Values: []string{"b1", "r1"},
+		SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{
+			dev: 1,
+		}),
+		Count: 2,
+	}}
+
+	// Control: with no usage recorded, both devices are free.
+	empty, err := fc.snapshot(ctx, log, newDefaultSimulator(), nil)
+	if err != nil {
+		t.Fatalf("snapshot() error = %v", err)
+	}
+	if got := empty.Fits(bothDevices); !got {
+		t.Errorf("Fits() with no usage = %t, want true", got)
+	}
+
+	fc.addUsage(log, "wl1", singleDevice)
+	fc.addUsage(log, "wl2", singleDevice)
+	snapshot, err := fc.snapshot(ctx, log, newDefaultSimulator(), nil)
+	if err != nil {
+		t.Fatalf("snapshot() error = %v", err)
+	}
+	if got := snapshot.Fits(bothDevices); got {
+		t.Errorf("Fits() with both devices used = %t, want false", got)
+	}
+
+	// Preemption simulation removes one Workload; the other still holds a device.
+	for _, tr := range singleDevice {
+		snapshot.updateTASUsage(tas.DomainID(tr.Values), tr.TotalRequests(), subtract, tr.Count)
+	}
+	if got := snapshot.Fits(bothDevices); got {
+		t.Errorf("Fits() after removing one Workload = %t, want false", got)
+	}
+}
+
+func newObservedLogger(level zapcore.Level) (logr.Logger, *observer.ObservedLogs) {
+	logsObserver, observedLogs := observer.New(level)
+	logger := crzap.New(
+		crzap.WriteTo(io.Discard),
+		crzap.Level(level),
+		func(o *crzap.Options) {
+			o.ZapOpts = append(o.ZapOpts, zaplog.WrapCore(func(zapcore.Core) zapcore.Core {
+				return logsObserver
+			}))
+		},
+	)
+	return logger, observedLogs
+}
+
+func TestUpdateCountsToMinimumGenericLogsLeafSummary(t *testing.T) {
+	// Error entries are not verbosity-gated, so leaf IDs must stay out of them.
+	newSnapshot := func(log logr.Logger) *TASFlavorSnapshot {
+		nodes := make([]*corev1.Node, 0, 2)
+		for _, name := range []string{"node-a", "node-b"} {
+			nodes = append(nodes, node.MakeNode(name).
+				Label(corev1.LabelHostname, name).
+				StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")}).
+				Ready().
+				Obj())
+		}
+		return newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, newTopologyTree([]string{corev1.LabelHostname}, nodes, 0), newDefaultSimulator())
+	}
+	// One domain with capacity 1 cannot satisfy count 10.
+	callWithViolatedAssumptions := func(snapshot *TASFlavorSnapshot) []*domain {
+		dom := &domain{id: "rack-1", idx: 0}
+		snapshot.domainStateOf(dom).podCount[obligationNone] = 1
+		return snapshot.updateCountsToMinimumGeneric([]*domain{dom}, 10, 0, sliceShape{size: 1}, false, false)
+	}
+	wantErrorFields := map[string]any{
+		"error":                "code assumptions violated",
+		"remainingCount":       int32(9),
+		"remainingLeaderCount": int32(0),
+		"count":                int32(10),
+		"leaderCount":          int32(0),
+		"sliceSize":            int32(1),
+		"unconstrained":        false,
+		"topologyName":         kueue.TopologyReference("tas-topology"),
+		"domainCount":          int64(1),
+		"leafCount":            int64(2),
+	}
+
+	t.Run("the error entry summarizes the leaf domains instead of dumping them", func(t *testing.T) {
+		log, observedLogs := newObservedLogger(zapcore.InfoLevel)
+		snapshot := newSnapshot(log)
+
+		if got := callWithViolatedAssumptions(snapshot); got != nil {
+			t.Fatalf("updateCountsToMinimumGeneric() = %v, want nil", got)
+		}
+
+		logs := observedLogs.TakeAll()
+		if len(logs) != 1 {
+			t.Fatalf("Observed %d log entries, want 1: %v", len(logs), logs)
+		}
+		if logs[0].Level != zapcore.ErrorLevel {
+			t.Errorf("Observed log level %v, want %v", logs[0].Level, zapcore.ErrorLevel)
+		}
+		fields := logs[0].ContextMap()
+		if diff := cmp.Diff(wantErrorFields, fields); diff != "" {
+			t.Errorf("Observed error fields mismatch (-want +got):\n%s", diff)
+		}
+		// Leaf IDs must not appear under any error field.
+		for _, leafDomainID := range []string{"node-a", "node-b"} {
+			if rendered := fmt.Sprint(fields); strings.Contains(rendered, leafDomainID) {
+				t.Errorf("Observed error entry mentions leaf domain %q: %s", leafDomainID, rendered)
+			}
+		}
+	})
+
+	t.Run("the leaf domains are logged at high verbosity", func(t *testing.T) {
+		log, observedLogs := newObservedLogger(zapcore.Level(-6))
+		snapshot := newSnapshot(log)
+
+		if got := callWithViolatedAssumptions(snapshot); got != nil {
+			t.Fatalf("updateCountsToMinimumGeneric() = %v, want nil", got)
+		}
+
+		logs := observedLogs.TakeAll()
+		if len(logs) != 2 {
+			t.Fatalf("Observed %d log entries, want 2: %v", len(logs), logs)
+		}
+		if diff := cmp.Diff(wantErrorFields, logs[0].ContextMap()); diff != "" {
+			t.Errorf("Observed error fields mismatch (-want +got):\n%s", diff)
+		}
+		if logs[1].Level != zapcore.Level(-6) {
+			t.Errorf("Observed log level %v, want %v", logs[1].Level, zapcore.Level(-6))
+		}
+		wantLeafFields := map[string]any{
+			"topologyName": kueue.TopologyReference("tas-topology"),
+			"leafDomains":  []tas.TopologyDomainID{"node-a", "node-b"},
+		}
+		if diff := cmp.Diff(wantLeafFields, logs[1].ContextMap()); diff != "" {
+			t.Errorf("Observed leaf domain fields mismatch (-want +got):\n%s", diff)
+		}
+	})
+}
+
+// nodeDerefSchedulerSimulator reads the node off every candidate the way the WAS
+// simulator does, so a leaf with no node of its own fails loudly here.
+type nodeDerefSchedulerSimulator struct {
+	simulator.SchedulerSimulator
+	// scoreEach is multiplied by the call number, so a second pass that is not undone
+	// leaves a different score behind rather than rewriting the same one.
+	scoreEach int64
+	calls     int64
+}
+
+func (s *nodeDerefSchedulerSimulator) FindFeasibleNodes(
+	_ context.Context,
+	candidates iter.Seq[simulator.Candidate],
+	_ *simulator.PodRequirements,
+	_ *simulator.NodeExclusionStats,
+) ([]simulator.MatchedCandidate, error) {
+	s.calls++
+	var feasible []simulator.MatchedCandidate
+	for candidate := range candidates {
+		matched, ok := candidate.(simulator.MatchedCandidate)
+		if !ok {
+			return nil, fmt.Errorf("failed to cast candidate %T", candidate)
+		}
+		if candidate.GetNode() == nil {
+			return nil, errors.New("candidate has no node; the simulator must not be asked about it")
+		}
+		matched.SetAffinityScore(s.scoreEach * s.calls)
+		feasible = append(feasible, matched)
+	}
+	return feasible, nil
+}
+
+// A leaf spanning several nodes has no node of its own, so the leader check must not
+// reach the simulator. The WAS simulator reads the node without a nil check.
+func TestLeaderPodSetFeasibilitySkipsSimulatorWithoutNodes(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, false)
+	features.SetFeatureGateDuringTest(t, features.TASLeaderPodSetFeasibility, true)
+	const rackLabel = "cloud.provider.com/topology-rack"
+	unconstrained := true
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	rackNode := node.MakeNode("").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("5"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).Ready()
+	nodes := []*corev1.Node{
+		rackNode.Clone().Name("n1").Label(rackLabel, "r1").Obj(),
+		rackNode.Clone().Name("n2").Label(rackLabel, "r2").Obj(),
+	}
+	tree := newTopologyTree([]string{rackLabel}, nodes, 0)
+	snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree,
+		&nodeDerefSchedulerSimulator{SchedulerSimulator: newDefaultSimulator()})
+
+	oneCPU := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000})
+	podSet := func(name string, count int32, spec corev1.PodSpec) TASPodSetRequests {
+		groupName := "group"
+		return TASPodSetRequests{
+			PodSet: &kueue.PodSet{
+				Name: kueue.PodSetReference(name),
+				TopologyRequest: &kueue.PodSetTopologyRequest{
+					Unconstrained:   &unconstrained,
+					PodSetGroupName: &groupName,
+				},
+				Template: corev1.PodTemplateSpec{Spec: spec},
+			},
+			SinglePodRequests: oneCPU,
+			Count:             count,
+			PodSetGroupName:   &groupName,
+		}
+	}
+	result := snapshot.FindTopologyAssignmentsForFlavor(ctx, FlavorTASRequests{
+		podSet("workers", 2, corev1.PodSpec{}),
+		podSet("leader", 1, corev1.PodSpec{NodeSelector: map[string]string{"accelerator": "true"}}),
+	})
+	if failure := result.Failure(); failure != nil {
+		t.Errorf("FindTopologyAssignmentsForFlavor() = %q, want a fit; the leader check reached the simulator", failure.Reason)
+	}
+}
+
+// The leader check must leave the affinity scores the workers' pass produced alone,
+// or domains are ranked by the leader's preferences instead of the workers'.
+func TestLeaderPodSetFeasibilityKeepsWorkerAffinityScores(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	features.SetFeatureGateDuringTest(t, features.TASRespectNodeAffinityPreferred, true)
+	const rackLabel = "cloud.provider.com/topology-rack"
+	unconstrained := true
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	rackNode := node.MakeNode("").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("5"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).Ready()
+	nodes := []*corev1.Node{
+		rackNode.Clone().Name("n1").Label(rackLabel, "r1").Obj(),
+		rackNode.Clone().Name("n2").Label(rackLabel, "r2").Obj(),
+	}
+	oneCPU := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000})
+	podSet := func(name string, count int32) TASPodSetRequests {
+		groupName := "group"
+		return TASPodSetRequests{
+			PodSet: &kueue.PodSet{
+				Name: kueue.PodSetReference(name),
+				TopologyRequest: &kueue.PodSetTopologyRequest{
+					Unconstrained:   &unconstrained,
+					PodSetGroupName: &groupName,
+				},
+			},
+			SinglePodRequests: oneCPU,
+			Count:             count,
+			PodSetGroupName:   &groupName,
+		}
+	}
+
+	// The fake scores a candidate differently on each pass, so a leader pass that is
+	// not undone leaves a score the workers' pass never produced.
+	tree := newTopologyTree([]string{rackLabel}, nodes, 0)
+	snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree,
+		&nodeDerefSchedulerSimulator{SchedulerSimulator: newDefaultSimulator(), scoreEach: 7})
+	snapshot.FindTopologyAssignmentsForFlavor(ctx, FlavorTASRequests{
+		podSet("workers", 2), podSet("leader", 1),
+	})
+
+	for _, leaf := range snapshot.leaves {
+		if got := snapshot.domainStateOf(&leaf.domain).affinityScore; got != 7 {
+			t.Errorf("leaf %s affinity score = %d, want 7 (the workers' score, counted once)", leaf.id, got)
+		}
+	}
+}
+
+// templateOnlySchedulerSimulator filters nodes using only the Pod template, the way
+// the scheduler-library does, ignoring the separately compiled selector.
+type templateOnlySchedulerSimulator struct {
+	simulator.SchedulerSimulator
+}
+
+func (s *templateOnlySchedulerSimulator) FindFeasibleNodes(
+	_ context.Context,
+	candidates iter.Seq[simulator.Candidate],
+	requirements *simulator.PodRequirements,
+	_ *simulator.NodeExclusionStats,
+) ([]simulator.MatchedCandidate, error) {
+	var feasible []simulator.MatchedCandidate
+	for candidate := range candidates {
+		matched, ok := candidate.(simulator.MatchedCandidate)
+		if !ok {
+			return nil, fmt.Errorf("failed to cast candidate %T", candidate)
+		}
+		selector := labels.SelectorFromSet(requirements.PodTemplate.Spec.NodeSelector)
+		if selector.Matches(labels.Set(candidate.GetNode().Labels)) {
+			feasible = append(feasible, matched)
+		}
+	}
+	return feasible, nil
+}
+
+// A PodSetUpdate from a Ready AdmissionCheck has to reach the leader's Pod template,
+// since the scheduler-library filters nodes with the template rather than the compiled
+// filters. With the gate off the leader's template is left alone, so the update does
+// not steer the group.
+func TestPodSetUpdatesReachTheTemplate(t *testing.T) {
+	for _, gateOn := range []bool{true, false} {
+		t.Run(fmt.Sprintf("gate=%t", gateOn), func(t *testing.T) {
+			testPodSetUpdatesReachTheTemplate(t, gateOn)
+		})
+	}
+}
+
+func testPodSetUpdatesReachTheTemplate(t *testing.T, gateOn bool) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	features.SetFeatureGateDuringTest(t, features.TASLeaderPodSetFeasibility, gateOn)
+	const rackLabel = "cloud.provider.com/topology-rack"
+	unconstrained := true
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	rackNode := node.MakeNode("").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("5"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).Ready()
+	nodes := []*corev1.Node{
+		rackNode.Clone().Name("n1").Label(rackLabel, "r1").Label("pool", "b").Obj(),
+		rackNode.Clone().Name("n2").Label(rackLabel, "r2").Label("pool", "a").Obj(),
+	}
+	tree := newTopologyTree([]string{rackLabel}, nodes, 0)
+	snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree,
+		&templateOnlySchedulerSimulator{SchedulerSimulator: newDefaultSimulator()})
+
+	oneCPU := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000})
+	// Only the leader is steered to pool "a" by an AdmissionCheck, not by its own
+	// template, so the workers alone accept either rack. Only n2 is in that pool, and
+	// it is in the second rack, so picking the first rack means the update never
+	// reached the leader's template.
+	podSet := func(name string, count int32) TASPodSetRequests {
+		groupName := "group"
+		return TASPodSetRequests{
+			PodSet: &kueue.PodSet{
+				Name: kueue.PodSetReference(name),
+				TopologyRequest: &kueue.PodSetTopologyRequest{
+					Unconstrained:   &unconstrained,
+					PodSetGroupName: &groupName,
+				},
+			},
+			SinglePodRequests: oneCPU,
+			Count:             count,
+			PodSetGroupName:   &groupName,
+		}
+	}
+	leader := podSet("leader", 1)
+	leader.PodSetUpdates = []*kueue.PodSetUpdate{{Name: "leader", NodeSelector: map[string]string{"pool": "a"}}}
+	result := snapshot.FindTopologyAssignmentsForFlavor(ctx, FlavorTASRequests{
+		podSet("workers", 1), leader,
+	})
+	if failure := result.Failure(); failure != nil {
+		t.Fatalf("FindTopologyAssignmentsForFlavor() = %q, want a fit", failure.Reason)
+	}
+	// With the gate off the leader's template is left alone and the workers accept
+	// either rack, so the group stays in the first one.
+	wantRack := "r1"
+	if gateOn {
+		wantRack = "r2"
+	}
+	for name, psResult := range result {
+		for _, domain := range psResult.TopologyAssignment.Domains {
+			if got := domain.Values[0]; got != wantRack {
+				t.Errorf("PodSet %s placed in %q, want %s", name, got, wantRack)
+			}
+		}
+	}
+}
+
+func TestBuildPodRequirements(t *testing.T) {
+	tolerateGPU := corev1.Toleration{Key: "example.com/gpu", Operator: corev1.TolerationOpExists}
+	tolerateDrain := corev1.Toleration{Key: "example.com/drain", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}
+	basePodSet := utiltestingapi.MakePodSet("main", 1)
+
+	cases := map[string]struct {
+		featureGates map[featuregate.Feature]bool
+		// levels are the levels the Topology declares. A leaf is a node when the lowest
+		// level is the hostname, declared or injected by TASNodeFeasibilityForAllLevels.
+		levels            []string
+		flavorTolerations []corev1.Toleration
+		// info is the PodSet merged with its PodSetUpdates, as podSetInfo() yields it.
+		// Only the fields buildPodRequirements reads are set.
+		info   podset.PodSetInfo
+		podSet *kueue.PodSet
+
+		wantPodRequirements simulator.PodRequirements
+		// wantNodeAffinity is compiled into the AffinitySelector and PreferredSchedulingTerms
+		// of wantPodRequirements, because the nodeaffinity constructors return an error.
+		wantNodeAffinity *corev1.NodeAffinity
+		wantErr          error
+	}{
+		"flavor toleration joins the template's": {
+			flavorTolerations: []corev1.Toleration{tolerateGPU},
+			info:              podset.PodSetInfo{Tolerations: []corev1.Toleration{tolerateDrain}},
+			podSet:            basePodSet.Clone().Toleration(tolerateDrain).Obj(),
+			wantPodRequirements: simulator.PodRequirements{
+				Tolerations: []corev1.Toleration{tolerateDrain, tolerateGPU},
+				Selector:    labels.Everything(),
+				PodTemplate: &basePodSet.Clone().Toleration(tolerateDrain).Toleration(tolerateGPU).Obj().Template,
+			},
+		},
+		"toleration on both the template and the flavor appears once": {
+			flavorTolerations: []corev1.Toleration{tolerateGPU},
+			info:              podset.PodSetInfo{Tolerations: []corev1.Toleration{tolerateGPU}},
+			podSet:            basePodSet.Clone().Toleration(tolerateGPU).Obj(),
+			wantPodRequirements: simulator.PodRequirements{
+				Tolerations: []corev1.Toleration{tolerateGPU},
+				Selector:    labels.Everything(),
+				PodTemplate: &basePodSet.Clone().Toleration(tolerateGPU).Obj().Template,
+			},
+		},
+		"toleration from an admission check and the flavor appears once": {
+			flavorTolerations: []corev1.Toleration{tolerateGPU},
+			info:              podset.PodSetInfo{Tolerations: []corev1.Toleration{tolerateGPU}},
+			podSet:            basePodSet.Clone().Obj(),
+			wantPodRequirements: simulator.PodRequirements{
+				Tolerations: []corev1.Toleration{tolerateGPU},
+				Selector:    labels.Everything(),
+				PodTemplate: &basePodSet.Clone().Toleration(tolerateGPU).Obj().Template,
+			},
+		},
+		"no flavor tolerations": {
+			info:   podset.PodSetInfo{Tolerations: []corev1.Toleration{tolerateDrain}},
+			podSet: basePodSet.Clone().Toleration(tolerateDrain).Obj(),
+			wantPodRequirements: simulator.PodRequirements{
+				Tolerations: []corev1.Toleration{tolerateDrain},
+				Selector:    labels.Everything(),
+				PodTemplate: &basePodSet.Clone().Toleration(tolerateDrain).Obj().Template,
+			},
+		},
+		"nodeSelector is compiled into the selector and kept on the template": {
+			levels: []string{corev1.LabelHostname},
+			info:   podset.PodSetInfo{NodeSelector: map[string]string{"pool": "a"}},
+			podSet: basePodSet.Clone().NodeSelector(map[string]string{"pool": "a"}).Obj(),
+			wantPodRequirements: simulator.PodRequirements{
+				Selector:    labels.SelectorFromSet(labels.Set{"pool": "a"}),
+				PodTemplate: &basePodSet.Clone().NodeSelector(map[string]string{"pool": "a"}).Obj().Template,
+			},
+		},
+		"nodeSelector from an admission check joins the template's": {
+			levels: []string{corev1.LabelHostname},
+			info:   podset.PodSetInfo{NodeSelector: map[string]string{"pool": "a", "zone": "z1"}},
+			podSet: basePodSet.Clone().NodeSelector(map[string]string{"pool": "a"}).Obj(),
+			wantPodRequirements: simulator.PodRequirements{
+				Selector:    labels.SelectorFromSet(labels.Set{"pool": "a", "zone": "z1"}),
+				PodTemplate: &basePodSet.Clone().NodeSelector(map[string]string{"pool": "a", "zone": "z1"}).Obj().Template,
+			},
+		},
+		"nodeSelector is not compiled into the selector when a leaf spans several nodes": {
+			featureGates: map[featuregate.Feature]bool{features.TASNodeFeasibilityForAllLevels: false},
+			levels:       []string{utiltesting.DefaultRackTopologyLevel},
+			info:         podset.PodSetInfo{NodeSelector: map[string]string{"pool": "a"}},
+			podSet:       basePodSet.Clone().NodeSelector(map[string]string{"pool": "a"}).Obj(),
+			wantPodRequirements: simulator.PodRequirements{
+				Selector:    labels.Everything(),
+				PodTemplate: &basePodSet.Clone().NodeSelector(map[string]string{"pool": "a"}).Obj().Template,
+			},
+		},
+		"invalid nodeSelector": {
+			levels:  []string{corev1.LabelHostname},
+			info:    podset.PodSetInfo{NodeSelector: map[string]string{"pool": "not a label value"}},
+			podSet:  basePodSet.Clone().NodeSelector(map[string]string{"pool": "not a label value"}).Obj(),
+			wantErr: errInvalidNodeSelector,
+		},
+		"required node affinity is compiled into the affinity selector": {
+			info: podset.PodSetInfo{Affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}},
+					}},
+				}},
+			}}},
+			podSet: basePodSet.Clone().RequiredNodeSelectorRequirement("pool", corev1.NodeSelectorOpIn, "a").Obj(),
+			wantPodRequirements: simulator.PodRequirements{
+				Selector:    labels.Everything(),
+				PodTemplate: &basePodSet.Clone().RequiredNodeSelectorRequirement("pool", corev1.NodeSelectorOpIn, "a").Obj().Template,
+			},
+			wantNodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}},
+					}},
+				}},
+			},
+		},
+		"required node affinity without preferred terms when TASRespectNodeAffinityPreferred is enabled": {
+			featureGates: map[featuregate.Feature]bool{features.TASRespectNodeAffinityPreferred: true},
+			info: podset.PodSetInfo{Affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}},
+					}},
+				}},
+			}}},
+			podSet: basePodSet.Clone().RequiredNodeSelectorRequirement("pool", corev1.NodeSelectorOpIn, "a").Obj(),
+			wantPodRequirements: simulator.PodRequirements{
+				Selector:    labels.Everything(),
+				PodTemplate: &basePodSet.Clone().RequiredNodeSelectorRequirement("pool", corev1.NodeSelectorOpIn, "a").Obj().Template,
+			},
+			wantNodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}},
+					}},
+				}},
+			},
+		},
+		"affinity without node affinity is not compiled": {
+			info:   podset.PodSetInfo{Affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{}}},
+			podSet: basePodSet.Clone().PodSpec(corev1.PodSpec{Affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{}}}).Obj(),
+			wantPodRequirements: simulator.PodRequirements{
+				Selector:    labels.Everything(),
+				PodTemplate: &basePodSet.Clone().PodSpec(corev1.PodSpec{Affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{}}}).Obj().Template,
+			},
+		},
+		"invalid required node affinity": {
+			// An In requirement needs at least one value.
+			info: podset.PodSetInfo{Affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: "pool", Operator: corev1.NodeSelectorOpIn},
+					}},
+				}},
+			}}},
+			podSet:  basePodSet.Clone().RequiredNodeSelectorRequirement("pool", corev1.NodeSelectorOpIn).Obj(),
+			wantErr: errInvalidRequiredAffinity,
+		},
+		"preferred node affinity is compiled when TASRespectNodeAffinityPreferred is enabled": {
+			featureGates: map[featuregate.Feature]bool{features.TASRespectNodeAffinityPreferred: true},
+			info: podset.PodSetInfo{Affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{
+					{Weight: 10, Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}},
+					}}},
+				},
+			}}},
+			podSet: basePodSet.Clone().PreferredNodeSelectorRequirement(10, "pool", corev1.NodeSelectorOpIn, "a").Obj(),
+			wantPodRequirements: simulator.PodRequirements{
+				Selector:    labels.Everything(),
+				PodTemplate: &basePodSet.Clone().PreferredNodeSelectorRequirement(10, "pool", corev1.NodeSelectorOpIn, "a").Obj().Template,
+			},
+			wantNodeAffinity: &corev1.NodeAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{
+					{Weight: 10, Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}},
+					}}},
+				},
+			},
+		},
+		"preferred node affinity is ignored when TASRespectNodeAffinityPreferred is disabled": {
+			featureGates: map[featuregate.Feature]bool{features.TASRespectNodeAffinityPreferred: false},
+			info: podset.PodSetInfo{Affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{
+					{Weight: 10, Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}},
+					}}},
+				},
+			}}},
+			podSet: basePodSet.Clone().PreferredNodeSelectorRequirement(10, "pool", corev1.NodeSelectorOpIn, "a").Obj(),
+			wantPodRequirements: simulator.PodRequirements{
+				Selector:    labels.Everything(),
+				PodTemplate: &basePodSet.Clone().PreferredNodeSelectorRequirement(10, "pool", corev1.NodeSelectorOpIn, "a").Obj().Template,
+			},
+		},
+		"invalid preferred node affinity": {
+			featureGates: map[featuregate.Feature]bool{features.TASRespectNodeAffinityPreferred: true},
+			// An In requirement needs at least one value.
+			info: podset.PodSetInfo{Affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{
+					{Weight: 10, Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: "pool", Operator: corev1.NodeSelectorOpIn},
+					}}},
+				},
+			}}},
+			podSet:  basePodSet.Clone().PreferredNodeSelectorRequirement(10, "pool", corev1.NodeSelectorOpIn).Obj(),
+			wantErr: errInvalidPreferredAffinity,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGatesDuringTest(t, tc.featureGates)
+			_, log := utiltesting.ContextWithLog(t)
+			flavor := flavorInformation{TopologyName: "dummy", Tolerations: tc.flavorTolerations}
+			snapshot := newTASFlavorSnapshot(log, flavor, newTopologyTree(tc.levels, nil, 0), newDefaultSimulator())
+			// The Pod template is a copy, so the merged constraints must not reach the PodSet.
+			wantPodSet := tc.podSet.DeepCopy()
+
+			gotPodRequirements, gotErr := snapshot.buildPodRequirements(tc.info, tc.podSet, "")
+
+			if diff := cmp.Diff(wantPodSet, tc.podSet); diff != "" {
+				t.Errorf("buildPodRequirements() modified the PodSet (-want,+got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantErr, gotErr, cmpopts.EquateErrors()); diff != "" {
+				t.Errorf("unexpected error (-want,+got):\n%s", diff)
+			}
+			if tc.wantErr != nil {
+				// The callers drop the PodRequirements that come with an error.
+				return
+			}
+			wantPodRequirements := tc.wantPodRequirements
+			if tc.wantNodeAffinity != nil {
+				if required := tc.wantNodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution; required != nil {
+					affinitySelector, err := nodeaffinity.NewNodeSelector(required)
+					if err != nil {
+						t.Fatalf("NewNodeSelector() = %v, want no error", err)
+					}
+					wantPodRequirements.AffinitySelector = affinitySelector
+				}
+				if preferred := tc.wantNodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution; len(preferred) != 0 {
+					preferredSchedulingTerms, err := nodeaffinity.NewPreferredSchedulingTerms(preferred)
+					if err != nil {
+						t.Fatalf("NewPreferredSchedulingTerms() = %v, want no error", err)
+					}
+					wantPodRequirements.PreferredSchedulingTerms = preferredSchedulingTerms
+				}
+			}
+			if diff := cmp.Diff(wantPodRequirements, gotPodRequirements,
+				// nodeaffinity keeps the compiled terms in unexported fields of unexported
+				// types, which cmp.AllowUnexported cannot name.
+				cmp.Exporter(func(t reflect.Type) bool {
+					return t.PkgPath() == reflect.TypeFor[nodeaffinity.NodeSelector]().PkgPath()
+				})); diff != "" {
+				t.Errorf("unexpected PodRequirements (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestValidateSpreadingLevels(t *testing.T) {
+	const (
+		blockLabel = "cloud.com/block"
+		rackLabel  = "cloud.com/rack"
+	)
+	levels := []string{blockLabel, rackLabel, corev1.LabelHostname}
+
+	cases := map[string]struct {
+		spec       *tas.SpreadingSpec
+		requested  string
+		wantReason string
+	}{
+		"no spreading spec": {
+			requested: rackLabel,
+		},
+		"rule above the requested level": {
+			spec:      &tas.SpreadingSpec{Rules: []tas.SpreadingRule{{TopologyKey: blockLabel}}},
+			requested: rackLabel,
+		},
+		"rule at the requested level": {
+			spec:      &tas.SpreadingSpec{Rules: []tas.SpreadingRule{{TopologyKey: rackLabel}}},
+			requested: rackLabel,
+		},
+		"rule below the requested level": {
+			spec:       &tas.SpreadingSpec{Rules: []tas.SpreadingRule{{TopologyKey: rackLabel}}},
+			requested:  blockLabel,
+			wantReason: "topology spreading level cloud.com/rack is below the podset topology cloud.com/block",
+		},
+		"level absent from the topology is skipped": {
+			spec:      &tas.SpreadingSpec{Rules: []tas.SpreadingRule{{TopologyKey: "cloud.com/datacenter"}}},
+			requested: rackLabel,
+		},
+		"absent level skipped, second rule still rejected": {
+			spec: &tas.SpreadingSpec{Rules: []tas.SpreadingRule{
+				{TopologyKey: "cloud.com/datacenter"},
+				{TopologyKey: corev1.LabelHostname},
+			}},
+			requested:  rackLabel,
+			wantReason: "topology spreading level kubernetes.io/hostname is below the podset topology cloud.com/rack",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			snapshot := &TASFlavorSnapshot{
+				log:          logr.Discard(),
+				topologyName: "default",
+				topologyTree: &topologyTree{levelKeys: levels},
+			}
+			requestedLevelIdx, found := snapshot.resolveLevelIdx(tc.requested)
+			if !found {
+				t.Fatalf("requested level %q is not part of the test topology", tc.requested)
+			}
+
+			gotReason := snapshot.validateSpreadingLevels(tc.spec, requestedLevelIdx)
+			if diff := cmp.Diff(tc.wantReason, gotReason); diff != "" {
+				t.Errorf("unexpected reason (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// Caching must not change an answer: every case runs with TASCacheNodeMatchResults on and
+// off and expects the same domains. Both entries of a group are built from the workers'
+// PodSet name, so an entry serving the leader the workers' leaves shows up here as the
+// leader on a node its own nodeSelector forbids.
+func TestMatchingLeavesCacheIsInvisible(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.TASNodeFeasibilityForAllLevels, true)
+	features.SetFeatureGateDuringTest(t, features.TASLeaderPodSetFeasibility, true)
+	features.SetFeatureGateDuringTest(t, features.TASRespectNodeAffinityPreferred, true)
+	const (
+		blockLabel = "cloud.provider.com/topology-block"
+		rackLabel  = "cloud.provider.com/topology-rack"
+		tierLabel  = "example.com/tier"
+	)
+
+	cases := map[string]struct {
+		required           string
+		workerPool         string
+		leaderPool         string
+		workersPreferred   []corev1.PreferredSchedulingTerm
+		workers            int32
+		wantWorkers        []string
+		wantLeader         []string
+		wantAffinityScores map[string]int64
+	}{
+		// Only the preference separates n3 and n4, and n3 wins by name if it is lost.
+		"workers' preferred node affinity decides the node": {
+			required: blockLabel, workerPool: "preferred", leaderPool: "preferred", workers: 2,
+			workersPreferred: utiltesting.MakePreferredSchedulingTerms().Term(10, tierLabel, corev1.NodeSelectorOpIn, "fast").Obj(),
+			wantWorkers:      []string{"n4"}, wantLeader: []string{"n4"},
+			wantAffinityScores: map[string]int64{"n4": 10},
+		},
+		"leader and workers want different nodes": {
+			required: blockLabel, workerPool: "workers", leaderPool: "leader", workers: 2,
+			wantWorkers: []string{"n1"}, wantLeader: []string{"n2"},
+		},
+		"leader and workers want the same node": {
+			required: blockLabel, workerPool: "workers", leaderPool: "workers", workers: 1,
+			wantWorkers: []string{"n1"}, wantLeader: []string{"n1"},
+		},
+		"leader takes the last place the workers could have used": {
+			required: blockLabel, workerPool: "workers", leaderPool: "workers", workers: 4,
+			wantWorkers: []string{"n1"}, wantLeader: []string{"n1"},
+		},
+		"required at the rack level": {
+			required: rackLabel, workerPool: "workers", leaderPool: "leader", workers: 2,
+			wantWorkers: []string{"n1"}, wantLeader: []string{"n2"},
+		},
+	}
+	for name, tc := range cases {
+		for _, cacheEnabled := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s with TASCacheNodeMatchResults enabled: %t", name, cacheEnabled), func(t *testing.T) {
+				features.SetFeatureGateDuringTest(t, features.TASCacheNodeMatchResults, cacheEnabled)
+				ctx, log := utiltesting.ContextWithLog(t)
+
+				// One rack of two nodes, one pool each, so a PodSet served the other's
+				// leaves names the wrong node rather than failing to fit. The hostname
+				// level is declared so that the assignment names the node.
+				rackNode := node.MakeNode("").
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("5"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).Ready()
+				nodes := []*corev1.Node{
+					rackNode.Clone().Name("n1").Label(blockLabel, "b1").Label(rackLabel, "r1").
+						Label(corev1.LabelHostname, "n1").Label("pool", "workers").Obj(),
+					rackNode.Clone().Name("n2").Label(blockLabel, "b1").Label(rackLabel, "r1").
+						Label(corev1.LabelHostname, "n2").Label("pool", "leader").Obj(),
+					rackNode.Clone().Name("n3").Label(blockLabel, "b1").Label(rackLabel, "r1").
+						Label(corev1.LabelHostname, "n3").Label("pool", "preferred").Obj(),
+					rackNode.Clone().Name("n4").Label(blockLabel, "b1").Label(rackLabel, "r1").
+						Label(corev1.LabelHostname, "n4").Label("pool", "preferred").Label(tierLabel, "fast").Obj(),
+				}
+				tree := newTopologyTree([]string{blockLabel, rackLabel, corev1.LabelHostname}, nodes, 0)
+				snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree,
+					newDefaultSimulator())
+
+				const groupName = "group"
+				oneCPU := resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000})
+				requests := FlavorTASRequests{
+					{
+						PodSet: utiltestingapi.MakePodSet("workers", int(tc.workers)).
+							RequiredTopologyRequest(tc.required).
+							PodSetGroup(groupName).
+							NodeSelector(map[string]string{"pool": tc.workerPool}).
+							PreferredDuringSchedulingIgnoredDuringExecution(tc.workersPreferred).Obj(),
+						SinglePodRequests: oneCPU,
+						Count:             tc.workers,
+						PodSetGroupName:   new(groupName),
+					},
+					{
+						PodSet: utiltestingapi.MakePodSet("leader", 1).
+							RequiredTopologyRequest(tc.required).
+							PodSetGroup(groupName).
+							NodeSelector(map[string]string{"pool": tc.leaderPool}).Obj(),
+						SinglePodRequests: oneCPU,
+						Count:             1,
+						PodSetGroupName:   new(groupName),
+					},
+				}
+				wl := workload.NewInfo(log, &kueue.Workload{Namespace: "default", Name: "wl", UID: "wl-uid"})
+
+				want := map[kueue.PodSetReference][]string{"workers": tc.wantWorkers, "leader": tc.wantLeader}
+				// The cache only answers from the second cycle, and the flavor assigner
+				// asks both ways, so an entry that answered one question must not serve
+				// the other.
+				for cycle := range 2 {
+					for _, simulateEmpty := range []bool{false, true} {
+						opts := []FindTopologyAssignmentsOption{WithWorkloadInfo(wl)}
+						if simulateEmpty {
+							opts = append(opts, WithSimulateEmpty(true))
+						}
+						result := snapshot.FindTopologyAssignmentsForFlavor(ctx, requests, opts...)
+						if failure := result.Failure(); failure != nil {
+							t.Fatalf("cycle %d simulateEmpty=%t: FindTopologyAssignmentsForFlavor() = %v, want a fit", cycle, simulateEmpty, failure)
+						}
+						for podSet, wantNodes := range want {
+							got := result[podSet].TopologyAssignment.Domains[0].Values
+							if diff := cmp.Diff(wantNodes, got); diff != "" {
+								t.Errorf("cycle %d simulateEmpty=%t: PodSet %s placed wrong (-want,+got): %s", cycle, simulateEmpty, podSet, diff)
+							}
+						}
+						for nodeName, wantScore := range tc.wantAffinityScores {
+							leaf := snapshot.leaves[snapshot.nodeToDomain[nodeName]]
+							if leaf == nil {
+								t.Fatalf("no leaf for node %s", nodeName)
+							}
+							if got := snapshot.domainStateOf(&leaf.domain).affinityScore; got != wantScore {
+								t.Errorf("cycle %d simulateEmpty=%t: node %s affinity score = %d, want %d (counted once)", cycle, simulateEmpty, nodeName, got, wantScore)
+							}
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+// A counter stays invisible to the operator unless hasExclusions admits it, add carries
+// it across the per-PodSet merge, and formatReasons prints it. Each has to agree, or the
+// Workload's message drops the one reason that explains it.
+func TestExclusionStatsReachTheMessage(t *testing.T) {
+	testCases := map[string]struct {
+		stats            tasExclusionStats
+		wantHas          bool
+		wantInReasons    string
+		wantNotInReasons string
+	}{
+		"draNoFit alone is enough to report exclusions": {
+			stats:         tasExclusionStats{NodeExclusionStats: simulator.NodeExclusionStats{DRANoFit: 3}},
+			wantHas:       true,
+			wantInReasons: "draNoFit: 3",
+		},
+		"draNoFit is named separately from schedulerLibraryNoFit": {
+			stats: tasExclusionStats{NodeExclusionStats: simulator.NodeExclusionStats{
+				DRANoFit:              2,
+				SchedulerLibraryNoFit: 5,
+			}},
+			wantHas:       true,
+			wantInReasons: "draNoFit: 2",
+		},
+		"schedulerLibraryNoFit alone is enough to report exclusions": {
+			stats:         tasExclusionStats{NodeExclusionStats: simulator.NodeExclusionStats{SchedulerLibraryNoFit: 4}},
+			wantHas:       true,
+			wantInReasons: "schedulerLibraryNoFit: 4",
+		},
+		"no exclusions when nothing was counted": {
+			stats:            tasExclusionStats{},
+			wantHas:          false,
+			wantNotInReasons: "draNoFit",
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.stats.hasExclusions(); got != tc.wantHas {
+				t.Errorf("hasExclusions() = %v, want %v", got, tc.wantHas)
+			}
+			reasons := tc.stats.formatReasons()
+			if tc.wantInReasons != "" && !strings.Contains(reasons, tc.wantInReasons) {
+				t.Errorf("formatReasons() = %q, want it to contain %q", reasons, tc.wantInReasons)
+			}
+			if tc.wantNotInReasons != "" && strings.Contains(reasons, tc.wantNotInReasons) {
+				t.Errorf("formatReasons() = %q, want it not to contain %q", reasons, tc.wantNotInReasons)
+			}
+
+			// add must carry the field across the per-PodSet merge.
+			var dst tasExclusionStats
+			dst.add(&tc.stats)
+			if dst.DRANoFit != tc.stats.DRANoFit {
+				t.Errorf("add() carried DRANoFit = %d, want %d", dst.DRANoFit, tc.stats.DRANoFit)
+			}
+		})
+	}
+}
+
+// sliceLevelUsages has to report the domains in the order they appear in the
+// assignment, which is the order the ungater ranks pods in. Both callers depend
+// on it: they single out the last domain as the one allowed to hold a
+// partial slice.
+func TestSliceLevelUsagesPreserveAssignmentOrder(t *testing.T) {
+	const rackLabel = "cloud.provider.com/topology-rack"
+
+	rackNode := node.MakeNode("").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("1"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).
+		Ready()
+	nodes := []*corev1.Node{
+		rackNode.Clone().Name("n1").Label(corev1.LabelHostname, "n1").Label(rackLabel, "r1").Obj(),
+		rackNode.Clone().Name("n2").Label(corev1.LabelHostname, "n2").Label(rackLabel, "r1").Obj(),
+		rackNode.Clone().Name("n3").Label(corev1.LabelHostname, "n3").Label(rackLabel, "r2").Obj(),
+		rackNode.Clone().Name("n4").Label(corev1.LabelHostname, "n4").Label(rackLabel, "r2").Obj(),
+		rackNode.Clone().Name("n5").Label(corev1.LabelHostname, "n5").Label(rackLabel, "r3").Obj(),
+	}
+
+	cases := map[string]struct {
+		assignment *tas.TopologyAssignment
+		want       []sliceLevelUsage
+	}{
+		"nodes of one rack are summed into a single entry": {
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n1"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n2"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n3"}, Count: 1}).
+				TopologyAssignment,
+			want: []sliceLevelUsage{
+				{domainID: "r1", count: 2},
+				{domainID: "r2", count: 1},
+			},
+		},
+		"the racks keep the order of the assignment, not their names": {
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n5"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n3"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n1"}, Count: 1}).
+				TopologyAssignment,
+			want: []sliceLevelUsage{
+				{domainID: "r3", count: 1},
+				{domainID: "r2", count: 1},
+				{domainID: "r1", count: 1},
+			},
+		},
+		"a rack revisited later keeps the position of its first appearance": {
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n1"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n3"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n2"}, Count: 1}).
+				TopologyAssignment,
+			want: []sliceLevelUsage{
+				{domainID: "r1", count: 2},
+				{domainID: "r2", count: 1},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, log := utiltesting.ContextWithLog(t)
+			tree := newTopologyTree([]string{rackLabel, corev1.LabelHostname}, nodes, 0)
+			snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator())
+
+			// Repeat, so that a map-order dependency cannot pass by chance.
+			for range 20 {
+				got := snapshot.sliceLevelUsages(tc.assignment, 0)
+				if diff := cmp.Diff(tc.want, got, cmp.AllowUnexported(sliceLevelUsage{})); diff != "" {
+					t.Fatalf("sliceLevelUsages() mismatch (-want +got):\n%s", diff)
+				}
+			}
+		})
+	}
+}
+
+// TestAssignmentSliceAligned drives the check that refuses to publish an
+// assignment in which a slice is spread over more than one domain. The
+// placement is not expected to produce such an assignment, so the predicate is
+// fed hand-built ones here rather than through a scheduling run.
+func TestAssignmentSliceAligned(t *testing.T) {
+	const (
+		rackLabel = "cloud.provider.com/topology-rack"
+		zoneLabel = "cloud.provider.com/topology-zone"
+	)
+
+	rackNode := node.MakeNode("").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("1"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).
+		Ready()
+	nodes := []*corev1.Node{
+		rackNode.Clone().Name("n1").Label(corev1.LabelHostname, "n1").Label(rackLabel, "r1").Obj(),
+		rackNode.Clone().Name("n2").Label(corev1.LabelHostname, "n2").Label(rackLabel, "r1").Obj(),
+		rackNode.Clone().Name("n3").Label(corev1.LabelHostname, "n3").Label(rackLabel, "r2").Obj(),
+		rackNode.Clone().Name("n4").Label(corev1.LabelHostname, "n4").Label(rackLabel, "r2").Obj(),
+	}
+
+	cases := map[string]struct {
+		disableGate     bool
+		virtualHostname bool
+		assignment      *tas.TopologyAssignment
+		request         *kueue.PodSetTopologyRequest
+		sliceSize       int32
+		want            bool
+	}{
+		"a whole slice per rack": {
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n1"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n2"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n3"}, Count: 2}).
+				TopologyAssignment,
+			request: utiltestingapi.MakePodSet("", 0).
+				SliceRequiredTopologyRequest(rackLabel).
+				SliceSizeTopologyRequest(2).
+				Obj().TopologyRequest,
+			sliceSize: 2,
+			want:      true,
+		},
+		"the partial slice is last": {
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n1"}, Count: 2}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n3"}, Count: 1}).
+				TopologyAssignment,
+			request: utiltestingapi.MakePodSet("", 0).
+				SliceRequiredTopologyRequest(rackLabel).
+				SliceSizeTopologyRequest(2).
+				Obj().TopologyRequest,
+			sliceSize: 2,
+			want:      true,
+		},
+		"the partial slice is not last": {
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n1"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n3"}, Count: 2}).
+				TopologyAssignment,
+			request: utiltestingapi.MakePodSet("", 0).
+				SliceRequiredTopologyRequest(rackLabel).
+				SliceSizeTopologyRequest(2).
+				Obj().TopologyRequest,
+			sliceSize: 2,
+			want:      false,
+		},
+		"a whole slice is split over two racks": {
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n1"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n3"}, Count: 1}).
+				TopologyAssignment,
+			request: utiltestingapi.MakePodSet("", 0).
+				SliceRequiredTopologyRequest(rackLabel).
+				SliceSizeTopologyRequest(2).
+				Obj().TopologyRequest,
+			sliceSize: 2,
+			want:      false,
+		},
+		"a slice of a single pod is always aligned": {
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n1"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n3"}, Count: 2}).
+				TopologyAssignment,
+			request: utiltestingapi.MakePodSet("", 0).
+				SliceRequiredTopologyRequest(rackLabel).
+				SliceSizeTopologyRequest(1).
+				Obj().TopologyRequest,
+			sliceSize: 1,
+			want:      true,
+		},
+		"a PodSet that does not ask for slices is not checked": {
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n1"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n3"}, Count: 2}).
+				TopologyAssignment,
+			request:   nil,
+			sliceSize: 2,
+			want:      true,
+		},
+		"a slice level the topology does not declare is not checked": {
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n1"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n3"}, Count: 2}).
+				TopologyAssignment,
+			request: utiltestingapi.MakePodSet("", 0).
+				SliceRequiredTopologyRequest(zoneLabel).
+				SliceSizeTopologyRequest(2).
+				Obj().TopologyRequest,
+			sliceSize: 2,
+			want:      true,
+		},
+		"the check is skipped while the feature gate is off": {
+			disableGate: true,
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n1"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"n3"}, Count: 2}).
+				TopologyAssignment,
+			request: utiltestingapi.MakePodSet("", 0).
+				SliceRequiredTopologyRequest(rackLabel).
+				SliceSizeTopologyRequest(2).
+				Obj().TopologyRequest,
+			sliceSize: 2,
+			want:      true,
+		},
+		"virtual hostname topology with partial slice last": {
+			virtualHostname: true,
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{rackLabel}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"r2"}, Count: 2}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"r1"}, Count: 1}).
+				TopologyAssignment,
+			request: utiltestingapi.MakePodSet("", 0).
+				SliceRequiredTopologyRequest(rackLabel).
+				SliceSizeTopologyRequest(2).
+				Obj().TopologyRequest,
+			sliceSize: 2,
+			want:      true,
+		},
+		"virtual hostname topology with partial slice not last": {
+			virtualHostname: true,
+			assignment: &utiltestingapi.MakeTopologyAssignment([]string{rackLabel}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"r1"}, Count: 1}).
+				Domain(tas.TopologyDomainAssignment{Values: []string{"r2"}, Count: 2}).
+				TopologyAssignment,
+			request: utiltestingapi.MakePodSet("", 0).
+				SliceRequiredTopologyRequest(rackLabel).
+				SliceSizeTopologyRequest(2).
+				Obj().TopologyRequest,
+			sliceSize: 2,
+			want:      false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, log := utiltesting.ContextWithLog(t)
+			features.SetFeatureGateDuringTest(t, features.TASPartialSlices, !tc.disableGate)
+
+			levels := []string{rackLabel, corev1.LabelHostname}
+			if tc.virtualHostname {
+				levels = []string{rackLabel}
+			}
+			tree := newTopologyTree(levels, nodes, 0)
+			snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"}, tree, newDefaultSimulator())
+
+			if got := snapshot.assignmentSliceAligned(tc.assignment, tc.request, tc.sliceSize); got != tc.want {
+				t.Errorf("assignmentSliceAligned() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDomainStateSliceCapacity(t *testing.T) {
+	state := domainState{sliceCount: [4]int32{
+		obligationNone:                    11,
+		obligationLeader:                  7,
+		obligationTail:                    5,
+		obligationLeader | obligationTail: 3,
+	}}
+	cases := map[string]struct {
+		withLeader bool
+		withTail   bool
+		want       int32
+	}{
+		"whole slices only":        {want: 11},
+		"leader with whole slices": {withLeader: true, want: 7},
+		"tail with whole slices":   {withTail: true, want: 5},
+		"leader and tail together": {withLeader: true, withTail: true, want: 3},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := state.sliceCapacity(obligationMaskFor(tc.withLeader, tc.withTail))
+			if got != tc.want {
+				t.Errorf("sliceCapacity() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDomainStateFitsZeroWholeSlicesWithTail(t *testing.T) {
+	cases := map[string]struct {
+		tailCapacity int32
+		want         bool
+	}{
+		"tail does not fit":                  {tailCapacity: noTailFit, want: false},
+		"tail fits without any whole slices": {tailCapacity: 0, want: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			state := domainState{sliceCount: [4]int32{obligationTail: tc.tailCapacity}}
+			if got := state.fitsSlices(0, 0, true); got != tc.want {
+				t.Errorf("fitsSlices() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFillTailCountsWithCapacityBound(t *testing.T) {
+	shape := sliceShape{size: 4, tailSize: 2}
+
+	cases := map[string]struct {
+		child                     domainState
+		hasLeaders                bool
+		parent                    domainState
+		childrenSliceCapacity     int32
+		wantTailCapacity          int32
+		wantLeaderAndTailCapacity int32
+	}{
+		"capped domain that still fits the tail is not rejected by child penalty": {
+			child: domainState{
+				podCount:   [2]int32{obligationNone: 4},
+				sliceCount: [4]int32{obligationNone: 1, obligationTail: 0},
+			},
+			parent: domainState{
+				podCount:   [2]int32{obligationNone: 2},
+				sliceCount: [4]int32{obligationNone: 0},
+			},
+			childrenSliceCapacity:     1,
+			wantTailCapacity:          0,
+			wantLeaderAndTailCapacity: noTailFit,
+		},
+		"capped domain with zero capacity stays at noTailFit instead of going below -1": {
+			child: domainState{
+				podCount:    [2]int32{obligationNone: 5, obligationLeader: 4},
+				leaderCount: 1,
+				sliceCount: [4]int32{
+					obligationNone:                    1,
+					obligationLeader:                  1,
+					obligationTail:                    0,
+					obligationLeader | obligationTail: 0,
+				},
+			},
+			hasLeaders: true,
+			parent: domainState{
+				podCount:   [2]int32{obligationNone: 0, obligationLeader: 0},
+				sliceCount: [4]int32{obligationNone: 0},
+			},
+			childrenSliceCapacity:     1,
+			wantTailCapacity:          noTailFit,
+			wantLeaderAndTailCapacity: noTailFit,
+		},
+		// The parent's podCount[obligationNone] fits the tail on its own, but its
+		// podCount[obligationLeader] is too low to fit the tail next to the leader.
+		"capped domain fits the tail alone but not next to the leader": {
+			child: domainState{
+				podCount:    [2]int32{obligationNone: 8, obligationLeader: 7},
+				leaderCount: 1,
+				sliceCount: [4]int32{
+					obligationNone:                    2,
+					obligationLeader:                  1,
+					obligationTail:                    1,
+					obligationLeader | obligationTail: 1,
+				},
+			},
+			hasLeaders: true,
+			parent: domainState{
+				podCount: [2]int32{obligationNone: 3, obligationLeader: 1},
+			},
+			childrenSliceCapacity:     2,
+			wantTailCapacity:          0,
+			wantLeaderAndTailCapacity: noTailFit,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var penalties tailPenaltyTracker
+			child := tc.child
+			penalties.add(0, &child, tc.hasLeaders)
+
+			parent := tc.parent
+			fillTailCounts(&parent, shape, false, tc.childrenSliceCapacity, &penalties)
+			if parent.sliceCount[obligationTail] != tc.wantTailCapacity {
+				t.Errorf("sliceCount[obligationTail] = %d, want %d", parent.sliceCount[obligationTail], tc.wantTailCapacity)
+			}
+			if parent.sliceCount[obligationLeader|obligationTail] != tc.wantLeaderAndTailCapacity {
+				t.Errorf("sliceCount[obligationLeader|obligationTail] = %d, want %d", parent.sliceCount[obligationLeader|obligationTail], tc.wantLeaderAndTailCapacity)
+			}
+		})
+	}
+}
+
+func TestFits(t *testing.T) {
+	cases := map[string]struct {
+		allocatable corev1.ResourceList
+		admitted    workload.TASFlavorUsage
+		usage       workload.TASFlavorUsage
+		want        bool
+	}{
+		"a PodSet the node has room for": {
+			allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("8"),
+				corev1.ResourcePods: resource.MustParse("110"),
+			},
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 4000}),
+				Count:             1,
+			}},
+			want: true,
+		},
+		"a PodSet the node has no slot for": {
+			allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("100"),
+				corev1.ResourcePods: resource.MustParse("1"),
+			},
+			admitted: workload.TASFlavorUsage{{
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000}),
+				Count:             1,
+			}},
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000}),
+				Count:             1,
+			}},
+			want: false,
+		},
+		"two PodSets that fit alone but not together": {
+			allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("4"),
+				corev1.ResourcePods: resource.MustParse("110"),
+			},
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 4000}),
+				Count:             1,
+			}, {
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 4000}),
+				Count:             1,
+			}},
+			want: false,
+		},
+		"two PodSets the node has room for": {
+			allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("8"),
+				corev1.ResourcePods: resource.MustParse("110"),
+			},
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 4000}),
+				Count:             1,
+			}, {
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 4000}),
+				Count:             1,
+			}},
+			want: true,
+		},
+		"replicas and a second PodSet fill the node exactly": {
+			allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("8"),
+				corev1.ResourcePods: resource.MustParse("3"),
+			},
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 2000}),
+				Count:             2,
+			}, {
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 4000}),
+				Count:             1,
+			}},
+			want: true,
+		},
+		"replicas past the first exhaust the CPU": {
+			allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("7"),
+				corev1.ResourcePods: resource.MustParse("3"),
+			},
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 2000}),
+				Count:             2,
+			}, {
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 4000}),
+				Count:             1,
+			}},
+			want: false,
+		},
+		"replicas past the first exhaust the Pod slots": {
+			allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("8"),
+				corev1.ResourcePods: resource.MustParse("2"),
+			},
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 2000}),
+				Count:             2,
+			}, {
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 4000}),
+				Count:             1,
+			}},
+			want: false,
+		},
+		"a PodSet asking for nothing but a slot": {
+			allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("8"),
+				corev1.ResourcePods: resource.MustParse("1"),
+			},
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{}),
+				Count:             1,
+			}},
+			want: true,
+		},
+		"a PodSet asking for nothing when no slot is left": {
+			allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("8"),
+				corev1.ResourcePods: resource.MustParse("1"),
+			},
+			admitted: workload.TASFlavorUsage{{
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000}),
+				Count:             1,
+			}},
+			usage: workload.TASFlavorUsage{{
+				Values:            []string{"node-a"},
+				SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{}),
+				Count:             1,
+			}},
+			want: false,
+		},
+	}
+	for name, tc := range cases {
+		for _, enableCaching := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s, TASCachingRemainingResources=%t", name, enableCaching), func(t *testing.T) {
+				features.SetFeatureGateDuringTest(t, features.TASCachingRemainingResources, enableCaching)
+				_, log := utiltesting.ContextWithLog(t)
+				nodeObj := node.MakeNode("node-a").
+					Label(corev1.LabelHostname, "node-a").
+					StatusAllocatable(tc.allocatable).
+					Ready().
+					Obj()
+				snapshot := newTASFlavorSnapshot(log, flavorInformation{TopologyName: "tas-topology"},
+					newTopologyTree([]string{corev1.LabelHostname}, []*corev1.Node{nodeObj}, 0), newDefaultSimulator())
+				snapshot.updateTASUsageForHeldDomains(tc.admitted, add)
+				if got := snapshot.Fits(tc.usage); got != tc.want {
+					t.Errorf("Fits() = %t, want %t", got, tc.want)
+				}
+				// Fits deducts from a copy, so asking again gives the same answer.
+				if got := snapshot.Fits(tc.usage); got != tc.want {
+					t.Errorf("Fits() asked a second time = %t, want %t", got, tc.want)
+				}
+			})
+		}
 	}
 }

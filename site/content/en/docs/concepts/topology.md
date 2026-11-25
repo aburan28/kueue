@@ -55,10 +55,30 @@ The `levels` field has the following constraints:
 
 - **Minimum items**: 1
 - **Maximum items**: 16
-- **Immutability**: The field cannot be changed after creation
+- **Mutability**: The field can only be changed when `kubernetes.io/hostname`
+  is the lowest (last) level both before and after the change; otherwise it is
+  immutable
 - **Uniqueness**: Each level must have a unique `nodeLabel`
 - **Hostname restriction**: The `kubernetes.io/hostname` label can only be used
   at the lowest (last) level
+
+### Changing the levels of a Topology in use
+
+When `kubernetes.io/hostname` is the lowest level, levels above it can be
+renamed, reordered, added or removed while workloads are admitted: their
+recorded usage is keyed by hostname and is preserved across the change, and
+already admitted workloads are not evicted. Pending workloads are automatically
+retried against the new levels. Keep in mind:
+
+- **When adding a level, label all nodes first, then add the level.** The
+  scheduler only considers nodes that carry the labels of every topology level,
+  so nodes missing the new label are excluded (together with their usage) until
+  they are labeled, which temporarily shrinks the available capacity.
+- **Removing a level makes it unschedulable for workloads that request it.**
+  Workloads with a required or preferred topology request for a removed level
+  can no longer be nominated (or re-nominated, for example during failed node
+  replacement) until the level is restored. Already admitted workloads keep
+  running; admission-time constraints are not re-validated retroactively.
 
 ## Referencing a Topology from a ResourceFlavor
 
@@ -80,8 +100,33 @@ When a ResourceFlavor references a Topology:
 
 - **At least one nodeLabel is required**: The ResourceFlavor must have at least
   one entry in `.spec.nodeLabels`.
-- **Spec becomes immutable**: Once a ResourceFlavor has a `topologyName` set,
-  the entire `.spec` field cannot be modified.
+- **Restricted mutability**: Once a ResourceFlavor has a `topologyName` set,
+  the `.spec.topologyName` field is immutable (it cannot be changed or unset in
+  place). Since Kueue v0.20, `.spec.nodeLabels` (as long as at least one label
+  remains), `.spec.nodeTaints`, and `.spec.tolerations` can still be updated in
+  place; in Kueue v0.18 and v0.19, `.spec.nodeLabels` and `.spec.tolerations`
+  are also immutable once `.spec.topologyName` is set.
+
+While `TopologyAwareScheduling` is enabled, Kueue adds the
+`kueue.x-k8s.io/resource-in-use` finalizer to each `Topology` and removes it
+only once no `ResourceFlavor` references that `Topology`. The TAS controllers
+that manage this finalizer do not run while `TopologyAwareScheduling` is
+disabled, so a `Topology` that already has the finalizer stays in `Terminating`
+if it is deleted while TAS is disabled, until TAS is re-enabled. When
+`TopologyAwareScheduling` is enabled, Kueue also marks any `ClusterQueue` that
+uses a flavor whose `Topology` does not exist as inactive (`TopologyNotFound`),
+so create the `Topology` before referencing it from a `ResourceFlavor`.
+
+Because `.spec.topologyName` cannot be unset in place, disabling TAS on an
+existing flavor without performing a blue/green `ResourceFlavor` replacement
+requires setting `TopologyAwareScheduling: false` and setting every enabled
+feature gate that depends on it (mostly the `TAS*` gates) to `false` (see
+[Topology-Aware Scheduling](/docs/concepts/topology_aware_scheduling)). Jobs
+already admitted through TAS before the gate is disabled retain the
+`kueue.x-k8s.io/topology` scheduling gate in their PodTemplate; any Pods created
+or recreated for those Jobs while TAS is disabled remain `SchedulingGated` until
+the Workload is evicted (for example, via `waitForPodsReady.recoveryTimeout`)
+and re-admitted.
 
 ## What's next?
 

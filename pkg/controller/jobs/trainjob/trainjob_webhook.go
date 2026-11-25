@@ -20,6 +20,7 @@ import (
 	"context"
 
 	kftrainerapi "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -29,27 +30,33 @@ import (
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	jobframeworktas "sigs.k8s.io/kueue/pkg/controller/jobframework/tas"
 	"sigs.k8s.io/kueue/pkg/features"
+	utiltrainjob "sigs.k8s.io/kueue/pkg/util/trainjob"
 	"sigs.k8s.io/kueue/pkg/util/webhook"
 )
 
 type TrainJobWebhook struct {
+	integrationManager           *jobframework.IntegrationManager
 	client                       client.Client
 	manageJobsWithoutQueueName   bool
 	managedJobsNamespaceSelector labels.Selector
 	queues                       *qcache.Manager
 	cache                        *schdcache.Cache
+	maxTimeoutOnWorkload         *metav1.Duration
 }
 
 // SetupTrainJobWebhook configures the webhook for kubeflow TrainJob.
 func SetupTrainJobWebhook(mgr ctrl.Manager, opts ...jobframework.Option) error {
 	options := jobframework.ProcessOptions(opts...)
 	wh := &TrainJobWebhook{
+		integrationManager:           options.IntegrationManager,
 		client:                       mgr.GetClient(),
 		manageJobsWithoutQueueName:   options.ManageJobsWithoutQueueName,
 		managedJobsNamespaceSelector: options.ManagedJobsNamespaceSelector,
 		queues:                       options.Queues,
 		cache:                        options.Cache,
+		maxTimeoutOnWorkload:         options.MaxTimeoutOnWorkload,
 	}
 	obj := &kftrainerapi.TrainJob{}
 	if options.NoopWebhook {
@@ -72,25 +79,37 @@ func (w *TrainJobWebhook) Default(ctx context.Context, obj *kftrainerapi.TrainJo
 	log := ctrl.LoggerFrom(ctx).WithName("trainjob-webhook")
 	log.V(5).Info("Applying defaults")
 
-	jobframework.ApplyDefaultLocalQueue(trainJob.Object(), w.queues.DefaultLocalQueueExist)
-	jobframework.ApplyDefaultWorkloadPriorityClass(ctx, w.client, trainJob.Object())
-	jobframework.ApplyDefaultForManagedBy(trainJob, w.queues, w.cache, log)
-	suspend, err := jobframework.WorkloadShouldBeSuspended(ctx, trainJob.Object(), w.client, w.manageJobsWithoutQueueName, w.managedJobsNamespaceSelector)
-	if err != nil {
+	if err := w.integrationManager.ApplyDefaultLocalQueue(ctx, w.client, trainJob.Object(), w.queues.DefaultLocalQueueExist, w.managedJobsNamespaceSelector); err != nil {
 		return err
 	}
-	runtimePatch := kftrainerapi.RuntimePatch{
-		Manager: runtimePatchManagerName,
-		TrainingRuntimeSpec: &kftrainerapi.TrainingRuntimeSpecPatch{
-			Template: &kftrainerapi.JobSetTemplatePatch{
-				Spec: &kftrainerapi.JobSetSpecPatch{},
-			},
-		},
+	if err := w.integrationManager.ApplyDefaultWorkloadPriorityClass(ctx, w.client, trainJob.Object(), w.managedJobsNamespaceSelector); err != nil {
+		return err
+	}
+	jobframework.ApplyDefaultForManagedBy(trainJob, w.queues, w.cache, log)
+	suspend, err := w.integrationManager.WorkloadShouldBeSuspended(
+		ctx,
+		trainJob.Object(),
+		w.client,
+		w.manageJobsWithoutQueueName,
+		w.managedJobsNamespaceSelector,
+		jobframework.WithDeletingObjectTolerance(true),
+	)
+	if err != nil {
+		return err
 	}
 	if suspend {
 		trainJob.Suspend()
 	}
-	trainJob.Spec.RuntimePatches = append(trainJob.Spec.RuntimePatches, runtimePatch)
+	if utiltrainjob.KueueRuntimePatch((*kftrainerapi.TrainJob)(trainJob)) == nil {
+		trainJob.Spec.RuntimePatches = append(trainJob.Spec.RuntimePatches, kftrainerapi.RuntimePatch{
+			Manager: utiltrainjob.KueueRuntimePatchManager,
+			TrainingRuntimeSpec: &kftrainerapi.TrainingRuntimeSpecPatch{
+				Template: &kftrainerapi.JobSetTemplatePatch{
+					Spec: &kftrainerapi.JobSetSpecPatch{},
+				},
+			},
+		})
+	}
 	return nil
 }
 
@@ -103,7 +122,7 @@ func (w *TrainJobWebhook) ValidateCreate(ctx context.Context, obj *kftrainerapi.
 	trainjob := fromObject(obj)
 	log := ctrl.LoggerFrom(ctx).WithName("trainjob-webhook")
 	log.Info("Validating create")
-	validationErrs, err := w.validateCreate(ctx, trainjob)
+	validationErrs, err := w.validateCreate(ctx, trainjob, w.maxTimeoutOnWorkload)
 	if err != nil {
 		return nil, err
 	}
@@ -125,8 +144,8 @@ func (w *TrainJobWebhook) ValidateUpdate(ctx context.Context, oldObj, newObj *kf
 
 func (w *TrainJobWebhook) validateUpdate(ctx context.Context, oldTrainJob, newTrainJob *TrainJob) (field.ErrorList, error) {
 	var allErrs field.ErrorList
-	allErrs = append(allErrs, jobframework.ValidateJobOnUpdate(oldTrainJob, newTrainJob, w.queues.DefaultLocalQueueExist)...)
-	validationErrs, err := w.validateCreate(ctx, newTrainJob)
+	allErrs = append(allErrs, jobframework.ValidateJobOnUpdate(oldTrainJob, newTrainJob, w.queues.DefaultLocalQueueExist, w.maxTimeoutOnWorkload)...)
+	validationErrs, err := w.validateCreate(ctx, newTrainJob, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -134,9 +153,9 @@ func (w *TrainJobWebhook) validateUpdate(ctx context.Context, oldTrainJob, newTr
 	return allErrs, nil
 }
 
-func (w *TrainJobWebhook) validateCreate(ctx context.Context, trainjob *TrainJob) (field.ErrorList, error) {
+func (w *TrainJobWebhook) validateCreate(ctx context.Context, trainjob *TrainJob, maxTimeoutOnWorkload *metav1.Duration) (field.ErrorList, error) {
 	var allErrs field.ErrorList
-	allErrs = append(allErrs, jobframework.ValidateJobOnCreate(trainjob)...)
+	allErrs = append(allErrs, jobframework.ValidateJobOnCreate(trainjob, maxTimeoutOnWorkload)...)
 	if features.Enabled(features.TopologyAwareScheduling) {
 		validationErrs, err := w.validateTopologyRequest(ctx, trainjob)
 		if err != nil {
@@ -153,8 +172,8 @@ func (w *TrainJobWebhook) validateTopologyRequest(ctx context.Context, trainJob 
 	podSets, podSetsErr := podSets(ctx, w.client, trainJob)
 	for _, p := range podSets {
 		jobPath := field.NewPath("job").Key(string(p.Name))
-		allErrs = append(allErrs, jobframework.ValidateTASPodSetRequest(jobPath, &p.Template.ObjectMeta)...)
-		allErrs = append(allErrs, jobframework.ValidateSliceSizeAnnotationUpperBound(jobPath, &p.Template.ObjectMeta, &p)...)
+		allErrs = append(allErrs, jobframeworktas.ValidateTASPodSetRequest(jobPath, &p.Template.ObjectMeta)...)
+		allErrs = append(allErrs, jobframeworktas.ValidateSliceSizeAnnotationUpperBound(jobPath, &p.Template.ObjectMeta, &p)...)
 	}
 
 	if len(allErrs) > 0 {

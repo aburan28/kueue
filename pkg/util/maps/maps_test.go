@@ -18,11 +18,135 @@ package maps
 
 import (
 	"maps"
+	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 )
+
+func TestMergeKeepExisting(t *testing.T) {
+	cases := map[string]struct {
+		dst           *map[string]string
+		src           map[string]string
+		want          *map[string]string
+		wantConflicts []string
+		nilCallback   bool
+	}{
+		"nil dst pointer": {
+			dst: nil,
+			src: map[string]string{
+				"key1": "value1",
+			},
+			want: nil,
+		},
+		"nil dst, nil src": {
+			dst:  new(map[string]string),
+			src:  nil,
+			want: new(map[string]string),
+		},
+		"nil dst, non-empty src": {
+			dst: new(map[string]string),
+			src: map[string]string{
+				"key1": "value1",
+			},
+			want: &map[string]string{
+				"key1": "value1",
+			},
+		},
+		"empty dst, non-empty src": {
+			dst: &map[string]string{},
+			src: map[string]string{
+				"key1": "value1",
+			},
+			want: &map[string]string{
+				"key1": "value1",
+			},
+		},
+		"existing key with the same value": {
+			dst: &map[string]string{
+				"key1": "value1",
+			},
+			src: map[string]string{
+				"key1": "value1",
+			},
+			want: &map[string]string{
+				"key1": "value1",
+			},
+		},
+		"existing key with a conflicting value": {
+			dst: &map[string]string{
+				"key1": "value1",
+			},
+			src: map[string]string{
+				"key1": "value2",
+			},
+			want: &map[string]string{
+				"key1": "value1",
+			},
+			wantConflicts: []string{"key1=value1/value2"},
+		},
+		"existing key with a conflicting value and nil callback": {
+			dst: &map[string]string{
+				"key1": "value1",
+			},
+			src: map[string]string{
+				"key1": "value2",
+			},
+			want: &map[string]string{
+				"key1": "value1",
+			},
+			nilCallback: true,
+		},
+		"new key": {
+			dst: &map[string]string{
+				"key1": "value1",
+			},
+			src: map[string]string{
+				"key2": "value2",
+			},
+			want: &map[string]string{
+				"key1": "value1",
+				"key2": "value2",
+			},
+		},
+		"mixed keys": {
+			dst: &map[string]string{
+				"same":     "s",
+				"conflict": "kept",
+			},
+			src: map[string]string{
+				"same":     "s",
+				"conflict": "ignored",
+				"new":      "n",
+			},
+			want: &map[string]string{
+				"same":     "s",
+				"conflict": "kept",
+				"new":      "n",
+			},
+			wantConflicts: []string{"conflict=kept/ignored"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var conflicts []string
+			var onConflict func(k, kept, ignored string)
+			if !tc.nilCallback {
+				onConflict = func(k, kept, ignored string) {
+					conflicts = append(conflicts, k+"="+kept+"/"+ignored)
+				}
+			}
+			MergeKeepExisting(tc.dst, tc.src, onConflict)
+			if diff := cmp.Diff(tc.want, tc.dst); diff != "" {
+				t.Errorf("MergeKeepExisting() dst mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantConflicts, conflicts, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("MergeKeepExisting() reported conflicts mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
 
 func TestCopy(t *testing.T) {
 	cases := map[string]struct {
@@ -290,5 +414,155 @@ func TestFilterKeys(t *testing.T) {
 				t.Errorf("Unexpected result, expecting %v", tc.want)
 			}
 		})
+	}
+}
+
+func TestUpdate(t *testing.T) {
+	penalty := 5
+	cases := map[string]struct {
+		initial       map[string]int
+		localQueue    string
+		f             func(int, bool) int
+		want          int
+		wantUnchanged map[string]int
+	}{
+		"missing key is treated as zero value": {
+			initial:    map[string]int{},
+			localQueue: "default/lq1",
+			f:          func(existing int, _ bool) int { return existing + penalty },
+			want:       5,
+		},
+		"existing key is accumulated": {
+			initial:    map[string]int{"default/lq1": 3},
+			localQueue: "default/lq1",
+			f:          func(existing int, _ bool) int { return existing + penalty },
+			want:       8,
+		},
+		"different key is not affected": {
+			initial:       map[string]int{"default/lq2": 3},
+			localQueue:    "default/lq1",
+			f:             func(existing int, _ bool) int { return existing + penalty },
+			want:          penalty,
+			wantUnchanged: map[string]int{"default/lq2": 3},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			syncMap := NewSyncMap[string, int](0)
+			for k, v := range tc.initial {
+				syncMap.Add(k, v)
+			}
+			got := syncMap.Update(tc.localQueue, tc.f)
+			if got != tc.want {
+				t.Errorf("returned value: got %v, want %v", got, tc.want)
+			}
+			stored, found := syncMap.Get(tc.localQueue)
+			if !found {
+				t.Errorf("key %q not present after Update", tc.localQueue)
+			} else if stored != tc.want {
+				t.Errorf("persisted value: got %v, want %v", stored, tc.want)
+			}
+			for unchangedKey, wantVal := range tc.wantUnchanged {
+				gotVal, found := syncMap.Get(unchangedKey)
+				if !found {
+					t.Errorf("key %q was unexpectedly deleted", unchangedKey)
+					continue
+				}
+				if gotVal != wantVal {
+					t.Errorf("key %q: got %v, want %v", unchangedKey, gotVal, wantVal)
+				}
+			}
+		})
+	}
+}
+
+// TestUpdateConcurrent verifies that concurrent Update calls on the
+// same key never lose an update. Each goroutine increments by 1; the final
+// value must equal exactly n. A lost update produces a lower value because one
+// goroutine's write silently overwrites another's.
+func TestUpdateConcurrent(t *testing.T) {
+	const n = 500
+	const key = "default/lq1"
+
+	syncMap := NewSyncMap[string, int](0)
+
+	var wg sync.WaitGroup
+	barrier := make(chan struct{})
+
+	for range n {
+		wg.Go(func() {
+			<-barrier
+			syncMap.Update(key, func(existing int, _ bool) int { return existing + 1 })
+		})
+	}
+
+	close(barrier)
+	wg.Wait()
+
+	got, _ := syncMap.Get(key)
+	if got != n {
+		t.Errorf("lost updates detected: got %d, want %d", got, n)
+	}
+}
+
+// TestUpdateOrDeleteConcurrentWithPush verifies that UpdateOrDelete eliminates
+// the TOCTOU between checking canClearPenalty and calling Delete in the
+// original AfsEntryPenalties.Sub implementation (since consolidated into AfsUsageLedger)
+// (https://github.com/kubernetes-sigs/kueue/issues/12546).
+func TestUpdateOrDeleteConcurrentWithPush(t *testing.T) {
+	const key = "default/lq1"
+
+	// n Sub goroutines each decrement by 1; n Push goroutines each increment by 1.
+	// The key starts at n so the decrements collectively cancel the initial value.
+	const n = 500
+
+	syncMap := NewSyncMap[string, int](0)
+	syncMap.Add(key, n)
+
+	var wg sync.WaitGroup
+	barrier := make(chan struct{})
+
+	for range n {
+		wg.Go(func() {
+			<-barrier
+			syncMap.UpdateOrDelete(key, func(existing int) (int, bool) {
+				v := existing - 1
+				return v, v == 0
+			})
+		})
+	}
+
+	for range n {
+		wg.Go(func() {
+			<-barrier
+			syncMap.Update(key, func(existing int, _ bool) int { return existing + 1 })
+		})
+	}
+
+	close(barrier)
+	wg.Wait()
+
+	got, _ := syncMap.Get(key)
+	if got != n {
+		t.Errorf("lost updates: got %d, want %d", got, n)
+	}
+}
+
+func TestUpdateIfPresent(t *testing.T) {
+	syncMap := NewSyncMap[string, int](0)
+
+	if got, found := syncMap.UpdateIfPresent("absent", func(v int) int { return v + 1 }); found || got != 0 {
+		t.Errorf("UpdateIfPresent() on an absent key = (%d, %t), want (0, false)", got, found)
+	}
+	if _, found := syncMap.Get("absent"); found {
+		t.Error("UpdateIfPresent() created an entry for an absent key")
+	}
+
+	syncMap.Add("present", 1)
+	if got, found := syncMap.UpdateIfPresent("present", func(v int) int { return v + 1 }); !found || got != 2 {
+		t.Errorf("UpdateIfPresent() on a present key = (%d, %t), want (2, true)", got, found)
+	}
+	if got, _ := syncMap.Get("present"); got != 2 {
+		t.Errorf("stored value = %d, want 2", got)
 	}
 }

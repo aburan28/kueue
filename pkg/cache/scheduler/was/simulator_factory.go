@@ -1,0 +1,266 @@
+//go:build !exclude_scheduler_library
+
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package was
+
+import (
+	"context"
+
+	corev1 "k8s.io/api/core/v1"
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
+	schedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultpreemption"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/gangscheduling"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeaffinity"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeports"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeunschedulable"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/queuesort"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/tainttoleration"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/topologyaware"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/scheduler-library/pkg/framework"
+	schedLibSimulator "sigs.k8s.io/scheduler-library/pkg/simulator"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
+	schedlib "sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
+
+	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/cache/scheduler/podtracker"
+	"sigs.k8s.io/kueue/pkg/cache/scheduler/simulator"
+	"sigs.k8s.io/kueue/pkg/features"
+	"sigs.k8s.io/kueue/pkg/workload"
+)
+
+var _ simulator.Factory = (*wasSimulatorFactory)(nil)
+
+type wasSimulatorFactory struct {
+	newSnapshot snapshotFactory
+	virtualPods *virtualPodsPerWorkload
+}
+
+type snapshotFactory func(ctx context.Context, pods []*corev1.Pod, nodes []*corev1.Node) (*schedlib.ClusterSnapshot, error)
+
+func newWASSimulatorFactory(ctx context.Context, client kubernetes.Interface) (*wasSimulatorFactory, error) {
+	cfg := newWASSchedulerConfig()
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+
+	// Register node and pod informers with the factory; sync errors are caught by AsError() below.
+	_ = informerFactory.Core().V1().Nodes().Informer()
+	_ = informerFactory.Core().V1().Pods().Informer()
+
+	comps, err := upstreamsync.NewFrameworkComponents(
+		withWASLogger(ctx),
+		client,
+		informerFactory,
+		upstreamsync.WithProfiles(cfg.Profiles...),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	informerFactory.StartWithContext(ctx)
+	if err := informerFactory.WaitForCacheSyncWithContext(ctx).AsError(); err != nil {
+		return nil, err
+	}
+	if err := comps.WaitForHandlersSync(ctx); err != nil {
+		return nil, err
+	}
+
+	snapshotFn := func(ctx context.Context, pods []*corev1.Pod, nodes []*corev1.Node) (*schedlib.ClusterSnapshot, error) {
+		snap := cache.NewSnapshot(pods, nodes)
+		profiles, err := upstreamsync.NewFrameworkMap(withWASLogger(ctx), comps, framework.DiscardRecorderFactory, snap)
+		if err != nil {
+			return nil, err
+		}
+		framework.ApplySimulationNeutralizers(profiles)
+		return schedlib.New(snap, profiles), nil
+	}
+
+	return &wasSimulatorFactory{
+		newSnapshot: snapshotFn,
+		virtualPods: newVirtualPodsPerWorkload(),
+	}, nil
+}
+
+func newWASSchedulerConfig() *schedulerconfig.KubeSchedulerConfiguration {
+	nodeFilters := []schedulerconfig.Plugin{
+		{Name: nodeaffinity.Name},
+		{Name: nodeports.Name},
+	}
+	config := []schedulerconfig.PluginConfig{
+		{
+			Name: nodeaffinity.Name,
+			Args: &schedulerconfig.NodeAffinityArgs{},
+		},
+	}
+	var podGroupPostFilter []schedulerconfig.Plugin
+	if features.Enabled(features.SchedulerLibraryDeepIntegration) {
+		nodeFilters = append(nodeFilters, schedulerconfig.Plugin{Name: noderesources.Name})
+		podGroupPostFilter = append(podGroupPostFilter, schedulerconfig.Plugin{Name: defaultpreemption.Name})
+		config = append(config,
+			schedulerconfig.PluginConfig{
+				Name: noderesources.Name,
+				Args: &schedulerconfig.NodeResourcesFitArgs{
+					ScoringStrategy: &schedulerconfig.ScoringStrategy{
+						Type: schedulerconfig.LeastAllocated,
+					},
+				},
+			},
+			schedulerconfig.PluginConfig{
+				Name: defaultpreemption.Name,
+				Args: &schedulerconfig.DefaultPreemptionArgs{
+					MinCandidateNodesPercentage: 10,
+					MinCandidateNodesAbsolute:   100,
+				},
+			},
+		)
+	}
+	return &schedulerconfig.KubeSchedulerConfiguration{
+		Profiles: []schedulerconfig.KubeSchedulerProfile{
+			{
+				SchedulerName: corev1.DefaultSchedulerName,
+				// https://kubernetes.io/docs/reference/scheduling/config/#scheduling-plugins
+				Plugins: &schedulerconfig.Plugins{
+					MultiPoint: schedulerconfig.PluginSet{
+						Enabled: []schedulerconfig.Plugin{{Name: gangscheduling.Name}},
+					},
+					QueueSort: schedulerconfig.PluginSet{
+						Enabled: []schedulerconfig.Plugin{{Name: queuesort.Name}},
+					},
+					Bind: schedulerconfig.PluginSet{
+						Enabled: []schedulerconfig.Plugin{{Name: defaultbinder.Name}},
+					},
+					Filter: schedulerconfig.PluginSet{
+						Enabled: append([]schedulerconfig.Plugin{
+							{Name: nodeunschedulable.Name},
+							{Name: tainttoleration.Name},
+						}, nodeFilters...),
+					},
+					PreFilter: schedulerconfig.PluginSet{
+						Enabled: nodeFilters,
+					},
+					PlacementGenerate: schedulerconfig.PluginSet{
+						Enabled: []schedulerconfig.Plugin{{Name: topologyaware.Name}},
+					},
+					PodGroupPostFilter: schedulerconfig.PluginSet{
+						Enabled: podGroupPostFilter,
+					},
+				},
+				PluginConfig: config,
+			},
+		},
+	}
+}
+
+func NewWASSimulatorFactory(ctx context.Context, restConfig *rest.Config) (*wasSimulatorFactory, error) {
+	if restConfig != nil {
+		// TODO(#13534): when DRA plugins are added, use a real client here
+		// instead of the fake so the informer factory is populated.
+		if _, err := schedLibSimulator.NewReadonlyClient(restConfig); err != nil {
+			return nil, err
+		}
+	}
+	return newWASSimulatorFactory(ctx, fake.NewSimpleClientset())
+}
+
+func (s *wasSimulatorFactory) NewSimulator(ctx context.Context, nodes []*corev1.Node, pods *podtracker.Tracker, options ...simulator.Option) (simulator.SchedulerSimulator, error) {
+	tracker := pods.Clone()
+
+	assumedWls := simulator.AssumedWorkloads(options...)
+	activeUIDs := sets.New[types.UID]()
+
+	for _, wl := range assumedWls {
+		activeUIDs.Insert(wl.UID)
+
+		vPods := s.getVirtualPods(wl)
+		if len(vPods) == 0 {
+			continue
+		}
+
+		wlKey := workload.Key(wl)
+		tracker.RemoveWorkload(wlKey)
+
+		for _, vPod := range vPods {
+			tracker.Track(vPod)
+		}
+	}
+
+	// Prune workloads that are no longer assumed active
+	s.virtualPods.prune(activeUIDs)
+
+	allPods := tracker.Pods()
+	clusterSnap, err := s.newSnapshot(ctx, allPods, nodes)
+	if err != nil {
+		return nil, err
+	}
+	snapshot := &wasSimulator{
+		wasSnapshot:        clusterSnap,
+		pods:               tracker,
+		podGroups:          make(map[client.ObjectKey]*schedulingv1beta1.PodGroup),
+		compositePodGroups: make(map[client.ObjectKey]*schedulingv1alpha3.CompositePodGroup),
+	}
+	snapshot.emptyCluster.build = func(ctx context.Context) (*schedlib.ClusterSnapshot, error) {
+		return s.newSnapshot(ctx, podsNotManagedByKueue(allPods), nodes)
+	}
+
+	return snapshot, nil
+}
+
+// podsNotManagedByKueue returns the Pods that belong to no Workload. Preemption
+// cannot remove them, so they keep occupying their node even when the caller assumes
+// every Workload is gone.
+func podsNotManagedByKueue(allPods []*corev1.Pod) []*corev1.Pod {
+	var kept []*corev1.Pod
+	for _, pod := range allPods {
+		if pod.Annotations[kueue.WorkloadAnnotation] == "" {
+			kept = append(kept, pod)
+		}
+	}
+	return kept
+}
+
+func (s *wasSimulatorFactory) getVirtualPods(wl *kueue.Workload) []*corev1.Pod {
+	if cached, ok := s.virtualPods.get(wl.UID); ok && cached.workloadResourceVersion == wl.ResourceVersion {
+		return cached.pods
+	}
+
+	vPods := VirtualPodsForWorkload(wl)
+
+	// TODO: Explicit invalidation will be needed for node hotswap (UpdateWorkloadIfUnchanged)
+	if vPods.Pods() == nil {
+		s.virtualPods.delete(wl.UID)
+	} else {
+		s.virtualPods.set(wl.UID, vPods)
+	}
+
+	return vPods.Pods()
+}
+
+func withWASLogger(ctx context.Context) context.Context {
+	return ctrl.LoggerInto(ctx, ctrl.LoggerFrom(ctx).WithName("was"))
+}

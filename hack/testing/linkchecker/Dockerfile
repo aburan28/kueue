@@ -1,5 +1,7 @@
-FROM python:3.15.0b3-alpine@sha256:c46e1b5012956890f42c4492c55cafde3ce675796854127cf93e9216f9f28f1a
+FROM python:3.15.2-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd
 
 RUN pip install --no-cache-dir linkchecker
 
-ENTRYPOINT ["linkchecker"]
+COPY linkcheckerrc /etc/linkchecker/linkcheckerrc
+
+ENTRYPOINT ["linkchecker", "--config=/etc/linkchecker/linkcheckerrc"]

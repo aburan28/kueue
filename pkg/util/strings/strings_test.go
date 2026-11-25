@@ -16,7 +16,11 @@ limitations under the License.
 
 package strings
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+)
 
 func TestStringContainsSubstrings(t *testing.T) {
 	cases := map[string]struct {
@@ -54,6 +58,94 @@ func TestStringContainsSubstrings(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			if got := StringContainsSubstrings(tc.s, tc.substrings...); got != tc.want {
+				t.Errorf("Unexpected result: want: %v, got: %v", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestTruncateNamePrefix(t *testing.T) {
+	cases := map[string]struct {
+		s    string
+		n    int
+		want string
+	}{
+		"shorter than limit is unchanged": {
+			s:    "job-my-job",
+			n:    20,
+			want: "job-my-job",
+		},
+		"cut at limit": {
+			s:    "job-my-job",
+			n:    6,
+			want: "job-my",
+		},
+		"trailing dot after cut is dropped": {
+			s:    "job-my.job",
+			n:    7,
+			want: "job-my",
+		},
+		"trailing hyphen after cut is kept": {
+			s:    "job-my-job",
+			n:    7,
+			want: "job-my-",
+		},
+		"zero limit is empty": {
+			s:    "job-my-job",
+			n:    0,
+			want: "",
+		},
+		"negative limit is empty": {
+			s:    "job-my-job",
+			n:    -1,
+			want: "",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := TruncateNamePrefix(tc.s, tc.n); got != tc.want {
+				t.Errorf("TruncateNamePrefix(%q, %d) = %q, want %q", tc.s, tc.n, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestJoinMap(t *testing.T) {
+	cases := map[string]struct {
+		m           map[string][]int
+		keyValueSep string
+		valueSep    string
+		entrySep    string
+		want        string
+	}{
+		"empty map": {
+			m:           map[string][]int{},
+			keyValueSep: ":",
+			valueSep:    ",",
+			entrySep:    ";",
+			want:        "",
+		},
+		"basic test": {
+			m:           map[string][]int{"a": {1, 2}, "b": {3}},
+			keyValueSep: ":",
+			valueSep:    ",",
+			entrySep:    "; ",
+			want:        "a:1,2; b:3",
+		},
+		"key present with empty values": {
+			m:           map[string][]int{"a": {}, "b": {1, 2}},
+			keyValueSep: ":",
+			valueSep:    ",",
+			entrySep:    "; ",
+			want:        "a; b:1,2",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := JoinMap(tc.m, tc.keyValueSep, tc.valueSep, tc.entrySep)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("Unexpected result: want: %v, got: %v", tc.want, got)
 			}
 		})

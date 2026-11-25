@@ -58,16 +58,46 @@ func UpsertVolumeMounts(mounts *[]corev1ac.VolumeMountApplyConfiguration, upMoun
 	}
 }
 
+func UpsertPodResourceClaims(claims *[]corev1ac.PodResourceClaimApplyConfiguration, upClaims ...corev1ac.PodResourceClaimApplyConfiguration) {
+	for _, c := range upClaims {
+		upsert(claims, c, byPodResourceClaimName)
+	}
+}
+
+func UpsertResourceClaims(claims *[]corev1ac.ResourceClaimApplyConfiguration, upClaims ...corev1ac.ResourceClaimApplyConfiguration) {
+	for _, c := range upClaims {
+		upsert(claims, c, byResourceClaimNameAndRequest)
+	}
+}
+
 func byEnvVarName(a, b corev1ac.EnvVarApplyConfiguration) bool {
 	return ptr.Equal(a.Name, b.Name)
 }
 
+// byContainerPortOrName reports whether two container ports identify the same port.
+// Kubernetes keys the container ports list by containerPort and protocol, so ports that
+// differ in either field are distinct. The name is only compared when both ports set one,
+// since the name is optional and two unnamed ports must not be treated as equal.
 func byContainerPortOrName(a, b corev1ac.ContainerPortApplyConfiguration) bool {
-	return ptr.Equal(a.ContainerPort, b.ContainerPort) || ptr.Equal(a.Name, b.Name)
+	if a.Name != nil && b.Name != nil && ptr.Equal(a.Name, b.Name) {
+		return true
+	}
+	return ptr.Equal(a.ContainerPort, b.ContainerPort) &&
+		ptr.Deref(a.Protocol, corev1.ProtocolTCP) == ptr.Deref(b.Protocol, corev1.ProtocolTCP)
 }
 
 func byVolumeName(a, b corev1ac.VolumeApplyConfiguration) bool {
 	return ptr.Equal(a.Name, b.Name)
+}
+
+func byPodResourceClaimName(a, b corev1ac.PodResourceClaimApplyConfiguration) bool {
+	return ptr.Equal(a.Name, b.Name)
+}
+
+// byResourceClaimNameAndRequest reports whether two container resource claims are the same entry.
+// Kubernetes keys the container resources.claims list by name and request.
+func byResourceClaimNameAndRequest(a, b corev1ac.ResourceClaimApplyConfiguration) bool {
+	return ptr.Equal(a.Name, b.Name) && ptr.Equal(a.Request, b.Request)
 }
 
 func byVolumeMountPath(a, b corev1ac.VolumeMountApplyConfiguration) bool {
@@ -112,6 +142,13 @@ func EnvVar(e corev1.EnvVar) *corev1ac.EnvVarApplyConfiguration {
 				key.WithOptional(*optional)
 			}
 			source.WithSecretKeyRef(key)
+		}
+		if ref := from.FileKeyRef; ref != nil {
+			key := corev1ac.FileKeySelector().WithVolumeName(ref.VolumeName).WithPath(ref.Path).WithKey(ref.Key)
+			if optional := ref.Optional; optional != nil {
+				key.WithOptional(*optional)
+			}
+			source.WithFileKeyRef(key)
 		}
 		envVar.WithValueFrom(source)
 	} else {

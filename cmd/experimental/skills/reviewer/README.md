@@ -6,15 +6,19 @@ Each skill is independent and can be applied in parallel with the others. When r
 
 > **Note:** Each skill file ends with an Apache 2.0 copyright block. Ignore it — it is not part of the skill instructions.
 
+When reviewing tests or test coverage, follow
+[Writing tests](../../../../site/content/en/community/contribution_guidelines/writing_tests.md).
+
 | Skill | Triggers on |
 |---|---|
-| [table-driven-tests](table-driven-tests/SKILL.md) | test function covers multiple cases inline instead of a table |
+| [multikueue](multikueue/SKILL.md) | reviewing MultiKueue changes |
+| [table-driven-tests](table-driven-tests/SKILL.md) | independent unit scenarios duplicate setup or bypass a suitable existing table |
 | [encapsulate-paired-ops](encapsulate-paired-ops/SKILL.md) | two calls/fields that always appear together but aren't wrapped |
 | [metrics-label-sets](metrics-label-sets/SKILL.md) | new metric adds labels not present on existing ClusterQueue metrics |
 | [metrics-feature-gates](metrics-feature-gates/SKILL.md) | new metric missing feature flag gating that similar metrics have |
 | [extract-helpers](extract-helpers/SKILL.md) | local variable scope spans more of a function than necessary |
-| [integration-tests-for-updates](integration-tests-for-updates/SKILL.md) | update/mutation logic with no integration test coverage |
-| [ctx-structured-logging](ctx-structured-logging/SKILL.md) | `context.Context` silenced with `_ = ctx` |
+| [integration-coverage](integration-coverage/SKILL.md) | relevant interaction or API-server behavior lacks feasible integration coverage |
+| [tests-run-in-ci](tests-run-in-ci/SKILL.md) | tests added or changed without evidence that a presubmit CI job selects and runs them |
 | [algorithm-comments](algorithm-comments/SKILL.md) | comment describing formula or algorithm doesn't match the code |
 | [feature-gated-code](feature-gated-code/SKILL.md) | reachable code path missing a feature gate check |
 | [push-guards-to-callees](push-guards-to-callees/SKILL.md) | same guard repeated at multiple call sites before the same function |
@@ -23,6 +27,7 @@ Each skill is independent and can be applied in parallel with the others. When r
 | [api-field-comments](api-field-comments/SKILL.md) | new CRD field missing godoc comment or enum value descriptions |
 | [race-conditions](race-conditions/SKILL.md) | snapshot/mirror field added to protect a reader from a concurrent writer |
 | [visibility-exports](visibility-exports/SKILL.md) | new exported function or method with no callers outside the package |
+| [ctx-structured-logging](ctx-structured-logging/SKILL.md) | `context.Context` silenced with `_ = ctx`, `var _ = ctx`, or an equivalent discard |
 | [code-eval](code-eval/SKILL.md) | runs code evaluation and produces a scored report |
 | [architectural-decisions](architectural-decisions/SKILL.md) | domain — unjustified complexity, duplicated logic across types/adapters, scope creep, or misplaced code (see ToC inside) |
 | [buggy-behavior](buggy-behavior/SKILL.md) | domain — logic errors, broken edge cases, feature-gate bugs, deletions that break backwards compatibility during rolling upgrades (see ToC inside) |
@@ -64,13 +69,14 @@ Each skill is independent and can be applied in parallel with the others. When r
 | [integration-adapter-trust-boundary](security/integration-adapter-trust-boundary/SKILL.md) | adapters reading credential-like fields from third-party CRDs without treating them as untrusted (security) |
 | [webhook-safety-regressions](security/webhook-safety-regressions/SKILL.md) | loosened failurePolicy, shortened timeouts, TLS bypass, non-idempotent mutating webhooks (security) |
 
+@multikueue/SKILL.md
 @table-driven-tests/SKILL.md
 @encapsulate-paired-ops/SKILL.md
 @metrics-label-sets/SKILL.md
 @metrics-feature-gates/SKILL.md
 @extract-helpers/SKILL.md
-@integration-tests-for-updates/SKILL.md
-@ctx-structured-logging/SKILL.md
+@integration-coverage/SKILL.md
+@tests-run-in-ci/SKILL.md
 @algorithm-comments/SKILL.md
 @feature-gated-code/SKILL.md
 @push-guards-to-callees/SKILL.md
@@ -79,6 +85,7 @@ Each skill is independent and can be applied in parallel with the others. When r
 @api-field-comments/SKILL.md
 @race-conditions/SKILL.md
 @visibility-exports/SKILL.md
+@ctx-structured-logging/SKILL.md
 @code-eval/SKILL.md
 @architectural-decisions/SKILL.md
 @buggy-behavior/SKILL.md

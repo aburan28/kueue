@@ -931,6 +931,11 @@ Each resource group defines the list of resources and a list of flavors
 that provide quotas for these resources.
 Each resource and each flavor can only form part of one resource group.
 resourceGroups can be up to 16, with a max of 256 total flavors across all groups.</p>
+<p>Many flavors can increase admission latency, especially with many
+ClusterQueues or frequent workload submissions. Depending on
+flavorFungibility, the scheduler may try every flavor and simulate
+preemption for each. Configure only necessary flavors and evaluate
+performance under representative peak load.</p>
 </td>
 </tr>
 <tr><td><code>cohortName</code><br/>
@@ -1037,6 +1042,11 @@ if FairSharing is enabled in the Kueue configuration.</p>
 Its main capability is to allow Workloads pursuing multiple flavors at the same time, and starting on the first flavor that led to admission.
 Additionally after the admission, Workloads can still try to pursue capacity on the more preferable flavors while running.
 It enables them to migrate to more preferable, whenever capacity appears.</p>
+<p>When set, resourceGroups must contain exactly one group with at most
+32 flavors, and queueingStrategy must be BestEffortFIFO. Kueue creates
+a Variant Workload for each flavor, even if unsuitable, multiplying the
+number of Workloads that the scheduler and controllers process.
+This field is immutable.</p>
 </td>
 </tr>
 </tbody>
@@ -1115,6 +1125,17 @@ clusterQueue and haven't finished yet.</p>
    <p>fairSharing contains the current state for this ClusterQueue
 when participating in Fair Sharing.
 This is recorded only when Fair Sharing is enabled in the Kueue configuration.</p>
+</td>
+</tr>
+<tr><td><code>effectiveQuotas</code><br/>
+<a href="#kueue-x-k8s-io-v1beta2-EffectiveQuotaStatus"><code>EffectiveQuotaStatus</code></a>
+</td>
+<td>
+   <p>effectiveQuotas is used for scheduling instead of spec.resourceGroups when
+present. It is set by Dynamic Quota Orchestration (DQO), which overrides
+the quotas of whole flavors.</p>
+<p>This field is alpha-level, and is ignored by Kueue when the DynamicQuotaOrchestration
+feature gate is disabled.</p>
 </td>
 </tr>
 </tbody>
@@ -1264,6 +1285,17 @@ when participating in Fair Sharing.
 The is recorded only when Fair Sharing is enabled in the Kueue configuration.</p>
 </td>
 </tr>
+<tr><td><code>effectiveQuotas</code><br/>
+<a href="#kueue-x-k8s-io-v1beta2-EffectiveQuotaStatus"><code>EffectiveQuotaStatus</code></a>
+</td>
+<td>
+   <p>effectiveQuotas is used for scheduling instead of spec.resourceGroups when
+present. It is set by Dynamic Quota Orchestration (DQO), which overrides
+the quotas of whole flavors.</p>
+<p>This field is alpha-level, and is ignored by Kueue when the DynamicQuotaOrchestration
+feature gate is disabled.</p>
+</td>
+</tr>
 </tbody>
 </table>
 
@@ -1309,7 +1341,7 @@ Workload can migrate to any flavor that is more preferable than the one it was a
 <tbody>
     
   
-<tr><td><code>mode</code> <B>[Required]</B><br/>
+<tr><td><code>mode</code><br/>
 <a href="#kueue-x-k8s-io-v1beta2-ConcurrentAdmissionMigrationMode"><code>ConcurrentAdmissionMigrationMode</code></a>
 </td>
 <td>
@@ -1357,7 +1389,7 @@ The possible values are:</p>
 <tbody>
     
   
-<tr><td><code>migration,omitzero</code> <B>[Required]</B><br/>
+<tr><td><code>migration</code> <B>[Required]</B><br/>
 <a href="#kueue-x-k8s-io-v1beta2-ConcurrentAdmissionMigration"><code>ConcurrentAdmissionMigration</code></a>
 </td>
 <td>
@@ -1386,6 +1418,91 @@ Flavor preferences are expressed through the order of flavors in the ClusterQueu
 
 
 
+
+## `EffectiveQuotaStatus`     {#kueue-x-k8s-io-v1beta2-EffectiveQuotaStatus}
+    
+
+**Appears in:**
+
+- [ClusterQueueStatus](#kueue-x-k8s-io-v1beta2-ClusterQueueStatus)
+
+- [CohortStatus](#kueue-x-k8s-io-v1beta2-CohortStatus)
+
+
+<p>EffectiveQuotaStatus represents the active effective quota structure computed by
+Dynamic Quota Orchestration (DQO).</p>
+
+
+<table class="table">
+<thead><tr><th width="30%">Field</th><th>Description</th></tr></thead>
+<tbody>
+    
+  
+<tr><td><code>orchestratorRef,omitzero</code> <B>[Required]</B><br/>
+<a href="#kueue-x-k8s-io-v1beta2-EffectiveQuotaStatusOrchestratorRef"><code>EffectiveQuotaStatusOrchestratorRef</code></a>
+</td>
+<td>
+   <p>orchestratorRef identifies the component managing this value.</p>
+</td>
+</tr>
+<tr><td><code>resourceGroups</code> <B>[Required]</B><br/>
+<a href="#kueue-x-k8s-io-v1beta2-ResourceGroup"><code>[]ResourceGroup</code></a>
+</td>
+<td>
+   <p>resourceGroups contains the quotas used by the scheduler.
+DQO starts with spec.resourceGroups.
+For each flavor in the DQO's status.effectiveCapacity, it replaces each
+resource's nominalQuota with its share of the effective capacity.
+If a resource is missing from that flavor's effective capacity, its
+nominalQuota is set to zero.
+For these resources, DQO limits any configured ClusterQueue lendingLimit
+to the new nominalQuota.
+An empty list is valid. The scheduler uses it without falling back to
+spec.resourceGroups.</p>
+</td>
+</tr>
+</tbody>
+</table>
+
+## `EffectiveQuotaStatusOrchestratorRef`     {#kueue-x-k8s-io-v1beta2-EffectiveQuotaStatusOrchestratorRef}
+    
+
+**Appears in:**
+
+- [EffectiveQuotaStatus](#kueue-x-k8s-io-v1beta2-EffectiveQuotaStatus)
+
+
+<p>EffectiveQuotaStatusOrchestratorRef identifies the component managing the effective quota.</p>
+
+
+<table class="table">
+<thead><tr><th width="30%">Field</th><th>Description</th></tr></thead>
+<tbody>
+    
+  
+<tr><td><code>apiGroup</code> <B>[Required]</B><br/>
+<code>string</code>
+</td>
+<td>
+   <p>apiGroup is the group for the resource representing the manager.</p>
+</td>
+</tr>
+<tr><td><code>kind</code> <B>[Required]</B><br/>
+<code>string</code>
+</td>
+<td>
+   <p>kind is the type of the manager setting the effective quota.</p>
+</td>
+</tr>
+<tr><td><code>name</code> <B>[Required]</B><br/>
+<code>string</code>
+</td>
+<td>
+   <p>name is the name of the manager setting the effective quota.</p>
+</td>
+</tr>
+</tbody>
+</table>
 
 ## `EvictionUnderlyingCause`     {#kueue-x-k8s-io-v1beta2-EvictionUnderlyingCause}
     
@@ -2006,11 +2123,11 @@ conditions are limited to 16 elements.</p>
 - [MultiKueueConfigSpec](#kueue-x-k8s-io-v1beta2-MultiKueueConfigSpec)
 
 
-<p>MultiKueueConfigQuotaManagementMode specifies the automation mode.
+<p>MultiKueueConfigQuotaManagementMode is deprecated and ignored since v0.21.
 Supported modes:</p>
 <ul>
-<li><code>Manual</code>: Quota automation is manual.</li>
-<li><code>Automated</code>: Quota automation is enabled (provided that the MultiKueueManagerQuotaAutomation feature gate is enabled).</li>
+<li><code>Manual</code></li>
+<li><code>Automated</code></li>
 </ul>
 
 
@@ -2036,21 +2153,20 @@ Supported modes:</p>
 <code>[]string</code>
 </td>
 <td>
-   <p>clusters is a list of MultiKueueClusters names where the workloads from the ClusterQueue should be distributed.</p>
+   <p>clusters is a list of MultiKueueClusters names where the workloads from the ClusterQueue should be distributed.
+The order of the list is significant: the Incremental dispatcher nominates clusters
+following this order, so the most preferred clusters should be listed first.</p>
 </td>
 </tr>
 <tr><td><code>quotaManagement</code><br/>
 <a href="#kueue-x-k8s-io-v1beta2-MultiKueueConfigQuotaManagementMode"><code>MultiKueueConfigQuotaManagementMode</code></a>
 </td>
 <td>
-   <p>quotaManagement specifies the management of ClusterQueue quotas
-in the manager cluster.
-Supported modes:</p>
-<ul>
-<li><code>Manual</code>: Quota automation is manual.</li>
-<li><code>Automated</code>: Quota automation is enabled (provided that the MultiKueueManagerQuotaAutomation feature gate is enabled).
-If unspecified, defaults to <code>Manual</code>.</li>
-</ul>
+   <p>quotaManagement is deprecated and ignored since v0.21.
+To sum the quotas of the worker ClusterQueues into the manager ClusterQueue,
+use a CapacityProvider with a MultiKueueCapacityProviderConfig.
+The field is removed in the next API version.</p>
+<p>Deprecated: Kueue ignores this field.</p>
 </td>
 </tr>
 </tbody>
@@ -2952,6 +3068,7 @@ During this time, the workload is taken as an inadmissible and
 other workloads will have a chance to be admitted.
 By default, the consecutive requeue delays are around: (60s, 120s, 240s, ...).</li>
 </ul>
+<p>Must be greater than or equal to 0.</p>
 <p>Defaults to 3.</p>
 </td>
 </tr>
@@ -2961,6 +3078,7 @@ By default, the consecutive requeue delays are around: (60s, 120s, 240s, ...).</
 <td>
    <p>backoffBaseSeconds defines the base for the exponential backoff for
 re-queuing an evicted workload.</p>
+<p>Must be greater than or equal to 0.</p>
 <p>Defaults to 60.</p>
 </td>
 </tr>
@@ -2969,6 +3087,7 @@ re-queuing an evicted workload.</p>
 </td>
 <td>
    <p>backoffMaxSeconds defines the maximum backoff time to re-queue an evicted workload.</p>
+<p>Must be greater than or equal to 0.</p>
 <p>Defaults to 1800.</p>
 </td>
 </tr>
@@ -3156,6 +3275,8 @@ nodes matching to the Resource Flavor node labels.</p>
 - [ClusterQueueSpec](#kueue-x-k8s-io-v1beta2-ClusterQueueSpec)
 
 - [CohortSpec](#kueue-x-k8s-io-v1beta2-CohortSpec)
+
+- [EffectiveQuotaStatus](#kueue-x-k8s-io-v1beta2-EffectiveQuotaStatus)
 
 
 
@@ -3621,6 +3742,46 @@ level.</p>
 </tbody>
 </table>
 
+## `WaitForPodsReady`     {#kueue-x-k8s-io-v1beta2-WaitForPodsReady}
+    
+
+**Appears in:**
+
+- [WorkloadSpec](#kueue-x-k8s-io-v1beta2-WorkloadSpec)
+
+
+
+<table class="table">
+<thead><tr><th width="30%">Field</th><th>Description</th></tr></thead>
+<tbody>
+    
+  
+<tr><td><code>timeoutSeconds</code><br/>
+<code>int64</code>
+</td>
+<td>
+   <p>timeoutSeconds defines the maximum time the workload may remain
+admitted before all pods are in a Ready or Succeeded state.
+When elapsed, the workload is evicted with reason PodsReadyTimeout.
+If both this field and the cluster-wide WaitForPodsReady.Timeout are set,
+this field takes precedence.</p>
+</td>
+</tr>
+<tr><td><code>recoveryTimeoutSeconds</code><br/>
+<code>int64</code>
+</td>
+<td>
+   <p>recoveryTimeoutSeconds defines a timeout, measured since the workload
+loses readiness after a Workload is Admitted and running.
+After exceeding the timeout the corresponding job gets suspended again
+and requeued after the backoff delay.
+If both this field and the cluster-wide WaitForPodsReady.RecoveryTimeout
+are set, this field takes precedence.</p>
+</td>
+</tr>
+</tbody>
+</table>
+
 ## `WorkloadSchedulingStatsEviction`     {#kueue-x-k8s-io-v1beta2-WorkloadSchedulingStatsEviction}
     
 
@@ -3744,6 +3905,15 @@ can trigger preemptions.
 The gates are closed by default.</p>
 </td>
 </tr>
+<tr><td><code>waitForPodsReady</code><br/>
+<a href="#kueue-x-k8s-io-v1beta2-WaitForPodsReady"><code>WaitForPodsReady</code></a>
+</td>
+<td>
+   <p>waitForPodsReady defines the per-workload pods-ready timeouts.</p>
+<p>This is an alpha field and requires enabling WorkloadLevelWaitForPodsReady feature gate.</p>
+<p>If unspecified, the cluster-wide WaitForPodsReady is used.</p>
+</td>
+</tr>
 </tbody>
 </table>
 
@@ -3774,7 +3944,9 @@ current state.</p>
 <li>Admitted: the Workload was admitted through a ClusterQueue.</li>
 <li>Finished: the associated workload finished running (failed or succeeded).</li>
 <li>PodsReady: at least <code>.spec.podSets[*].count</code> Pods are ready or have
-succeeded.
+succeeded.</li>
+<li>PodsScheduled: all the Pods required by the admission have been
+scheduled or have succeeded.
 conditions are limited to 16 items.</li>
 </ul>
 </td>

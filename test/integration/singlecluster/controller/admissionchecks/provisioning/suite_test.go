@@ -34,31 +34,38 @@ import (
 	"sigs.k8s.io/kueue/pkg/controller/core"
 	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	jobcontrollers "sigs.k8s.io/kueue/pkg/controller/jobs"
 	"sigs.k8s.io/kueue/pkg/controller/jobs/job"
+	"sigs.k8s.io/kueue/pkg/controller/jobs/pod"
+	"sigs.k8s.io/kueue/pkg/controller/jobs/statefulset"
 	"sigs.k8s.io/kueue/pkg/scheduler"
 	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
 	"sigs.k8s.io/kueue/pkg/webhooks"
 	"sigs.k8s.io/kueue/test/integration/framework"
-	"sigs.k8s.io/kueue/test/util"
+	"sigs.k8s.io/kueue/test/util/behavioral"
+	"sigs.k8s.io/kueue/test/util/behavioral/integration"
 )
 
 var (
 	cfg       *rest.Config
 	k8sClient client.Client
-	ctx       context.Context
-	fwk       *framework.Framework
+	// managerClient reads the manager's cache, which is what the provisioning
+	// controller reads.
+	managerClient client.Client
+	ctx           context.Context
+	fwk           *framework.Framework
 )
 
 func TestProvisioning(t *testing.T) {
-	util.RunSuite(t, "Provisioning admission check suite")
+	behavioral.RunSuite(t, "Provisioning admission check suite")
 }
 
 var _ = ginkgo.BeforeSuite(func() {
 	fwk = &framework.Framework{
 		DepCRDPaths: []string{
-			util.AutoscalerCrds,
+			behavioral.AutoscalerCrds,
 		},
-		WebhookPath: util.WebhookPath,
+		WebhookPath: behavioral.WebhookPath,
 	}
 	cfg = fwk.Init()
 	ctx, k8sClient = fwk.SetupClient(cfg)
@@ -69,8 +76,10 @@ var _ = ginkgo.AfterSuite(func() {
 })
 
 type managerSetupOpts struct {
-	runScheduler     bool
-	runJobController bool
+	runScheduler             bool
+	runJobController         bool
+	runStatefulSetController bool
+	runPodController         bool
 }
 
 type managerSetupOption func(*managerSetupOpts)
@@ -83,8 +92,19 @@ func runJobController(opts *managerSetupOpts) {
 	opts.runJobController = true
 }
 
+func runPodController(opts *managerSetupOpts) {
+	opts.runPodController = true
+}
+
+func runStatefulSetController(opts *managerSetupOpts) {
+	opts.runStatefulSetController = true
+}
+
 func managerSetup(options ...managerSetupOption) framework.ManagerSetup {
+	ginkgo.GinkgoHelper()
 	return func(ctx context.Context, mgr manager.Manager) {
+		managerClient = mgr.GetClient()
+		integrationManager := jobcontrollers.NewIntegrationManager()
 		var opts managerSetupOpts
 		for _, opt := range options {
 			opt(&opts)
@@ -106,7 +126,7 @@ func managerSetup(options ...managerSetupOption) framework.ManagerSetup {
 		cCache := schdcache.New(mgr.GetClient())
 		preemptionExpectations := preemptexpectations.New()
 		queueOptions := []qcache.Option{qcache.WithPreemptionExpectations(preemptionExpectations)}
-		queues := util.NewManagerForIntegrationTests(ctx, mgr.GetClient(), cCache, queueOptions...)
+		queues := integration.NewManager(ctx, mgr.GetClient(), cCache, queueOptions...)
 
 		if opts.runJobController {
 			var err error
@@ -114,15 +134,47 @@ func managerSetup(options ...managerSetupOption) framework.ManagerSetup {
 				ctx,
 				mgr.GetClient(),
 				mgr.GetFieldIndexer(),
-				mgr.GetEventRecorder(constants.JobControllerName))
+				mgr.GetEventRecorder(constants.JobControllerName), jobframework.WithIntegrationManager(integrationManager))
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			err = job.SetupIndexes(ctx, mgr.GetFieldIndexer())
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			err = jobReconciler.SetupWithManager(mgr)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
-			err = job.SetupWebhook(mgr, jobframework.WithCache(cCache), jobframework.WithQueues(queues))
+			err = job.SetupWebhook(mgr, jobframework.WithIntegrationManager(integrationManager), jobframework.WithCache(cCache), jobframework.WithQueues(queues))
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
-			jobframework.EnableIntegration(job.FrameworkName)
+			integrationManager.EnableIntegration(job.FrameworkName)
+		}
+
+		if opts.runPodController {
+			podReconciler, err := pod.NewReconciler(
+				ctx,
+				mgr.GetClient(),
+				mgr.GetFieldIndexer(),
+				mgr.GetEventRecorder(constants.JobControllerName), jobframework.WithIntegrationManager(integrationManager))
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			err = pod.SetupIndexes(ctx, mgr.GetFieldIndexer())
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			err = podReconciler.SetupWithManager(mgr)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			err = pod.SetupWebhook(mgr, jobframework.WithIntegrationManager(integrationManager), jobframework.WithCache(cCache), jobframework.WithQueues(queues))
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			integrationManager.EnableIntegration(pod.FrameworkName)
+		}
+
+		if opts.runStatefulSetController {
+			stsReconciler, err := statefulset.NewReconciler(
+				ctx,
+				mgr.GetClient(),
+				mgr.GetFieldIndexer(),
+				mgr.GetEventRecorder(constants.JobControllerName), jobframework.WithIntegrationManager(integrationManager))
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			err = statefulset.SetupIndexes(ctx, mgr.GetFieldIndexer())
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			err = stsReconciler.SetupWithManager(mgr)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			err = statefulset.SetupWebhook(mgr, jobframework.WithIntegrationManager(integrationManager), jobframework.WithCache(cCache), jobframework.WithQueues(queues))
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			integrationManager.EnableIntegration(statefulset.FrameworkName)
 		}
 
 		failedCtrl, err := core.SetupControllers(
@@ -153,7 +205,7 @@ func managerSetup(options ...managerSetupOption) framework.ManagerSetup {
 				mgr.GetEventRecorder(constants.AdmissionName),
 				scheduler.WithPreemptionExpectations(preemptionExpectations),
 			)
-			err = sched.Start(ctx)
+			err = mgr.Add(sched)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		}
 	}

@@ -24,7 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/client-go/discovery"
-	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/controller/constants"
@@ -35,7 +35,7 @@ import (
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	testingjob "sigs.k8s.io/kueue/pkg/util/testingjobs/job"
-	"sigs.k8s.io/kueue/test/util"
+	"sigs.k8s.io/kueue/test/util/behavioral"
 )
 
 var _ = ginkgo.Describe("Job Webhook With manageJobsWithoutQueueName enabled", func() {
@@ -51,21 +51,20 @@ var _ = ginkgo.Describe("Job Webhook With manageJobsWithoutQueueName enabled", f
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 		unmanagedNsName := "unmanaged-ns-" + rand.String(8)
-		fwk.StartManager(ctx, cfg, managerSetup(
+		fwk.StartManagerForSpec(ctx, cfg, managerSetup(
 			job.SetupWebhook,
 			jobframework.WithManageJobsWithoutQueueName(true),
-			jobframework.WithManagedJobsNamespaceSelector(util.NewNamespaceSelectorExcluding(unmanagedNsName)),
+			jobframework.WithManagedJobsNamespaceSelector(behavioral.NewNamespaceSelectorExcluding(unmanagedNsName)),
 			jobframework.WithKubeServerVersion(serverVersionFetcher),
 		))
 		unmanagedNs = utiltesting.MakeNamespace(unmanagedNsName)
-		util.MustCreate(ctx, k8sClient, unmanagedNs)
-		ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "job-")
+		behavioral.MustCreate(ctx, k8sClient, unmanagedNs)
+		ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "job-")
 	})
 
 	ginkgo.AfterEach(func() {
-		gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
-		gomega.Expect(util.DeleteNamespace(ctx, k8sClient, unmanagedNs)).To(gomega.Succeed())
-		fwk.StopManager(ctx)
+		gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
+		gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, unmanagedNs)).To(gomega.Succeed())
 	})
 
 	ginkgo.It("checking the workload is not created when JobMinParallelismAnnotation is invalid", func() {
@@ -77,31 +76,70 @@ var _ = ginkgo.Describe("Job Webhook With manageJobsWithoutQueueName enabled", f
 
 	ginkgo.It("Should suspend a Job even no queue name specified", func() {
 		job := testingjob.MakeJob("job-without-queue-name", ns.Name).Suspend(false).Obj()
-		util.MustCreate(ctx, k8sClient, job)
+		behavioral.MustCreate(ctx, k8sClient, job)
 
 		lookupKey := types.NamespacedName{Name: job.Name, Namespace: job.Namespace}
 		createdJob := &batchv1.Job{}
 		gomega.Eventually(func(g gomega.Gomega) {
 			g.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
 			g.Expect(createdJob.Spec.Suspend).Should(gomega.Equal(new(true)))
-		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 	})
 
 	ginkgo.It("Should not suspend a Job with no queue name specified in an unmanaged namespace", func() {
 		job := testingjob.MakeJob("job-without-queue-name-unmanaged", unmanagedNs.Name).Suspend(false).Obj()
-		util.MustCreate(ctx, k8sClient, job)
+		behavioral.MustCreate(ctx, k8sClient, job)
 
 		lookupKey := types.NamespacedName{Name: job.Name, Namespace: job.Namespace}
 		createdJob := &batchv1.Job{}
 		gomega.Consistently(func(g gomega.Gomega) {
 			g.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
 			g.Expect(createdJob.Spec.Suspend).Should(gomega.Equal(new(false)))
-		}, util.ConsistentDuration, util.ShortInterval).Should(gomega.Succeed())
+		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("Should not inject default queue label for a Job in an unmanaged namespace", func() {
+		defaultLq := utiltestingapi.MakeLocalQueue("default", unmanagedNs.Name).ClusterQueue("cluster-queue").Obj()
+		behavioral.MustCreate(ctx, k8sClient, defaultLq)
+		ginkgo.DeferCleanup(func() {
+			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, defaultLq, true)
+		})
+
+		j := testingjob.MakeJob("job-default-lq-unmanaged", unmanagedNs.Name).Suspend(false).Obj()
+		behavioral.MustCreate(ctx, k8sClient, j)
+
+		lookupKey := types.NamespacedName{Name: j.Name, Namespace: j.Namespace}
+		createdJob := &batchv1.Job{}
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
+			g.Expect(createdJob.Spec.Suspend).Should(gomega.Equal(new(false)))
+			g.Expect(createdJob.Labels).ShouldNot(gomega.HaveKey(constants.QueueLabel))
+		}, behavioral.ShortTimeout, behavioral.ShortInterval).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("Should not set the default WorkloadPriorityClass label for a Job in an unmanaged namespace", func() {
+		features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.WorkloadPriorityClassDefaulting, true)
+
+		defaultWPC := utiltestingapi.MakeWorkloadPriorityClass(constants.DefaultWorkloadPriorityClassName).PriorityValue(100).Obj()
+		behavioral.MustCreate(ctx, k8sClient, defaultWPC)
+		ginkgo.DeferCleanup(func() {
+			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, defaultWPC, true)
+		})
+
+		j := testingjob.MakeJob("job-wpc-unmanaged", unmanagedNs.Name).Suspend(false).Obj()
+		behavioral.MustCreate(ctx, k8sClient, j)
+
+		lookupKey := types.NamespacedName{Name: j.Name, Namespace: j.Namespace}
+		createdJob := &batchv1.Job{}
+		gomega.Consistently(func(g gomega.Gomega) {
+			g.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
+			g.Expect(createdJob.Labels).ShouldNot(gomega.HaveKey(constants.WorkloadPriorityClassLabel))
+		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
 	})
 
 	ginkgo.It("Should not update unsuspend Job successfully when adding queue name", func() {
 		job := testingjob.MakeJob("job-without-queue-name", ns.Name).Suspend(false).Obj()
-		util.MustCreate(ctx, k8sClient, job)
+		behavioral.MustCreate(ctx, k8sClient, job)
 
 		lookupKey := types.NamespacedName{Name: job.Name, Namespace: job.Namespace}
 		createdJob := &batchv1.Job{}
@@ -116,41 +154,40 @@ var _ = ginkgo.Describe("Job Webhook With manageJobsWithoutQueueName enabled", f
 var _ = ginkgo.Describe("Job Webhook with manageJobsWithoutQueueName disabled", func() {
 	var ns *corev1.Namespace
 	ginkgo.BeforeEach(func() {
-		fwk.StartManager(ctx, cfg, managerSetup(job.SetupWebhook, jobframework.WithManageJobsWithoutQueueName(false)))
-		ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "job-")
+		fwk.StartManagerForSpec(ctx, cfg, managerSetup(job.SetupWebhook, jobframework.WithManageJobsWithoutQueueName(false)))
+		ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "job-")
 	})
 	ginkgo.AfterEach(func() {
-		gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
-		fwk.StopManager(ctx)
+		gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
 	})
 
 	ginkgo.It("should suspend a Job when created in unsuspend state", func() {
 		job := testingjob.MakeJob("job-with-queue-name", ns.Name).Suspend(false).Queue("default").Obj()
-		util.MustCreate(ctx, k8sClient, job)
+		behavioral.MustCreate(ctx, k8sClient, job)
 
 		lookupKey := types.NamespacedName{Name: job.Name, Namespace: job.Namespace}
 		createdJob := &batchv1.Job{}
 		gomega.Eventually(func(g gomega.Gomega) {
 			g.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
 			g.Expect(createdJob.Spec.Suspend).Should(gomega.Equal(new(true)))
-		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 	})
 
 	ginkgo.It("should not suspend a Job when no queue name specified", func() {
 		job := testingjob.MakeJob("job-without-queue-name", ns.Name).Suspend(false).Obj()
-		util.MustCreate(ctx, k8sClient, job)
+		behavioral.MustCreate(ctx, k8sClient, job)
 
 		lookupKey := types.NamespacedName{Name: job.Name, Namespace: job.Namespace}
 		createdJob := &batchv1.Job{}
 		gomega.Eventually(func(g gomega.Gomega) {
 			g.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
 			g.Expect(createdJob.Spec.Suspend).Should(gomega.Equal(new(false)))
-		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 	})
 
 	ginkgo.It("should not update unsuspend Job successfully when changing queue name", func() {
 		job := testingjob.MakeJob("job-with-queue-name", ns.Name).Queue("queue").Obj()
-		util.MustCreate(ctx, k8sClient, job)
+		behavioral.MustCreate(ctx, k8sClient, job)
 
 		lookupKey := types.NamespacedName{Name: job.Name, Namespace: job.Namespace}
 		createdJob := &batchv1.Job{}
@@ -167,13 +204,13 @@ var _ = ginkgo.Describe("Job Webhook with manageJobsWithoutQueueName disabled", 
 			Completions(6).
 			SetAnnotation(job.JobMinParallelismAnnotation, "4").
 			Obj()
-		util.MustCreate(ctx, k8sClient, job)
+		behavioral.MustCreate(ctx, k8sClient, job)
 
 		lookupKey := types.NamespacedName{Name: job.Name, Namespace: job.Namespace}
 		createdJob := &batchv1.Job{}
 		gomega.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
 
-		createdJob.Spec.Parallelism = ptr.To[int32](4)
+		createdJob.Spec.Parallelism = new(int32(4))
 		createdJob.Spec.Suspend = new(false)
 		gomega.Expect(k8sClient.Update(ctx, createdJob)).Should(gomega.Succeed())
 	})
@@ -189,13 +226,13 @@ var _ = ginkgo.Describe("Job Webhook with manageJobsWithoutQueueName disabled", 
 			Completions(6).
 			SetAnnotation(job.JobMinParallelismAnnotation, "4").
 			Obj()
-		util.MustCreate(ctx, k8sClient, job)
+		behavioral.MustCreate(ctx, k8sClient, job)
 
 		lookupKey := types.NamespacedName{Name: job.Name, Namespace: job.Namespace}
 		createdJob := &batchv1.Job{}
 		gomega.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
 
-		createdJob.Spec.Parallelism = ptr.To[int32](3)
+		createdJob.Spec.Parallelism = new(int32(3))
 		createdJob.Spec.Suspend = new(false)
 		gomega.Expect(k8sClient.Update(ctx, createdJob)).Should(gomega.Succeed())
 	})
@@ -207,60 +244,90 @@ var _ = ginkgo.Describe("Job Webhook with manageJobsWithoutQueueName disabled", 
 			SetAnnotation(job.StoppingAnnotation, "true").
 			SetAnnotation(job.JobMinParallelismAnnotation, "2").
 			Obj()
-		util.MustCreate(ctx, k8sClient, originalJob)
+		behavioral.MustCreate(ctx, k8sClient, originalJob)
 
 		lookupKey := types.NamespacedName{Name: originalJob.Name, Namespace: originalJob.Namespace}
 		updatedJob := &batchv1.Job{}
 		gomega.Expect(k8sClient.Get(ctx, lookupKey, updatedJob)).Should(gomega.Succeed())
 
-		updatedJob.Spec.Parallelism = ptr.To[int32](6)
+		updatedJob.Spec.Parallelism = new(int32(6))
 		delete(updatedJob.Annotations, job.StoppingAnnotation)
 		gomega.Expect(k8sClient.Update(ctx, updatedJob)).Should(gomega.Succeed())
 	})
 
+	ginkgo.It("should allow lowering the parallelism of a suspended partially admissible job above its minimum", func() {
+		job := testingjob.MakeJob("job-with-queue-name", ns.Name).Queue("queue").
+			Parallelism(5).
+			Completions(6).
+			SetAnnotation(job.JobMinParallelismAnnotation, "3").
+			Obj()
+		behavioral.MustCreate(ctx, k8sClient, job)
+
+		lookupKey := types.NamespacedName{Name: job.Name, Namespace: job.Namespace}
+		createdJob := &batchv1.Job{}
+		gomega.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
+
+		createdJob.Spec.Parallelism = new(int32(4))
+		gomega.Expect(k8sClient.Update(ctx, createdJob)).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("should reject lowering the parallelism of a suspended partially admissible job below its minimum", func() {
+		job := testingjob.MakeJob("job-with-queue-name", ns.Name).Queue("queue").
+			Parallelism(5).
+			Completions(6).
+			SetAnnotation(job.JobMinParallelismAnnotation, "3").
+			Obj()
+		behavioral.MustCreate(ctx, k8sClient, job)
+
+		lookupKey := types.NamespacedName{Name: job.Name, Namespace: job.Namespace}
+		createdJob := &batchv1.Job{}
+		gomega.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
+
+		createdJob.Spec.Parallelism = new(int32(2))
+		gomega.Expect(k8sClient.Update(ctx, createdJob)).Should(utiltesting.BeForbiddenError())
+	})
+
 	ginkgo.It("Should not set the default WorkloadPriorityClass label when the feature gate is disabled", func() {
+		features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.WorkloadPriorityClassDefaulting, false)
+
 		defaultWPC := utiltestingapi.MakeWorkloadPriorityClass(constants.DefaultWorkloadPriorityClassName).PriorityValue(100).Obj()
-		util.MustCreate(ctx, k8sClient, defaultWPC)
+		behavioral.MustCreate(ctx, k8sClient, defaultWPC)
 		ginkgo.DeferCleanup(func() {
 			gomega.Expect(k8sClient.Delete(ctx, defaultWPC)).To(gomega.Succeed())
 		})
 
 		j := testingjob.MakeJob("job-without-wpc-gate-off", ns.Name).Queue("test-queue").Obj()
-		util.MustCreate(ctx, k8sClient, j)
+		behavioral.MustCreate(ctx, k8sClient, j)
 
 		lookupKey := types.NamespacedName{Name: j.Name, Namespace: j.Namespace}
 		createdJob := &batchv1.Job{}
 		gomega.Consistently(func(g gomega.Gomega) {
 			g.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
 			g.Expect(createdJob.Labels).ShouldNot(gomega.HaveKey(constants.WorkloadPriorityClassLabel))
-		}, util.ConsistentDuration, util.ShortInterval).Should(gomega.Succeed())
+		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
 	})
 })
 
-var _ = ginkgo.Describe("Job Webhook with WorkloadPriorityClassDefaulting enabled", ginkgo.Ordered, func() {
+var _ = ginkgo.Describe("Job Webhook with WorkloadPriorityClassDefaulting enabled", func() {
 	var ns *corev1.Namespace
 	var defaultWPC *kueue.WorkloadPriorityClass
 
-	ginkgo.BeforeAll(func() {
-		fwk.StartManager(ctx, cfg, managerSetup(job.SetupWebhook))
-	})
 	ginkgo.BeforeEach(func() {
 		features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.WorkloadPriorityClassDefaulting, true)
-		ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "wpc-defaulting-")
+		fwk.StartManagerForSpec(ctx, cfg, managerSetup(job.SetupWebhook))
+
+		ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "wpc-defaulting-")
 		defaultWPC = utiltestingapi.MakeWorkloadPriorityClass(constants.DefaultWorkloadPriorityClassName).PriorityValue(100).Obj()
-		util.MustCreate(ctx, k8sClient, defaultWPC)
+		behavioral.MustCreate(ctx, k8sClient, defaultWPC)
 	})
 	ginkgo.AfterEach(func() {
 		gomega.Expect(k8sClient.Delete(ctx, defaultWPC)).To(gomega.Succeed())
-		gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
-	})
-	ginkgo.AfterAll(func() {
-		fwk.StopManager(ctx)
+		gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
 	})
 
 	ginkgo.It("Should set the default WorkloadPriorityClass label when the default WPC exists", func() {
 		j := testingjob.MakeJob("job-without-wpc", ns.Name).Queue("test-queue").Obj()
-		util.MustCreate(ctx, k8sClient, j)
+		behavioral.MustCreate(ctx, k8sClient, j)
 
 		lookupKey := types.NamespacedName{Name: j.Name, Namespace: j.Namespace}
 		createdJob := &batchv1.Job{}
@@ -270,18 +337,18 @@ var _ = ginkgo.Describe("Job Webhook with WorkloadPriorityClassDefaulting enable
 				constants.WorkloadPriorityClassLabel,
 				constants.DefaultWorkloadPriorityClassName,
 			))
-		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 	})
 
 	ginkgo.It("Should not override an existing WorkloadPriorityClass label", func() {
 		highWPC := utiltestingapi.MakeWorkloadPriorityClass("high").PriorityValue(1000).Obj()
-		util.MustCreate(ctx, k8sClient, highWPC)
+		behavioral.MustCreate(ctx, k8sClient, highWPC)
 		ginkgo.DeferCleanup(func() {
 			gomega.Expect(k8sClient.Delete(ctx, highWPC)).To(gomega.Succeed())
 		})
 
 		j := testingjob.MakeJob("job-with-wpc", ns.Name).Queue("test-queue").WorkloadPriorityClass("high").Obj()
-		util.MustCreate(ctx, k8sClient, j)
+		behavioral.MustCreate(ctx, k8sClient, j)
 
 		lookupKey := types.NamespacedName{Name: j.Name, Namespace: j.Namespace}
 		createdJob := &batchv1.Job{}
@@ -290,23 +357,20 @@ var _ = ginkgo.Describe("Job Webhook with WorkloadPriorityClassDefaulting enable
 			g.Expect(createdJob.Labels).Should(gomega.HaveKeyWithValue(
 				constants.WorkloadPriorityClassLabel, "high",
 			))
-		}, util.ConsistentDuration, util.ShortInterval).Should(gomega.Succeed())
+		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
 	})
 
 	ginkgo.It("Should not set the label when the default WPC does not exist", func() {
 		gomega.Expect(k8sClient.Delete(ctx, defaultWPC)).To(gomega.Succeed())
 
-		j := testingjob.MakeJob("job-no-default-wpc", ns.Name).Queue("test-queue").Obj()
-		util.MustCreate(ctx, k8sClient, j)
+		gomega.Eventually(func(g gomega.Gomega) {
+			j := testingjob.MakeJob("job-no-default-wpc", ns.Name).Queue("test-queue").Obj()
 
-		lookupKey := types.NamespacedName{Name: j.Name, Namespace: j.Namespace}
-		createdJob := &batchv1.Job{}
-		gomega.Consistently(func(g gomega.Gomega) {
-			g.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
-			g.Expect(createdJob.Labels).ShouldNot(gomega.HaveKey(constants.WorkloadPriorityClassLabel))
-		}, util.ConsistentDuration, util.ShortInterval).Should(gomega.Succeed())
+			g.Expect(k8sClient.Create(ctx, j, client.DryRunAll)).Should(gomega.Succeed())
+			g.Expect(j.Labels).ShouldNot(gomega.HaveKey(constants.WorkloadPriorityClassLabel))
+		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 
 		defaultWPC = utiltestingapi.MakeWorkloadPriorityClass(constants.DefaultWorkloadPriorityClassName).PriorityValue(100).Obj()
-		util.MustCreate(ctx, k8sClient, defaultWPC)
+		behavioral.MustCreate(ctx, k8sClient, defaultWPC)
 	})
 })
